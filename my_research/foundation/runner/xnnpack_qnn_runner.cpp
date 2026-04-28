@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-DEFINE_string(backend, "qnn", "Backend: xnnpack or qnn.");
+DEFINE_string(backend, "qnn", "Backend: xnnpack, vulkan, or qnn.");
 
 DEFINE_string(embedding_path, "embedding.pte", "Path to embedding model.");
 DEFINE_string(encoder_path, "encoder.pte", "Path to vision encoder model.");
@@ -41,6 +41,10 @@ DEFINE_string(decoder_model_version, "internvl3", "Decoder model version.");
 DEFINE_string(prompt, "Describe this image:", "Text prompt.");
 DEFINE_string(tokenized_prompt, "", "Alternative: tokenized prompt file.");
 DEFINE_string(image_path, "", "Path to preprocessed image .bin or frame directory.");
+DEFINE_string(
+    decoder_input_mode,
+    "embeddings",
+    "Decoder input mode: embeddings or token_ids.");
 DEFINE_string(system_prompt, "", "System prompt.");
 
 DEFINE_double(temperature, 0.0f, "Sampling temperature.");
@@ -129,18 +133,20 @@ int main(int argc, char** argv) {
       FLAGS_eval_mode != 0) {
     ET_CHECK_MSG(false, "dump_logits only supported in KV mode.");
   }
-  if (FLAGS_image_path.empty()) {
+  if (FLAGS_image_path.empty() && FLAGS_decoder_input_mode != "token_ids") {
     ET_LOG(Error, "--image_path is required.");
     return 1;
   }
 
-  std::string frame_dir = normalize_frame_dir(FLAGS_image_path);
+  std::string frame_dir =
+      FLAGS_image_path.empty() ? "" : normalize_frame_dir(FLAGS_image_path);
 
   executorch::examples::foundation::ManifestData manifest;
   manifest.backend = FLAGS_backend;
   manifest.model_family = "internvl3";
   manifest.variant = FLAGS_decoder_model_version;
   manifest.runner_type = "multimodal_split";
+  manifest.decoder_input_mode = FLAGS_decoder_input_mode;
   manifest.paths.vision_encoder_pte = FLAGS_encoder_path;
   manifest.paths.text_embedding_pte = FLAGS_embedding_path;
   manifest.paths.text_decoder_pte = FLAGS_decoder_path;
@@ -148,7 +154,7 @@ int main(int argc, char** argv) {
 
   executorch::examples::foundation::UnifiedRunConfig config;
   config.frame_dir = frame_dir;
-  config.frame_count = count_frames(frame_dir);
+  config.frame_count = frame_dir.empty() ? 0 : count_frames(frame_dir);
   config.questions = join_prompts(prompts);
   config.seq_len = FLAGS_seq_len;
   config.temperature = FLAGS_temperature;
@@ -157,7 +163,7 @@ int main(int argc, char** argv) {
   config.output_path = FLAGS_output_path;
 
   std::unique_ptr<executorch::examples::foundation::BackendRunner> runner;
-  if (FLAGS_backend == "xnnpack") {
+  if (FLAGS_backend == "xnnpack" || FLAGS_backend == "vulkan") {
     runner = executorch::examples::foundation::create_xnnpack_backend_runner(manifest);
   } else if (FLAGS_backend == "qnn") {
     runner = executorch::examples::foundation::create_qnn_backend_runner(manifest);

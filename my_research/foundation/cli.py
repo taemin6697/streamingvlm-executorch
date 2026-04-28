@@ -58,15 +58,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Unified foundation CLI for QNN/XNNPACK multimodal export and run."
+        description="Unified foundation CLI for QNN/XNNPACK/Vulkan multimodal export and run."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     export_parser = subparsers.add_parser(
         "export",
-        help="Export foundation artifacts natively for QNN or XNNPACK.",
+        help="Export foundation artifacts natively for QNN, XNNPACK, or Vulkan.",
     )
-    export_parser.add_argument("--backend", required=True, choices=["qnn", "xnnpack"])
+    export_parser.add_argument("--backend", required=True, choices=["qnn", "xnnpack", "vulkan"])
     export_parser.add_argument("--artifact_root", required=True)
     export_parser.add_argument("--decoder_model", required=True)
     export_parser.add_argument("--max_seq_len", type=int, default=1024)
@@ -80,17 +80,26 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument(
         "--vision_quant",
         default="fp16",
-        help="Backend-specific vision quant mode.",
+        help=(
+            "Backend-specific vision quant mode. QNN supports fp16(alias 16a16w), "
+            "16a16w, 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
+        ),
     )
     export_parser.add_argument(
         "--decoder_quant",
         default="fp16",
-        help="Backend-specific decoder quant mode.",
+        help=(
+            "Backend-specific decoder quant mode. QNN supports fp16(alias 16a16w), "
+            "16a16w, 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
+        ),
     )
     export_parser.add_argument(
         "--embedding_quant",
         default="fp16",
-        help="Backend-specific embedding quant mode.",
+        help=(
+            "Backend-specific embedding quant mode. QNN supports fp16(alias 16a16w), "
+            "16a16w, 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
+        ),
     )
     export_parser.add_argument("--model_path", default=None)
     export_parser.add_argument("--checkpoint", default=None)
@@ -98,7 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--encoder_weights", default=None)
     export_parser.add_argument("--calibration_images", nargs="+", default=None)
     export_parser.add_argument("--calibration_num", type=int, default=8)
-    export_parser.add_argument("--text_group_size", type=int, default=128)
+    export_parser.add_argument(
+        "--text_group_size",
+        type=int,
+        default=None,
+        help="TorchAo text weight group size. Defaults to 64 for Vulkan 8da4w, otherwise 128.",
+    )
     export_parser.add_argument(
         "--trust_remote_code",
         action=argparse.BooleanOptionalAction,
@@ -110,16 +124,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
     )
     export_parser.add_argument(
+        "--decoder_input_mode",
+        choices=["token_ids", "embeddings"],
+        default="token_ids",
+        help=(
+            "Vulkan decoder input mode. token_ids matches upstream Llama-style export; "
+            "embeddings is required for InternVL image-feature merging."
+        ),
+    )
+    export_parser.add_argument(
+        "--vulkan_xnnpack_fallback",
+        action="store_true",
+        help="For Vulkan export, lower unsupported non-decoder subgraphs with XNNPACK.",
+    )
+    export_parser.add_argument(
         "--dynamic_shape",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable dynamic sequence shapes for XNNPACK text embedding/decoder export.",
+        help="Enable dynamic sequence shapes for XNNPACK/Vulkan text embedding/decoder export.",
     )
     export_parser.add_argument(
         "--disable_dynamic_shape",
         action="store_false",
         dest="dynamic_shape",
-        help="Disable dynamic sequence shapes for XNNPACK text embedding/decoder export.",
+        help="Disable dynamic sequence shapes for XNNPACK/Vulkan text embedding/decoder export.",
     )
     export_parser.add_argument("-b", "--build_path", default=None)
     export_parser.add_argument("-s", "--device", default=None)

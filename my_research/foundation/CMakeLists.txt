@@ -69,6 +69,7 @@ endif()
 add_executable(
   xnnpack_qnn_runner
   runner/xnnpack_qnn_runner.cpp
+  runner/foundation_qnn_multimodal_runner.cpp
   runner/qnn_backend.cpp
   runner/xnnpack_backend.cpp
 )
@@ -103,6 +104,11 @@ if(TARGET xnnpack_backend)
     PUBLIC
     ${_foundation_xnnpack_backend_libs}
   )
+endif()
+
+if(TARGET vulkan_backend)
+  executorch_target_link_options_shared_lib(vulkan_backend)
+  target_link_libraries(xnnpack_qnn_runner PUBLIC vulkan_backend)
 endif()
 
 # portable_ops_lib: XNNPACK 전용. QNN 사용 시 full_portable_ops_lib(custom_ops)만 사용하여

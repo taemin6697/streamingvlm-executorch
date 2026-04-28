@@ -91,7 +91,8 @@ dynamic_shape ON:
 
 dynamic_shape OFF:
   입력 sequence length가 export example shape에 고정
-  prefill 길이와 decode 길이 1을 같은 decoder PTE로 처리하기 어려울 수 있음
+  XNNPACK static export는 upstream LLM runner 방식처럼 1-token step에 맞춤
+  prefill은 prompt 전체를 한 번에 넣지 않고 1-token decoder step을 반복
   KV-cache capacity는 역시 max_context_len 기준
   메모리는 max_context_len에 크게 의존
 ```
@@ -132,4 +133,4 @@ static shape 비교가 필요하면 다음처럼 실행한다.
 DYNAMIC_SHAPE=0 my_research/foundation/scripts/export_internvl3_matrix.sh xnnpack
 ```
 
-다만 static shape artifact는 현재 unified runner에서 바로 실행 비교가 어려울 수 있다. runner가 같은 decoder artifact로 prefill과 decode를 모두 호출하는데, static shape에서는 입력 sequence length가 고정되기 때문이다.
+static shape artifact는 dynamic artifact와 실행 방식이 다르다. XNNPACK static은 QNN처럼 `max_context_len` 길이 입력을 매번 넣는 방식이 아니라, upstream ExecuTorch LLM runner의 static KV-cache 경로처럼 parallel prefill을 끄고 1-token step을 반복한다. 따라서 static artifact를 비교하려면 이 문서 업데이트 이후의 export로 artifact를 다시 만들어야 한다. 이전 `_static` artifact는 text embedding/decoder가 256-token shape로 고정되어 있어 현재 runner의 static 경로와 맞지 않는다.

@@ -751,6 +751,592 @@ Verified imports:
 - `import torchtune.training.quantization`
 - `from executorch.examples.qualcomm.oss_scripts.llama import SUPPORTED_LLM_MODELS`
 
+## 20. QNN Detailed Phase Profiling Overlay
+
+Implemented a local QNN multimodal runner overlay so QNN logs can expose phase
+rows similar to XNNPACK without modifying upstream ExecuTorch.
+
+What changed:
+
+- Added `my_research/foundation/runner/foundation_qnn_multimodal_runner.{h,cpp}`.
+- Wired `my_research/foundation/runner/qnn_backend.cpp` to use
+  `ProfiledQNNMultimodalRunner` instead of upstream `example::QNNMultimodalRunner`.
+- Added the overlay source to `my_research/foundation/CMakeLists.txt`.
+- `foundation_proc.csv` for QNN now records:
+  - `L`
+  - `V_Encode`
+  - `EmbeddingAndMerging`
+  - `T_Prefill`
+  - `Decode`
+  - per-token callback rows as `D`
+
+Why:
+
+- `/workspace/stream` had the desired QNN profiling behavior, but it achieved
+  this by modifying files under `executorch/examples/qualcomm/...`.
+- The project rule is to keep ExecuTorch clean, so the modified flow was copied
+  into a local overlay under `my_research/foundation/runner`.
+
+Notes:
+
+- QNN `dispatch_inputs()` can execute text embedding before image encoding for
+  prompts like `<image>...`; the CSV writer adjusts `EmbeddingAndMerging` so the
+  reported row does not double-count `V_Encode` in the stacked phase graph.
+- Per-token `D` rows are based on token callback timing from the local overlay.
+  They are useful for token position/KV growth, but not as exact as modifying
+  upstream `TokenGenerator` internals. Upstream ExecuTorch remains untouched.
+
+Verification:
+
+```bash
+SKIP_ET_BUILD=1 JOBS=8 my_research/foundation/scripts/build_backend_and_runner.sh qnn
+```
+
+Smoke test run:
+
+```bash
+python -m my_research.foundation.cli run \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_qnn_1b_1k_fp16/manifest.json \
+  --runner_binary /workspace/streamingvlm/executorch/build-android/foundation/xnnpack_qnn_runner \
+  -b executorch/build-android \
+  -s R3KYC01FW1P \
+  -m SM8750 \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions "Describe this image briefly using around 10 words." \
+  --seq_len 320 \
+  --temperature 0.0 \
+  --save_log
+```
+
+Observed output:
+
+- `my_research/foundation/results/log/qnn/internvl3_qnn_1b_1k_fp16/foundation_proc.csv`
+  contains `V_Encode`, `EmbeddingAndMerging`, `T_Prefill`, `Decode`, and `D` rows.
+- `phase_duration_stacked_bar.png` and `memory_timeline_plot.png` are regenerated.
+
+Follow-up output-format fix:
+
+- QNN initially wrote only the assistant answer to `foundation_output.txt`, while
+  XNNPACK writes the echoed InternVL3 prompt plus the answer.
+- Updated `qnn_backend.cpp` to write the same prompt echo format as XNNPACK:
+  `<|im_start|>user:`, `FrameN: <img><IMG_CONTEXT>...</img>`, user question,
+  `<|im_start|>assistant`, then the generated answer.
+- The original prompt list is copied before `prepare_messages()` because upstream
+  QNN chat-template preparation mutates prompts by prepending `<image>` tokens for
+  model input. The saved output should show the user-facing prompt, not the
+  internal QNN dispatch placeholder.
+
+## 21. XNNPACK Static Shape Runner Semantics
+
+Corrected the XNNPACK static-shape interpretation to match upstream ExecuTorch
+LLM runner behavior.
+
+What changed:
+
+- `my_research/foundation/exporters/xnnpack.py`
+  - Dynamic export still uses a representative `sample_seq_len=min(256, max_seq_len)`.
+  - Static export now uses `sample_seq_len=1`.
+  - Manifest export metadata records `enable_dynamic_shape` and
+    `static_prefill_mode`.
+- `my_research/foundation/runner/xnnpack_backend.cpp`
+  - Reads `enable_dynamic_shape` from the decoder PTE constant method.
+  - Dynamic path remains unchanged: embed/merge the full prompt and call decoder
+    once for prefill.
+  - Static path now disables parallel prefill and feeds one token at a time.
+  - For `<IMG_CONTEXT>` tokens, the runner feeds the corresponding vision hidden
+    row directly instead of calling token embedding.
+  - Static path validates that `text_embedding_xnnpack.pte` has shape `[1,1]`;
+    old `_static` artifacts fixed to `[1,256]` must be re-exported.
+
+Why:
+
+- Upstream ExecuTorch static KV-cache LLM runners do not feed
+  `max_context_len`-wide tensors for XNNPACK decode.
+- With `enable_dynamic_shape=false`, upstream disables parallel prefill and
+  performs sequential 1-token steps.
+- QNN fixed-AR/static behavior is different and should not be used as the
+  XNNPACK static contract.
+
+Verification:
+
+```bash
+SKIP_ET_BUILD=1 JOBS=8 my_research/foundation/scripts/build_backend_and_runner.sh xnnpack-vulkan
+```
+
+Dynamic XNNPACK smoke run still passes:
+
+```bash
+python -m my_research.foundation.cli run \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/xnnpack/internvl3_xnnpack_1b_1k_fp16/manifest.json \
+  --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
+  --device R3KYC01FW1P \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions "Describe this image briefly using around 10 words." \
+  --seq_len 320 \
+  --temperature 0.0 \
+  --save_log
+```
+
+Next step for static comparison:
+
+- Re-export static XNNPACK artifacts with `DYNAMIC_SHAPE=0`; existing old static
+  artifacts with 256-token text embedding shape are incompatible with the fixed
+  static runner contract.
+
+## 22. QNN Quant Mode Selection Overlay
+
+Added project-local QNN quant mode selection without modifying upstream
+ExecuTorch/Qualcomm sources.
+
+What changed:
+
+- `my_research/foundation/exporters/qnn.py`
+  - Added QNN quant mode normalization for `fp16`, `16a16w`, `16a8w`,
+    `16a4w`, `16a4w_block`, `8a8w`, and `8a4w`.
+  - For QNN, `fp16` is treated as an alias for `16a16w`.
+  - Injects local decoder and vision quant recipe classes into the
+    `internvl3_1b` config only for the duration of `qnn_compile()`.
+  - Wraps `llm_wrappers.make_quantizer()` during export so the token embedding
+    quantizer follows `--embedding_quant` instead of upstream's hard-coded
+    `QuantDtype.use_16a8w`.
+- `my_research/foundation/cli.py`
+  - Updated quant argument help text to show QNN-style quant names.
+- `my_research/foundation/docs/mobile_backend_flow.md`
+  - Updated the QNN export example to use `16a16w`.
+
+Why:
+
+- XNNPACK `fp16` artifacts are effectively 16-bit activation / 16-bit weight
+  for comparison purposes.
+- Upstream Qualcomm InternVL3 recipes default to `use_16a8w`, so a command that
+  looked like `--decoder_quant fp16` still printed `use_16a8w/PTQ`.
+- Explicit `16a16w` export is needed for a fairer XNNPACK-vs-QNN precision
+  comparison.
+
+Verification:
+
+```bash
+python -m py_compile my_research/foundation/cli.py my_research/foundation/exporters/qnn.py
+```
+
+Recipe override smoke check:
+
+```bash
+python - <<'PY'
+from my_research.foundation.exporters.qnn import _qnn_quant_overrides
+from executorch.examples.qualcomm.oss_scripts.llama import SUPPORTED_LLM_MODELS
+cfg = SUPPORTED_LLM_MODELS['internvl3_1b']
+with _qnn_quant_overrides(cfg, decoder_quant='16a16w', vision_quant='16a16w', embedding_quant='16a16w'):
+    print(cfg.quant_recipe().default_quant_dtype.name)
+    print(cfg.vision_encoder.quant_recipe().default_quant_dtype.name)
+PY
+```
+
+## 23. QNN Matrix Export Quant Suffix
+
+Updated `my_research/foundation/scripts/export_internvl3_matrix.sh` so QNN matrix
+exports encode the effective quant mode in artifact directory names.
+
+What changed:
+
+- Added QNN matrix environment overrides:
+  - `QNN_QUANT`
+  - `QNN_VISION_QUANT`
+  - `QNN_DECODER_QUANT`
+  - `QNN_EMBEDDING_QUANT`
+- QNN artifact roots now end with a quant suffix, for example:
+  - `internvl3_1b_hybrid_16p_2k_16a16w`
+  - `internvl3_1b_hybrid_16p_2k_16a8w`
+- The shell script normalizes `fp16` to `16a16w` for artifact names, matching the
+  QNN exporter alias behavior.
+- If QNN component quant modes differ, the suffix becomes
+  `v<vision>_d<decoder>_e<embedding>`.
+
+Why:
+
+- QNN exports with different quant recipes should not share visually ambiguous
+  artifact directory names.
+- Existing result analysis uses artifact directory names as run identifiers.
+
+Verification:
+
+```bash
+bash -n my_research/foundation/scripts/export_internvl3_matrix.sh
+```
+
+## 24. Vulkan Dynamic Shape Export Overlay
+
+Implemented a foundation-local Vulkan export overlay for InternVL3 dynamic-shape
+decoder export, then later removed the operator-avoidance parts after device-side
+Vulkan runs triggered a GPU-driver fatal reboot.
+
+What changed:
+
+- `my_research/foundation/exporters/xnnpack.py`
+  - Keeps Vulkan `dtype_override` aligned with upstream Llama Vulkan export:
+    `fp32` export dtype with optional Vulkan `force_fp16`.
+  - Keeps SDPA KV-cache disabled for this InternVL3 Vulkan path because the
+    custom SDPA/KV-cache fusion path fails earlier in Vulkan lowering.
+  - Adds a local Vulkan preprocess patch for options already checked by
+    ExecuTorch's Vulkan backend but not parsed by upstream `parse_compile_spec`,
+    notably `skip_memory_planning`.
+  - Removed the temporary operator-avoidance overlays:
+    Vulkan preprocess pass no-ops, Vulkan-only RoPE `get_freqs()` monkey patch,
+    Vulkan-only dynamic `Tensor.narrow()` monkey patch, and the `_skip_dim_order`
+    compile-config workaround.
+
+Why:
+
+- Dynamic shape is required for Vulkan exports in this project, but the
+  operator-avoidance overlays produced a graph that could export and then caused
+  a probable GPU-driver fatal reboot on device.
+- Removing the overlays puts the foundation path back closer to upstream
+  behavior for comparison and avoids carrying custom graph rewrites while
+  testing standard Llama Vulkan export.
+
+Verification:
+
+```bash
+python -m py_compile my_research/foundation/exporters/xnnpack.py
+```
+
+Earlier successful dynamic Vulkan export before removing the operator-avoidance
+overlays:
+
+```bash
+python -m my_research.foundation.cli export \
+  --backend vulkan \
+  --artifact_root my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_512_fp32 \
+  --decoder_model internvl3_1b \
+  --model_path my_research/foundation/results/model/hf/InternVL3-1B-hf \
+  --checkpoint my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth \
+  --max_seq_len 512 \
+  --max_context_len 512 \
+  --dtype fp32 \
+  --vision_quant fp16 \
+  --decoder_quant fp16 \
+  --embedding_quant fp16 \
+  --no-use_sdpa_with_kv_cache
+```
+
+Generated files:
+
+- `vision_encoder_vulkan.pte` (~1.2GB)
+- `text_embedding_vulkan.pte` (~519MB)
+- `text_decoder_vulkan.pte` (~1.9GB)
+- `manifest.json`
+
+Notes:
+
+- The earlier produced manifest records `enable_dynamic_shape: true`,
+  `vulkan_export_dtype: fp32`, `vulkan_force_fp16: false`, and
+  `use_sdpa_with_kv_cache: false`.
+- Token embedding currently does not partition into Vulkan because
+  `aten.embedding` reports unsupported args, but the split artifact is still
+  produced. The decoder and vision encoder contain Vulkan delegate partitions.
+- ExecuTorch source was not modified.
+
+Upstream Llama Vulkan smoke tests after removing the foundation operator
+avoidance overlays:
+
+```bash
+python -m examples.models.llama.export_llama \
+  --model stories110m \
+  --checkpoint executorch/examples/models/llama/params/demo_rand_params.pth \
+  --params executorch/examples/models/llama/params/demo_config.json \
+  -d fp32 \
+  --vulkan \
+  -qmode 8da4w \
+  -G 64 \
+  --max_seq_length 128 \
+  --max_context_length 128 \
+  -kv \
+  --use_sdpa_with_kv_cache \
+  --metadata '{"get_bos_id":1,"get_eos_ids":[2]}' \
+  --output-dir tmp_vulkan_llama \
+  --output_name stories110m_vulkan_demo_8da4w.pte
+```
+
+Result:
+
+- Failed during upstream Vulkan preprocessing in `FuseBatchNormPass`.
+- Root error was still dynamic RoPE slicing:
+  `GuardOnDataDependentSymNode: Could not guard on data-dependent expression
+  u176 + 3 > 128`, while executing `aten.slice_copy.Tensor` from
+  `examples/models/llama/rope.py` `freqs_cos.narrow(...)`.
+- This confirms the same dynamic RoPE `item() -> narrow()` issue appears in the
+  clean upstream Llama Vulkan path in the current environment; it was not caused
+  by the foundation-only avoidance code.
+
+## 25. Vulkan Decoder-First Export Order
+
+Changed the foundation split exporter so text decoder lowering runs before vision
+encoder and text embedding lowering.
+
+What changed:
+
+- `my_research/foundation/exporters/xnnpack.py`
+  - The decoder `ExportedProgram` is now lowered and saved first.
+  - Vision encoder loading/export/lowering is deferred until after
+    `text_decoder_<backend>.pte` is successfully produced.
+  - Text embedding lowering is also deferred until after decoder success.
+  - Vulkan now allows `decoder_quant=8da4w` with `text_group_size=64`,
+    `dtype=fp16` mapped to upstream-style `fp32 + force_fp16`, and
+    `use_sdpa_with_kv_cache=True` without forcibly disabling it.
+- `my_research/foundation/cli.py`
+  - `--text_group_size` default is now `None`; Vulkan `8da4w` defaults to 64,
+    other paths default to 128 in the exporter.
+
+Why:
+
+- Vulkan enablement is currently blocked in the text decoder, not the vision
+  encoder. Running vision first costs several minutes before reaching the real
+  failure.
+- Decoder-first export makes Vulkan debugging much faster and avoids writing
+  partial vision/embedding artifacts when decoder lowering fails.
+
+Verification:
+
+```bash
+python -m py_compile my_research/foundation/exporters/xnnpack.py my_research/foundation/cli.py
+```
+
+Decoder-first smoke command:
+
+```bash
+python -m my_research.foundation.cli export \
+  --backend vulkan \
+  --artifact_root my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_128_decoder_first_smoke \
+  --decoder_model internvl3_1b \
+  --model_path my_research/foundation/results/model/hf/InternVL3-1B-hf \
+  --max_seq_len 128 \
+  --max_context_len 128 \
+  --dtype fp16 \
+  --vision_quant fp16 \
+  --decoder_quant 8da4w \
+  --embedding_quant fp16 \
+  --text_group_size 64 \
+  --use_sdpa_with_kv_cache
+```
+
+Result:
+
+- No vision or embedding PTE was written before decoder failure.
+- Decoder reached Vulkan preprocessing directly and failed in the known split
+  decoder SDPA fusion path:
+  `AssertionError: match.update_key_cache_node is not None` in
+  `executorch/backends/vulkan/patterns/sdpa.py`.
+- ExecuTorch source was not modified.
+
+Follow-up token-id decoder experiment:
+
+- Updated Vulkan decoder export to use a token-id input wrapper instead of the
+  embeddings-input wrapper:
+  - XNNPACK/non-Vulkan keeps `InternVL3EmbeddingTextDecoder`.
+  - Vulkan uses `InternVL3TokenTextDecoder`, calling
+    `decoder(token_ids, {"input_pos": input_pos})`.
+  - Vulkan forces `use_sdpa_with_kv_cache=True`.
+  - Manifest metadata records `decoder_input_mode`.
+- Smoke command:
+
+```bash
+python -m my_research.foundation.cli export \
+  --backend vulkan \
+  --artifact_root my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_128_token_id_sdpa \
+  --decoder_model internvl3_1b \
+  --model_path my_research/foundation/results/model/hf/InternVL3-1B-hf \
+  --max_seq_len 128 \
+  --max_context_len 128 \
+  --dtype fp16 \
+  --vision_quant fp16 \
+  --decoder_quant 8da4w \
+  --embedding_quant fp16 \
+  --text_group_size 64 \
+  --use_sdpa_with_kv_cache
+```
+
+Result:
+
+- Token-id path was applied; Vulkan logs show `aten.embedding.default` in the
+  decoder graph.
+- Vulkan still found a single subgraph, then failed in the same SDPA replacement
+  assertion:
+  `AssertionError: match.update_key_cache_node is not None`.
+- Interpretation: the blocker is no longer just embeddings-input split. InternVL3
+  uses a Qwen-style text architecture/cache update graph that still does not
+  match the upstream Llama Vulkan SDPA pattern expected by
+  `replace_custom_sdpa_with_causal_sdpa`.
+
+Follow-up SDPA matcher overlay:
+
+- Added a foundation-local monkey patch inside `_vulkan_preprocess_option_patch`
+  to make `executorch.backends.vulkan.patterns.sdpa.CausalSDPAMatch` search
+  cache-node ancestors when direct `key_cache_node.users` /
+  `value_cache_node.users` do not contain `llama::update_cache`.
+- This keeps ExecuTorch source clean while allowing the Vulkan SDPA replacement
+  to find InternVL3/Qwen-style cache update nodes.
+- Successful smoke command:
+
+```bash
+python -m my_research.foundation.cli export \
+  --backend vulkan \
+  --artifact_root my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_128_token_id_sdpa_cachepatch \
+  --decoder_model internvl3_1b \
+  --model_path my_research/foundation/results/model/hf/InternVL3-1B-hf \
+  --max_seq_len 128 \
+  --max_context_len 128 \
+  --dtype fp16 \
+  --vision_quant fp16 \
+  --decoder_quant 8da4w \
+  --embedding_quant fp16 \
+  --text_group_size 64 \
+  --use_sdpa_with_kv_cache
+```
+
+Generated files:
+
+- `text_decoder_vulkan.pte` (~799MB)
+- `text_embedding_vulkan.pte` (~519MB)
+- `vision_encoder_vulkan.pte` (~589MB)
+- `manifest.json`
+
+Important logs:
+
+- Decoder:
+  - `Found 1 Vulkan subgraphs to be partitioned.`
+  - Vulkan partition includes `sdpa_with_kv_cache.default`,
+    `et_vk.apply_rotary_emb_hf.default`, and
+    `et_vk.linear_dq8ca_q4gsw.default`.
+- Vision:
+  - `Found 73 Vulkan subgraphs to be partitioned.`
+- Embedding:
+  - `aten.embedding.default` still does not partition to Vulkan due to unsupported
+    args, matching upstream Llama behavior.
+
+Follow-up text-only run support:
+
+- User wanted to run the `max_seq_len=128` Vulkan artifact without an image because
+  the image placeholder tokens exceed the context budget.
+- Added a local runner CLI flag, `--decoder_input_mode`, and propagated it through
+  `ManifestData`.
+- Updated the Android launcher to allow text-only XNNPACK/Vulkan runs when the
+  artifact uses `decoder_input_mode=token_ids`; it now skips frame extraction and
+  omits `--image_path`.
+- Updated `xnnpack_backend.cpp` so token-id decoder artifacts skip vision/text
+  embedding modules and feed `Long` token tensors directly into the decoder for
+  both prefill and decode.
+- Rebuilt with:
+
+```bash
+SKIP_ET_BUILD=1 JOBS=8 my_research/foundation/scripts/build_backend_and_runner.sh xnnpack-vulkan
+```
+
+- Smoke run succeeded without `--image`:
+
+```bash
+python -m my_research.foundation.cli run \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_128_token_id_sdpa_cachepatch/manifest.json \
+  --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
+  --device R3KYC01FW1P \
+  --questions "Describe yourself briefly." \
+  --seq_len 32 \
+  --temperature 0.0 \
+  --save_log
+```
+
+- Output/logs were pulled to
+  `my_research/foundation/results/log/vulkan/internvl3_vulkan_1b_128_token_id_sdpa_cachepatch/`.
+
+### Vulkan 1K Token-ID Export
+
+User requested a 1024-token Vulkan build after the 128-token text-only smoke run.
+
+Command:
+
+```bash
+python -m my_research.foundation.cli export \
+  --backend vulkan \
+  --artifact_root my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k_token_id_sdpa_cachepatch \
+  --decoder_model internvl3_1b \
+  --model_path my_research/foundation/results/model/hf/InternVL3-1B-hf \
+  --max_seq_len 1024 \
+  --max_context_len 1024 \
+  --dtype fp16 \
+  --vision_quant fp16 \
+  --decoder_quant 8da4w \
+  --embedding_quant fp16 \
+  --text_group_size 64 \
+  --use_sdpa_with_kv_cache
+```
+
+Result:
+
+- Export succeeded.
+- Output directory:
+  `my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k_token_id_sdpa_cachepatch/`
+- Generated files:
+  - `text_decoder_vulkan.pte` (~800MB)
+  - `text_embedding_vulkan.pte` (~519MB)
+  - `vision_encoder_vulkan.pte` (~589MB)
+  - `manifest.json`
+- Manifest confirms:
+  - `max_seq_len=1024`
+  - `max_context_len=1024`
+  - `enable_dynamic_shape=true`
+  - `decoder_input_mode=token_ids`
+  - `use_sdpa_with_kv_cache=true`
+  - `decoder_quant=8da4w`
+  - `text_group_size=64`
+- Export logs:
+  - Decoder: `Found 1 Vulkan subgraphs to be partitioned.`
+  - Decoder Vulkan ops include `sdpa_with_kv_cache.default` and
+    `et_vk.linear_dq8ca_q4gsw.default`.
+  - Vision: `Found 73 Vulkan subgraphs to be partitioned.`
+
+### Hybrid XNNPACK Vision + Vulkan Decoder Experiment
+
+User asked whether unsupported/problematic Vulkan image-side work could be sent
+through XNNPACK while keeping the decoder on GPU.
+
+Setup:
+
+- Vision encoder: XNNPACK 512 fp16 artifact.
+- Text embedding: XNNPACK 512 fp16 artifact.
+- Text decoder: Vulkan 512 embeddings artifact with `8da4w`,
+  `use_sdpa_with_kv_cache=true`, `decoder_input_mode=embeddings`.
+- Created manifest:
+  `my_research/foundation/results/model/vulkan/internvl3_hybrid_xnnpack_vision_embedding_vulkan_decoder_512/manifest.json`
+
+Runner changes:
+
+- Added Vulkan decoder input casting in `xnnpack_backend.cpp`, because the
+  Vulkan embeddings decoder expects Float input while the XNNPACK embedding and
+  vision artifacts produce Half embeddings.
+- Kept image frame input cast to Half for the existing fp16 vision artifacts.
+
+Findings:
+
+- Full-Vulkan image path still exits before useful progress, likely during
+  Vulkan vision/embedding pipeline initialization or early execution.
+- Hybrid path reaches all expected phases:
+  - `V_Encode` completed with XNNPACK vision.
+  - `EmbeddingAndMerging` completed.
+  - `T_Prefill` completed on Vulkan decoder.
+  - Decode steps ran on Vulkan decoder.
+- Running with `seq_len=320` on a 512 context artifact failed after `kv_pos`
+  exceeded 512:
+
+```text
+tensor sizes requires a larger texture than the current one
+```
+
+- This was not an Adreno crash; it was context capacity overflow:
+  prompt/image tokens were 278, so 320 generated tokens needs roughly 598 total
+  context slots.
+- Re-running with `seq_len=200` succeeded.
+- Output/logs:
+  `my_research/foundation/results/log/vulkan/internvl3_hybrid_xnnpack_vision_embedding_vulkan_decoder_512/`
+
 ## Update Checklist for Future Changes
 
 When modifying implementation:

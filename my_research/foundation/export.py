@@ -17,7 +17,7 @@ def export_with_backend(args: argparse.Namespace) -> int:
     artifact_root = Path(args.artifact_root).resolve()
     artifact_root.mkdir(parents=True, exist_ok=True)
 
-    if args.backend == "xnnpack":
+    if args.backend in {"xnnpack", "vulkan"}:
         from my_research.foundation.exporters.xnnpack import export_xnnpack
 
         return export_xnnpack(args)

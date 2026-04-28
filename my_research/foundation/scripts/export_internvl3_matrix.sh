@@ -24,6 +24,10 @@ QNN overrides:
   QNN_SOC_MODEL            Default: SM8750
   QNN_MODEL_MODE           Default: hybrid
   QNN_PREFILL_AR_LEN       Default: 16
+  QNN_QUANT                Default for all QNN components. Default: fp16 (=16a16w)
+  QNN_VISION_QUANT         QNN vision quant mode. Default: $QNN_QUANT
+  QNN_DECODER_QUANT        QNN decoder quant mode. Default: $QNN_QUANT
+  QNN_EMBEDDING_QUANT      QNN embedding quant mode. Default: $QNN_QUANT
   QNN_PROMPT               Default: Can you describe this image?
   QNN_IMAGE_PATH           Default: COCO sample image URL
 
@@ -86,6 +90,10 @@ QNN_DEVICE="${QNN_DEVICE:-R3KYC01FW1P}"
 QNN_SOC_MODEL="${QNN_SOC_MODEL:-SM8750}"
 QNN_MODEL_MODE="${QNN_MODEL_MODE:-hybrid}"
 QNN_PREFILL_AR_LEN="${QNN_PREFILL_AR_LEN:-16}"
+QNN_QUANT="${QNN_QUANT:-fp16}"
+QNN_VISION_QUANT="${QNN_VISION_QUANT:-${QNN_QUANT}}"
+QNN_DECODER_QUANT="${QNN_DECODER_QUANT:-${QNN_QUANT}}"
+QNN_EMBEDDING_QUANT="${QNN_EMBEDDING_QUANT:-${QNN_QUANT}}"
 QNN_PROMPT="${QNN_PROMPT:-Can you describe this image?}"
 QNN_IMAGE_PATH="${QNN_IMAGE_PATH:-http://images.cocodataset.org/val2017/000000039769.jpg}"
 
@@ -107,6 +115,30 @@ length_tag() {
 model_size_tag() {
   local decoder_model="$1"
   echo "${decoder_model#internvl3_}"
+}
+
+qnn_quant_tag_value() {
+  local quant="${1,,}"
+  case "${quant}" in
+    fp16|16a16w) echo "16a16w" ;;
+    16a8w|16a4w|16a4w_block|8a8w|8a4w) echo "${quant}" ;;
+    *) die "unsupported QNN quant mode for artifact tag: ${1}" ;;
+  esac
+}
+
+qnn_artifact_quant_tag() {
+  local vision
+  local decoder
+  local embedding
+  vision="$(qnn_quant_tag_value "${QNN_VISION_QUANT}")"
+  decoder="$(qnn_quant_tag_value "${QNN_DECODER_QUANT}")"
+  embedding="$(qnn_quant_tag_value "${QNN_EMBEDDING_QUANT}")"
+
+  if [[ "${vision}" == "${decoder}" && "${decoder}" == "${embedding}" ]]; then
+    echo "${decoder}"
+  else
+    echo "v${vision}_d${decoder}_e${embedding}"
+  fi
 }
 
 hf_model_dirname() {
@@ -159,10 +191,12 @@ run_qnn_export() {
   local length="$2"
   local model_size
   local tag
+  local quant_tag
   local artifact_root
   model_size="$(model_size_tag "${decoder_model}")"
   tag="$(length_tag "${length}")"
-  artifact_root="${QNN_ARTIFACT_BASE}/internvl3_${model_size}_${QNN_MODEL_MODE}_${QNN_PREFILL_AR_LEN}p_${tag}"
+  quant_tag="$(qnn_artifact_quant_tag)"
+  artifact_root="${QNN_ARTIFACT_BASE}/internvl3_${model_size}_${QNN_MODEL_MODE}_${QNN_PREFILL_AR_LEN}p_${tag}_${quant_tag}"
 
   maybe_skip_existing "${artifact_root}" && return 0
 
@@ -179,9 +213,9 @@ run_qnn_export() {
     --max_seq_len "${length}"
     --max_context_len "${length}"
     --dtype fp32
-    --vision_quant fp16
-    --decoder_quant fp16
-    --embedding_quant fp16
+    --vision_quant "${QNN_VISION_QUANT}"
+    --decoder_quant "${QNN_DECODER_QUANT}"
+    --embedding_quant "${QNN_EMBEDDING_QUANT}"
     --prompts "${QNN_PROMPT}"
     --image_path "${QNN_IMAGE_PATH}"
   )

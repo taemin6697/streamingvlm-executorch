@@ -259,6 +259,57 @@ void merge_image_features_typed(
   }
 }
 
+template <typename T>
+::executorch::extension::TensorPtr copy_single_embedding_typed(
+    const T* src,
+    int64_t hidden_dim,
+    executorch::aten::ScalarType scalar_type) {
+  std::vector<T> data(src, src + hidden_dim);
+  return make_tensor_ptr(
+      std::vector<executorch::aten::SizesType>{
+          1, 1, static_cast<executorch::aten::SizesType>(hidden_dim)},
+      std::move(data),
+      {},
+      {},
+      scalar_type);
+}
+
+::executorch::extension::TensorPtr image_embedding_at(
+    const std::vector<executorch::aten::Tensor>& image_tensors,
+    size_t image_token_offset) {
+  size_t offset = image_token_offset;
+  for (const auto& image_tensor : image_tensors) {
+    const int64_t image_seq_len = image_tensor.size(1);
+    const int64_t hidden_dim = image_tensor.size(2);
+    if (offset >= static_cast<size_t>(image_seq_len)) {
+      offset -= static_cast<size_t>(image_seq_len);
+      continue;
+    }
+    switch (image_tensor.scalar_type()) {
+      case executorch::aten::ScalarType::Float: {
+        const auto* src = image_tensor.const_data_ptr<float>() + offset * hidden_dim;
+        return copy_single_embedding_typed<float>(
+            src, hidden_dim, executorch::aten::ScalarType::Float);
+      }
+      case executorch::aten::ScalarType::Half: {
+        const auto* src =
+            image_tensor.const_data_ptr<executorch::aten::Half>() + offset * hidden_dim;
+        return copy_single_embedding_typed<executorch::aten::Half>(
+            src, hidden_dim, executorch::aten::ScalarType::Half);
+      }
+      case executorch::aten::ScalarType::BFloat16: {
+        const auto* src =
+            image_tensor.const_data_ptr<executorch::aten::BFloat16>() + offset * hidden_dim;
+        return copy_single_embedding_typed<executorch::aten::BFloat16>(
+            src, hidden_dim, executorch::aten::ScalarType::BFloat16);
+      }
+      default:
+        ET_CHECK_MSG(false, "Unsupported image embedding dtype for XNNPACK split backend");
+    }
+  }
+  ET_CHECK_MSG(false, "Image placeholder offset is out of range");
+}
+
 executorch::runtime::Result<executorch::aten::Tensor> run_token_embedding(
     Module& embedding_module,
     const std::vector<uint64_t>& tokens) {
@@ -271,6 +322,54 @@ executorch::runtime::Result<executorch::aten::Tensor> run_token_embedding(
     return outputs.error();
   }
   return outputs->at(0).toTensor();
+}
+
+executorch::runtime::Result<executorch::aten::Tensor> run_token_id_decoder_forward(
+    Module& decoder_module,
+    const std::vector<uint64_t>& tokens,
+    int64_t& start_pos) {
+  std::vector<int64_t> cache_positions;
+  auto cache_position_tensor = populate_start_pos_or_cache_position(
+      &decoder_module, start_pos, cache_positions, static_cast<int>(tokens.size()));
+  if (!cache_position_tensor.ok()) {
+    return cache_position_tensor.error();
+  }
+  auto token_tensor = from_blob(
+      const_cast<uint64_t*>(tokens.data()),
+      {1, static_cast<executorch::aten::SizesType>(tokens.size())},
+      executorch::aten::ScalarType::Long);
+  auto outputs =
+      decoder_module.execute("forward", {token_tensor, *cache_position_tensor.get()});
+  if (!outputs.ok()) {
+    return outputs.error();
+  }
+  return outputs->at(0).toTensor();
+}
+
+bool decoder_uses_dynamic_shape(Module& decoder_module) {
+  auto value = decoder_module.get("enable_dynamic_shape");
+  if (!value.ok()) {
+    return true;
+  }
+  if (value->isBool()) {
+    return value->toBool();
+  }
+  if (value->isInt()) {
+    return value->toInt() != 0;
+  }
+  return true;
+}
+
+int64_t static_embedding_seq_len(Module& embedding_module) {
+  auto method_meta = embedding_module.method_meta("forward");
+  if (!method_meta.ok()) {
+    return -1;
+  }
+  auto input_meta = method_meta->input_tensor_meta(0);
+  if (!input_meta.ok() || input_meta->sizes().size() < 2) {
+    return -1;
+  }
+  return input_meta->sizes()[1];
 }
 
 executorch::runtime::Result<executorch::aten::Tensor> run_decoder_forward(
@@ -312,8 +411,17 @@ class XnnpackBackendRunner final : public BackendRunner {
   }
 
   executorch::runtime::Error run(const UnifiedRunConfig& config) override {
-    ET_CHECK_MSG(!config.frame_dir.empty(), "--frame_dir is required.");
-    ET_CHECK_MSG(config.frame_count > 0, "--frame_count must be > 0.");
+    const bool decoder_uses_token_ids = manifest_.decoder_input_mode == "token_ids";
+    ET_CHECK_MSG(
+        manifest_.decoder_input_mode == "embeddings" || decoder_uses_token_ids,
+        "Unsupported decoder_input_mode: %s",
+        manifest_.decoder_input_mode.c_str());
+    ET_CHECK_MSG(
+        decoder_uses_token_ids || !config.frame_dir.empty(),
+        "--frame_dir is required for embedding-input decoder artifacts.");
+    ET_CHECK_MSG(
+        decoder_uses_token_ids || config.frame_count > 0,
+        "--frame_count must be > 0 for embedding-input decoder artifacts.");
 
     const long t_run_start = executorch::extension::llm::time_in_ms();
     std::unique_ptr<std::ofstream> fproc;
@@ -338,17 +446,22 @@ class XnnpackBackendRunner final : public BackendRunner {
         "Failed to load tokenizer: %s",
         manifest_.paths.tokenizer_path.c_str());
     const auto eos_token_id = static_cast<uint64_t>(tokenizer->eos_tok());
-    const auto image_placeholder_id = placeholder_token_id(tokenizer.get());
+    const auto image_placeholder_id =
+        decoder_uses_token_ids ? 0 : placeholder_token_id(tokenizer.get());
     const auto stop_ids = stop_token_ids(tokenizer.get());
 
-    Module vision_module(
-        manifest_.paths.vision_encoder_pte,
-        Module::LoadMode::MmapUseMlockIgnoreErrors);
-    Module embedding_module(
-        manifest_.paths.text_embedding_pte,
-        Module::LoadMode::MmapUseMlockIgnoreErrors);
-    ET_CHECK_OK_OR_RETURN_ERROR(vision_module.load_method("forward"));
-    ET_CHECK_OK_OR_RETURN_ERROR(embedding_module.load_method("forward"));
+    std::unique_ptr<Module> vision_module;
+    std::unique_ptr<Module> embedding_module;
+    if (!decoder_uses_token_ids) {
+      vision_module = std::make_unique<Module>(
+          manifest_.paths.vision_encoder_pte,
+          Module::LoadMode::MmapUseMlockIgnoreErrors);
+      embedding_module = std::make_unique<Module>(
+          manifest_.paths.text_embedding_pte,
+          Module::LoadMode::MmapUseMlockIgnoreErrors);
+      ET_CHECK_OK_OR_RETURN_ERROR(vision_module->load_method("forward"));
+      ET_CHECK_OK_OR_RETURN_ERROR(embedding_module->load_method("forward"));
+    }
     const long t_load_end = executorch::extension::llm::time_in_ms();
     const long rss_load_end = rss_kb();
     write_proc_row(
@@ -362,14 +475,14 @@ class XnnpackBackendRunner final : public BackendRunner {
 
     std::vector<executorch::aten::Tensor> image_tensors;
     image_tensors.reserve(config.frame_count);
-    for (int idx = 0; idx < config.frame_count; ++idx) {
+    for (int idx = 0; !decoder_uses_token_ids && idx < config.frame_count; ++idx) {
       const long t_vision_start = executorch::extension::llm::time_in_ms();
       const long rss_vision_start = rss_kb();
       auto frame_tensor = load_preprocessed_frame(frame_path(config.frame_dir, idx), 448);
-      // fp16 vision encoder expects Half; frame .bin is always float32
-      auto frame_fp16 =
+      // fp16 vision artifacts expect Half; frame .bin is always float32.
+      auto vision_input =
           clone_tensor_ptr(*frame_tensor, executorch::aten::ScalarType::Half);
-      auto outputs = vision_module.execute("forward", frame_fp16);
+      auto outputs = vision_module->execute("forward", vision_input);
       ET_CHECK_OK_OR_RETURN_ERROR(outputs.error());
       image_tensors.push_back(outputs->at(0).toTensor());
       const long t_vision_end = executorch::extension::llm::time_in_ms();
@@ -388,48 +501,125 @@ class XnnpackBackendRunner final : public BackendRunner {
 
     std::ostringstream final_output;
     for (const auto& question : split_questions(config.questions)) {
-      std::string full_prompt = build_full_prompt_text(config.frame_count, question);
+      std::string full_prompt = decoder_uses_token_ids
+          ? ("<|im_start|>user:\n" + question + "<|im_end|>\n<|im_start|>assistant\n")
+          : build_full_prompt_text(config.frame_count, question);
       auto encoded = tokenizer->encode(full_prompt, 0, 0);
       ET_CHECK_MSG(encoded.ok(), "Failed to encode prompt for question");
       std::vector<uint64_t> prompt_tokens = std::move(*encoded);
       final_output << full_prompt;
 
-      const long t_merge_start = executorch::extension::llm::time_in_ms();
-      const long rss_merge_start = rss_kb();
-      auto text_embeddings_res = run_token_embedding(embedding_module, prompt_tokens);
-      ET_CHECK_OK_OR_RETURN_ERROR(text_embeddings_res.error());
-      auto text_embeddings = text_embeddings_res.get();
-
-      auto merged_embeddings = build_merged_embeddings(
-          text_embeddings, image_tensors, prompt_tokens, image_placeholder_id);
-      int64_t start_pos = 0;
-      const long t_merge_end = executorch::extension::llm::time_in_ms();
-      const long rss_merge_end = rss_kb();
-      write_proc_row(
-          fproc.get(),
-          "EmbeddingAndMerging",
-          t_merge_start,
-          t_merge_end,
-          t_run_start,
-          rss_merge_start,
-          rss_merge_end,
-          static_cast<long>(prompt_tokens.size()));
-
       Module decoder_module(
           manifest_.paths.text_decoder_pte,
           Module::LoadMode::MmapUseMlockIgnoreErrors);
       ET_CHECK_OK_OR_RETURN_ERROR(decoder_module.load_method("forward"));
+      const bool enable_dynamic_shape = decoder_uses_dynamic_shape(decoder_module);
+      if (!enable_dynamic_shape) {
+        ET_CHECK_MSG(
+            !decoder_uses_token_ids,
+            "Token-id decoder artifacts are expected to use dynamic shape.");
+        ET_CHECK_MSG(
+            embedding_module != nullptr,
+            "Static embedding-input decoder requires text_embedding_pte.");
+        const int64_t embedding_seq_len = static_embedding_seq_len(*embedding_module);
+        ET_CHECK_MSG(
+            embedding_seq_len == 1,
+            "Static XNNPACK runner expects text_embedding_xnnpack.pte input "
+            "shape [1,1]. Got [1,%lld]. Re-export static artifacts after the "
+            "sequential static export fix.",
+            static_cast<long long>(embedding_seq_len));
+      }
 
+      int64_t start_pos = 0;
+      uint64_t cur_token = 0;
       const long t_prefill_start = executorch::extension::llm::time_in_ms();
       const long rss_prefill_start = rss_kb();
-      auto logits_res = run_decoder_forward(
-          decoder_module,
-          *merged_embeddings,
-          start_pos,
-          static_cast<int>(prompt_tokens.size()));
-      ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
-      auto logits = logits_res.get();
-      start_pos += static_cast<int64_t>(prompt_tokens.size());
+      if (enable_dynamic_shape) {
+        const long t_merge_start = executorch::extension::llm::time_in_ms();
+        const long rss_merge_start = rss_kb();
+        const bool decoder_uses_vulkan =
+            manifest_.paths.text_decoder_pte.find("vulkan") != std::string::npos;
+        if (decoder_uses_token_ids) {
+          auto logits_res =
+              run_token_id_decoder_forward(decoder_module, prompt_tokens, start_pos);
+          ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
+          auto logits = logits_res.get();
+          cur_token = static_cast<uint64_t>(
+              logits_to_token(logits, static_cast<float>(config.temperature)));
+          start_pos += static_cast<int64_t>(prompt_tokens.size());
+        } else {
+          auto text_embeddings_res = run_token_embedding(*embedding_module, prompt_tokens);
+        ET_CHECK_OK_OR_RETURN_ERROR(text_embeddings_res.error());
+        auto text_embeddings = text_embeddings_res.get();
+
+        auto merged_embeddings = build_merged_embeddings(
+            text_embeddings, image_tensors, prompt_tokens, image_placeholder_id);
+        const long t_merge_end = executorch::extension::llm::time_in_ms();
+        const long rss_merge_end = rss_kb();
+        write_proc_row(
+            fproc.get(),
+            "EmbeddingAndMerging",
+            t_merge_start,
+            t_merge_end,
+            t_run_start,
+            rss_merge_start,
+            rss_merge_end,
+            static_cast<long>(prompt_tokens.size()));
+
+          auto decoder_embeddings = decoder_uses_vulkan
+              ? clone_tensor_ptr(*merged_embeddings, executorch::aten::ScalarType::Float)
+              : std::move(merged_embeddings);
+          auto logits_res = run_decoder_forward(
+            decoder_module,
+            *decoder_embeddings,
+            start_pos,
+            static_cast<int>(prompt_tokens.size()));
+        ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
+        auto logits = logits_res.get();
+        cur_token = static_cast<uint64_t>(
+            logits_to_token(logits, static_cast<float>(config.temperature)));
+        start_pos += static_cast<int64_t>(prompt_tokens.size());
+        }
+      } else {
+        const long t_merge_start = executorch::extension::llm::time_in_ms();
+        const long rss_merge_start = rss_kb();
+        const long t_merge_end = t_merge_start;
+        const long rss_merge_end = rss_merge_start;
+        write_proc_row(
+            fproc.get(),
+            "EmbeddingAndMerging",
+            t_merge_start,
+            t_merge_end,
+            t_run_start,
+            rss_merge_start,
+            rss_merge_end,
+            static_cast<long>(prompt_tokens.size()));
+
+        size_t image_token_offset = 0;
+        for (uint64_t token : prompt_tokens) {
+          if (token == image_placeholder_id) {
+            auto token_embedding = image_embedding_at(image_tensors, image_token_offset++);
+            auto logits_res =
+                run_decoder_forward(decoder_module, *token_embedding, start_pos, 1);
+            ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
+            auto logits = logits_res.get();
+            cur_token = static_cast<uint64_t>(
+                logits_to_token(logits, static_cast<float>(config.temperature)));
+          } else {
+            std::vector<uint64_t> token_input{token};
+            auto token_embedding_res = run_token_embedding(*embedding_module, token_input);
+            ET_CHECK_OK_OR_RETURN_ERROR(token_embedding_res.error());
+            auto token_embedding = token_embedding_res.get();
+            auto logits_res =
+                run_decoder_forward(decoder_module, token_embedding, start_pos, 1);
+            ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
+            auto logits = logits_res.get();
+            cur_token = static_cast<uint64_t>(
+                logits_to_token(logits, static_cast<float>(config.temperature)));
+          }
+          start_pos += 1;
+        }
+      }
       const long t_prefill_end = executorch::extension::llm::time_in_ms();
       const long rss_prefill_end = rss_kb();
       write_proc_row(
@@ -441,8 +631,6 @@ class XnnpackBackendRunner final : public BackendRunner {
           rss_prefill_start,
           rss_prefill_end,
           static_cast<long>(prompt_tokens.size()));
-      uint64_t cur_token =
-          static_cast<uint64_t>(logits_to_token(logits, static_cast<float>(config.temperature)));
       uint64_t prev_token = cur_token;
       int64_t kv_pos = static_cast<int64_t>(prompt_tokens.size());
       std::ostringstream answer;
@@ -462,22 +650,37 @@ class XnnpackBackendRunner final : public BackendRunner {
         }
 
         std::vector<uint64_t> next_token{cur_token};
-        auto next_emb_res = run_token_embedding(embedding_module, next_token);
-        ET_CHECK_OK_OR_RETURN_ERROR(next_emb_res.error());
-        auto next_emb = next_emb_res.get();
-
         const long t_token_start = executorch::extension::llm::time_in_ms();
         const long rss_token_start = rss_kb();
         start_pos = kv_pos;
-        auto next_logits_res =
-            run_decoder_forward(decoder_module, next_emb, start_pos, 1);
-        ET_CHECK_OK_OR_RETURN_ERROR(next_logits_res.error());
-        auto next_logits = next_logits_res.get();
+        uint64_t sampled_token = 0;
+        if (decoder_uses_token_ids) {
+          auto next_logits_res =
+              run_token_id_decoder_forward(decoder_module, next_token, start_pos);
+          ET_CHECK_OK_OR_RETURN_ERROR(next_logits_res.error());
+          auto next_logits = next_logits_res.get();
+          sampled_token = static_cast<uint64_t>(
+              logits_to_token(next_logits, static_cast<float>(config.temperature)));
+        } else {
+          auto next_emb_res = run_token_embedding(*embedding_module, next_token);
+          ET_CHECK_OK_OR_RETURN_ERROR(next_emb_res.error());
+          auto next_emb = next_emb_res.get();
+          const bool decoder_uses_vulkan =
+              manifest_.paths.text_decoder_pte.find("vulkan") != std::string::npos;
+          auto decoder_next_emb = decoder_uses_vulkan
+              ? clone_tensor_ptr(next_emb, executorch::aten::ScalarType::Float)
+              : clone_tensor_ptr(next_emb, next_emb.scalar_type());
+          auto next_logits_res =
+              run_decoder_forward(decoder_module, *decoder_next_emb, start_pos, 1);
+          ET_CHECK_OK_OR_RETURN_ERROR(next_logits_res.error());
+          auto next_logits = next_logits_res.get();
+          sampled_token = static_cast<uint64_t>(
+              logits_to_token(next_logits, static_cast<float>(config.temperature)));
+        }
         const long t_token_end = executorch::extension::llm::time_in_ms();
         const long rss_token_end = rss_kb();
         prev_token = cur_token;
-        cur_token = static_cast<uint64_t>(
-            logits_to_token(next_logits, static_cast<float>(config.temperature)));
+        cur_token = sampled_token;
         kv_pos += 1;
         write_proc_row(
             fproc.get(),

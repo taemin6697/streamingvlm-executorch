@@ -30,6 +30,7 @@ struct ManifestData {
   std::string model_family;
   std::string variant;
   std::string runner_type;
+  std::string decoder_input_mode{"embeddings"};
   ManifestPaths paths;
 };
 

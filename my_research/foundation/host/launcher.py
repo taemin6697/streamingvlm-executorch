@@ -295,6 +295,12 @@ def _run_unified_xnnpack(
     remote_root = _remote_cache_root(manifest)
     remote_frames = f"{remote_root}/frames"
     remote_runner = f"{remote_root}/xnnpack_qnn_runner"
+    text_only = image is None and video is None
+    decoder_input_mode = (
+        manifest.metadata.get("decoder_input_mode")
+        or manifest.export.get("decoder_input_mode")
+        or "embeddings"
+    )
 
     with tempfile.TemporaryDirectory(prefix="foundation_xnnpack_") as tmpdir:
         tmpdir = Path(tmpdir)
@@ -306,7 +312,12 @@ def _run_unified_xnnpack(
         elif video:
             frame_count = _extract_frames(video, 1.0, frame_dir, manifest.variant)
         else:
-            raise SystemExit("XNNPACK unified run requires --image or --video")
+            if decoder_input_mode != "token_ids":
+                raise SystemExit(
+                    "XNNPACK/Vulkan text-only run requires a token-id decoder artifact. "
+                    "Use --image or --video for embedding-input artifacts."
+                )
+            frame_count = 0
 
         device_manifest = manifest.resolve_paths(manifest_path.parent)
         rel_paths = {}
@@ -346,11 +357,12 @@ def _run_unified_xnnpack(
                     force_push=force_push,
                 )
 
-        # Inputs can change between runs, so refresh only the frame directory.
-        _run(adb + ["shell", "rm", "-rf", remote_frames])
-        _run(adb + ["shell", "mkdir", "-p", remote_frames])
-        # adb push dir dest -> dest/dir/ 생성. 내용만 푸시하려면 dir/. 사용
-        _run(adb + ["push", str(frame_dir) + "/.", remote_frames])
+        if not text_only:
+            # Inputs can change between runs, so refresh only the frame directory.
+            _run(adb + ["shell", "rm", "-rf", remote_frames])
+            _run(adb + ["shell", "mkdir", "-p", remote_frames])
+            # adb push dir dest -> dest/dir/ 생성. 내용만 푸시하려면 dir/. 사용
+            _run(adb + ["push", str(frame_dir) + "/.", remote_frames])
         _run(adb + ["shell", "chmod", "+x", remote_runner])
 
         encoder_path = device_manifest.paths.get("vision_encoder_pte", "encoder.pte")
@@ -359,17 +371,19 @@ def _run_unified_xnnpack(
         tokenizer_path = device_manifest.paths.get("tokenizer_path", "tokenizer.bin")
 
         args = [
-            "--backend=xnnpack",
+            f"--backend={manifest.backend}",
             f"--encoder_path={encoder_path}",
             f"--embedding_path={embedding_path}",
             f"--decoder_path={decoder_path}",
             f"--tokenizer_path={tokenizer_path}",
-            f"--image_path={remote_frames}",
             f"--seq_len={seq_len or 128}",
             f"--temperature={temperature if temperature is not None else 0.0}",
             f"--eval_mode={eval_mode}",
             f"--output_path=foundation_output.txt",
         ]
+        if not text_only:
+            args.append(f"--image_path={remote_frames}")
+        args.append(f"--decoder_input_mode={decoder_input_mode}")
         for q in questions:
             args.extend(["--prompt", shlex.quote(q)])
         if save_log:
@@ -545,11 +559,15 @@ def run_with_manifest(
             force_push=force_push,
         )
 
-    if manifest.backend == "xnnpack":
+    if manifest.backend in {"xnnpack", "vulkan"}:
         if not runner_binary:
-            raise SystemExit("XNNPACK foundation 실행에는 --runner_binary xnnpack_qnn_runner 가 필요합니다.")
+            raise SystemExit(
+                f"{manifest.backend} foundation 실행에는 --runner_binary xnnpack_qnn_runner 가 필요합니다."
+            )
         if Path(runner_binary).name != "xnnpack_qnn_runner":
-            raise SystemExit("XNNPACK foundation 실행은 xnnpack_qnn_runner 만 지원합니다.")
+            raise SystemExit(
+                f"{manifest.backend} foundation 실행은 xnnpack_qnn_runner 만 지원합니다."
+            )
         return _run_unified_xnnpack(
             manifest,
             Path(manifest_path),

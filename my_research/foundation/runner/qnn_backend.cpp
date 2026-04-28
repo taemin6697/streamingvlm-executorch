@@ -7,12 +7,12 @@
  */
 
 #include "backend.h"
+#include "foundation_qnn_multimodal_runner.h"
 #include "internal_memory_sampler.h"
 
 #ifdef FOUNDATION_ENABLE_QNN
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/chat_template.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/encoder.h>
-#include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/utils.h>
 #include <executorch/extension/llm/runner/image.h>
 #include <executorch/extension/llm/runner/util.h>
@@ -38,6 +38,7 @@ namespace {
 
 constexpr const char* kFoundationProcCsv = "foundation_proc.csv";
 constexpr const char* kAndroidMemoryTimelineCsv = "android_memory_timeline.csv";
+constexpr int32_t kInternVL3ImageSeqLen = 256;
 
 long rss_kb() {
   const size_t bytes = executorch::extension::llm::get_rss_bytes();
@@ -52,7 +53,10 @@ void write_proc_header(std::ofstream& fproc) {
   fproc << "row_type,elapsed_s_start,elapsed_s_end,rss_kb_start,rss_kb_end,"
            "col_a_ms,col_b_ms,total_ms,kv_pos,kv_total,kv_used_pct,"
            "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
-  fproc << "# L: Loading  Decode: QNN multimodal generate call\n";
+  fproc << "# L: Loading  V_Encode: QNN vision encoder  "
+           "EmbeddingAndMerging: text embedding + multimodal merge  "
+           "T_Prefill: QNN prompt prefill  Decode: QNN token generation  "
+           "D: token callback timing\n";
 }
 
 void write_proc_row(
@@ -73,6 +77,57 @@ void write_proc_row(
          << rss_end << "," << total_ms << ",," << total_ms << ",,,,,,,"
          << token_idx << "\n";
   fproc->flush();
+}
+
+void write_phase_row(
+    std::ofstream* fproc,
+    const char* row_type,
+    const QnnProfilePhaseTiming& timing,
+    long run_start_ms,
+    int64_t kv_pos = 0,
+    int64_t kv_total = 0,
+    int64_t kv_total_kb = 0,
+    int64_t token_idx = 0) {
+  if (fproc == nullptr || !fproc->is_open() || timing.start_ms <= 0 ||
+      timing.end_ms < timing.start_ms) {
+    return;
+  }
+  const long total_ms = timing.end_ms - timing.start_ms;
+  const double kv_pct = kv_total > 0 ? 100.0 * kv_pos / kv_total : 0.0;
+  const int64_t kv_used_kb =
+      (kv_total > 0 && kv_total_kb > 0) ? (kv_pos * kv_total_kb) / kv_total : 0;
+  *fproc << row_type << "," << elapsed_s(timing.start_ms, run_start_ms) << ","
+         << elapsed_s(timing.end_ms, run_start_ms) << ","
+         << timing.rss_kb_start << "," << timing.rss_kb_end << ","
+         << total_ms << ",," << total_ms << ","
+         << kv_pos << "," << kv_total << "," << kv_pct << ","
+         << kv_used_kb << "," << kv_total_kb << ",,"
+         << token_idx << "\n";
+  fproc->flush();
+}
+
+void write_token_row(
+    std::ofstream* fproc,
+    const QnnProfileTokenTiming& timing,
+    long run_start_ms,
+    int64_t kv_total,
+    int64_t kv_total_kb) {
+  if (fproc == nullptr || !fproc->is_open()) {
+    return;
+  }
+  const long total_ms = timing.end_ms - timing.start_ms;
+  const double kv_pct =
+      kv_total > 0 ? 100.0 * timing.kv_pos / kv_total : 0.0;
+  const int64_t kv_used_kb = (kv_total > 0 && kv_total_kb > 0)
+      ? (timing.kv_pos * kv_total_kb) / kv_total
+      : 0;
+  *fproc << "D," << elapsed_s(timing.start_ms, run_start_ms) << ","
+         << elapsed_s(timing.end_ms, run_start_ms) << ","
+         << timing.rss_kb << "," << timing.rss_kb << ",,"
+         << total_ms << "," << total_ms << ","
+         << timing.kv_pos << "," << kv_total << "," << kv_pct << ","
+         << kv_used_kb << "," << kv_total_kb << ",,"
+         << timing.token_idx << "\n";
 }
 
 std::string frame_path(const std::string& dir, int idx) {
@@ -164,7 +219,7 @@ executorch::runtime::Error run_batch_qnn(
       manifest.paths.text_decoder_pte,
       Module::LoadMode::MmapUseMlockIgnoreErrors);
 
-  example::QNNMultimodalRunner<T> runner(
+  ProfiledQNNMultimodalRunner<T> runner(
       std::move(encoder_module),
       std::move(embedding_module),
       std::move(decoder_module),
@@ -223,14 +278,22 @@ executorch::runtime::Error run_batch_qnn(
   }
   std::vector<std::string> audio_paths;
   auto prompts = split_questions(config.questions);
+  const std::vector<std::string> output_prompts = prompts;
   auto messages = prepare_messages(prompts, image_paths, audio_paths);
   int token_idx = 0;
-  for (const auto& message : messages) {
+  for (size_t message_idx = 0; message_idx < messages.size(); ++message_idx) {
+    const auto& message = messages[message_idx];
     std::vector<char> out_buf;
     auto cb = [&](const std::string& piece) {
       for (char c : piece) {
         out_buf.push_back(c);
       }
+    };
+    int64_t num_prompt_tokens = 0;
+    int64_t num_generated_tokens = 0;
+    auto stats_cb = [&](const executorch::extension::llm::Stats& stats) {
+      num_prompt_tokens = stats.num_prompt_tokens;
+      num_generated_tokens = stats.num_generated_tokens;
     };
 
     std::vector<MultimodalInput> inputs;
@@ -245,19 +308,92 @@ executorch::runtime::Error run_batch_qnn(
     inputs = dispatch_inputs(inputs, formatted_prompt);
     const long t_generate_start = executorch::extension::llm::time_in_ms();
     const long rss_generate_start = rss_kb();
-    ET_CHECK_OK_OR_RETURN_ERROR(runner.generate(inputs, gen_config, cb));
+    ET_CHECK_OK_OR_RETURN_ERROR(runner.generate(inputs, gen_config, cb, stats_cb));
     const long t_generate_end = executorch::extension::llm::time_in_ms();
     const long rss_generate_end = rss_kb();
-    write_proc_row(
+    const auto& timings = runner.last_generate_timings();
+    const int64_t kv_total = runner.context_len();
+    const int64_t kv_total_kb =
+        static_cast<int64_t>(runner.kv_cache_total_bytes() / 1024);
+    const int64_t kv_prefill = num_prompt_tokens;
+    const int64_t kv_after = runner.cur_pos();
+
+    write_phase_row(
+        fproc.get(),
+        "V_Encode",
+        timings.vision_encode,
+        t_run_start,
+        /*kv_pos=*/0,
+        kv_total,
+        kv_total_kb,
+        token_idx);
+    QnnProfilePhaseTiming adjusted_embedding = timings.embedding_and_merging;
+    if (timings.vision_encode.start_ms > 0 &&
+        timings.vision_encode.end_ms > timings.vision_encode.start_ms &&
+        adjusted_embedding.start_ms > 0 &&
+        adjusted_embedding.end_ms > adjusted_embedding.start_ms) {
+      const long embedding_ms =
+          adjusted_embedding.end_ms - adjusted_embedding.start_ms;
+      const long vision_ms =
+          timings.vision_encode.end_ms - timings.vision_encode.start_ms;
+      const long adjusted_ms = std::max<long>(0, embedding_ms - vision_ms);
+      adjusted_embedding.start_ms = timings.vision_encode.end_ms;
+      adjusted_embedding.end_ms = adjusted_embedding.start_ms + adjusted_ms;
+      if (timings.prefill.start_ms > 0 &&
+          adjusted_embedding.end_ms > timings.prefill.start_ms) {
+        adjusted_embedding.end_ms = timings.prefill.start_ms;
+      }
+    }
+    write_phase_row(
+        fproc.get(),
+        "EmbeddingAndMerging",
+        adjusted_embedding,
+        t_run_start,
+        /*kv_pos=*/0,
+        kv_total,
+        kv_total_kb,
+        token_idx);
+    write_phase_row(
+        fproc.get(),
+        "T_Prefill",
+        timings.prefill,
+        t_run_start,
+        kv_prefill,
+        kv_total,
+        kv_total_kb,
+        token_idx);
+    write_phase_row(
         fproc.get(),
         "Decode",
-        t_generate_start,
-        t_generate_end,
+        timings.decode,
         t_run_start,
-        rss_generate_start,
-        rss_generate_end,
-        token_idx++);
-    fout << std::string(out_buf.begin(), out_buf.end()) << "\n";
+        kv_after,
+        kv_total,
+        kv_total_kb,
+        token_idx);
+    for (const auto& token_timing : timings.token_timings) {
+      write_token_row(fproc.get(), token_timing, t_run_start, kv_total, kv_total_kb);
+    }
+    if (timings.decode.start_ms <= 0) {
+      write_proc_row(
+          fproc.get(),
+          "Decode",
+          t_generate_start,
+          t_generate_end,
+          t_run_start,
+          rss_generate_start,
+          rss_generate_end,
+          token_idx);
+    }
+    (void)num_generated_tokens;
+    token_idx++;
+    const std::string output_prompt = build_batch_prompt(
+        "internvl3",
+        config.frame_count,
+        kInternVL3ImageSeqLen,
+        message_idx < output_prompts.size() ? output_prompts[message_idx]
+                                            : config.questions);
+    fout << output_prompt << std::string(out_buf.begin(), out_buf.end()) << "\n";
   }
   if (memory_sampler) {
     memory_sampler->stop();

@@ -172,12 +172,12 @@ cd /workspace/streamingvlm
 
 python -m my_research.foundation.cli export \
   --backend vulkan \
-  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_2k \
+  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k \
   --decoder_model internvl3_1b \
   --model_path /workspace/streamingvlm/my_research/foundation/results/model/hf/InternVL3-1B-hf \
   --checkpoint /workspace/streamingvlm/my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth \
-  --max_seq_len 2048 \
-  --max_context_len 2048 \
+  --max_seq_len 1024 \
+  --max_context_len 1024 \
   --dtype fp16 \
   --vision_quant fp16 \
   --decoder_quant fp16 \
@@ -193,22 +193,27 @@ cd /workspace/streamingvlm
 
 python -m my_research.foundation.cli export \
   --backend qnn \
-  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_qnn_1b_1k_fp16 \
+  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_qnn_1b_512_16a8w \
   --decoder_model internvl3_1b \
   -b executorch/build-android \
   -s R3KYC01FW1P \
   -m SM8750 \
   --model_mode hybrid \
   --prefill_ar_len 16 \
-  --max_seq_len 1024 \
-  --max_context_len 1024 \
+  --max_seq_len 512 \
+  --max_context_len 512 \
   --dtype fp32 \
-  --vision_quant fp16 \
-  --decoder_quant fp16 \
-  --embedding_quant fp16 \
+  --vision_quant 16a8w \
+  --decoder_quant 16a8w \
+  --embedding_quant 16a8w \
   --prompts "Can you describe this image?" \
   --image_path "http://images.cocodataset.org/val2017/000000039769.jpg"
 ```
+
+QNN quantization modes use Qualcomm-style names: `16a16w`, `16a8w`,
+`16a4w`, `16a4w_block`, `8a8w`, and `8a4w`. For QNN only, legacy
+`fp16` is treated as an alias for `16a16w`, which makes comparisons with
+XNNPACK fp16 exports explicit.
 
 ### 4.4 Batch Export
 
@@ -246,7 +251,7 @@ Check that these paths exist:
 
 ```bash
 python -m my_research.foundation.cli run \
-  --manifest /workspace/streamingvlm/my_research/foundation/results/model/xnnpack/internvl3_xnnpack_1b_1k_fp16/manifest.json \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/xnnpack/internvl3_xnnpack_1b_1k_fp16_static/manifest.json \
   --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
   --device R3KYC01FW1P \
   --image http://images.cocodataset.org/val2017/000000039769.jpg \
@@ -255,6 +260,15 @@ python -m my_research.foundation.cli run \
   --temperature 0.0 \
   --save_log
 ```
+
+For XNNPACK, dynamic and static artifacts use different runner paths:
+
+- Dynamic shape artifact: prompt prefill can run with the actual prompt length,
+  and decode uses 1-token inputs.
+- Static shape artifact: matches upstream ExecuTorch static KV-cache behavior.
+  Parallel prefill is disabled, so the runner feeds one token/image embedding
+  row at a time. Re-export static artifacts after this behavior change; older
+  `_static` artifacts may have been fixed to a 256-token example shape.
 
 `--save_log` stores run output and memory logs under:
 
@@ -294,7 +308,7 @@ python -m my_research.foundation.cli run \
 
 ```bash
 python -m my_research.foundation.cli run \
-  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_qnn_1b_1k_fp16/manifest.json \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_qnn_1b_2k_fp16/manifest.json \
   --runner_binary /workspace/streamingvlm/executorch/build-android/foundation/xnnpack_qnn_runner \
   -b executorch/build-android \
   -s R3KYC01FW1P \

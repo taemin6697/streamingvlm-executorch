@@ -9,11 +9,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import torch
 from executorch.backends.xnnpack.partition.config.xnnpack_config import ConfigPrecisionType
@@ -160,19 +161,158 @@ def _tokenizer_metadata(tokenizer) -> Tuple[int, List[int]]:
     return int(bos_token_id), eos_ids
 
 
+def _split_pte_names(backend: str) -> Tuple[str, str, str]:
+    if backend == "vulkan":
+        return (
+            "vision_encoder_vulkan",
+            "text_embedding_vulkan",
+            "text_decoder_vulkan",
+        )
+    return (VISION_ENCODER_PTE, TEXT_EMBEDDING_PTE, TEXT_DECODER_PTE)
+
+
+@contextlib.contextmanager
+def _vulkan_preprocess_option_patch() -> Iterator[None]:
+    """Teach ExecuTorch Vulkan preprocess about bool options it already checks."""
+    import executorch.backends.vulkan.vulkan_preprocess as vulkan_preprocess
+    import executorch.backends.vulkan.patterns.sdpa as vulkan_sdpa
+
+    original_parse_compile_spec = vulkan_preprocess.parse_compile_spec
+    original_causal_sdpa_match_init = vulkan_sdpa.CausalSDPAMatch.__init__
+
+    def parse_compile_spec_with_foundation_options(compile_specs):
+        options = original_parse_compile_spec(compile_specs)
+        for spec in compile_specs:
+            if spec.key in {
+                "skip_memory_planning",
+                "skip_tag_memory_metadata",
+                "small_texture_limits",
+            }:
+                options[spec.key] = bool.from_bytes(spec.value, byteorder="little")
+        return options
+
+    def cache_ancestor_nodes(node, depth: int = 4):
+        if depth < 0 or not isinstance(node, torch.fx.Node):
+            return
+        yield node
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                yield from cache_ancestor_nodes(arg, depth - 1)
+            elif isinstance(arg, (tuple, list)):
+                for item in arg:
+                    yield from cache_ancestor_nodes(item, depth - 1)
+
+    def find_update_cache_node_from_ancestors(node):
+        for candidate in cache_ancestor_nodes(node):
+            for user in candidate.users:
+                if vulkan_sdpa.is_update_cache_node(user):
+                    return user
+        return None
+
+    def causal_sdpa_match_with_ancestor_cache_search(self, custom_sdpa_node):
+        original_causal_sdpa_match_init(self, custom_sdpa_node)
+        if not self.match_found:
+            return
+        if self.update_key_cache_node is None:
+            self.update_key_cache_node = find_update_cache_node_from_ancestors(
+                self.key_cache_node
+            )
+            if self.update_key_cache_node is not None:
+                self.key_projection_node = self.update_key_cache_node.args[0]
+        if self.update_value_cache_node is None:
+            self.update_value_cache_node = find_update_cache_node_from_ancestors(
+                self.value_cache_node
+            )
+            if self.update_value_cache_node is not None:
+                self.value_projection_node = self.update_value_cache_node.args[0]
+
+    vulkan_preprocess.parse_compile_spec = parse_compile_spec_with_foundation_options
+    vulkan_sdpa.CausalSDPAMatch.__init__ = causal_sdpa_match_with_ancestor_cache_search
+    try:
+        yield
+    finally:
+        vulkan_preprocess.parse_compile_spec = original_parse_compile_spec
+        vulkan_sdpa.CausalSDPAMatch.__init__ = original_causal_sdpa_match_init
+
+
+def _foundation_vulkan_partitioner(
+    *, dtype: str, enable_dynamic_shape: bool, force_fp16: bool
+):
+    assert (
+        dtype == "fp32" or dtype is None
+    ), "Vulkan backend does not support non fp32 dtype_override; use force_fp16."
+    from executorch.backends.vulkan.partitioner.vulkan_partitioner import (
+        VulkanPartitioner,
+    )
+
+    return VulkanPartitioner(
+        {"require_dynamic_shapes": enable_dynamic_shape, "force_fp16": force_fp16}
+    )
+
+
+def _lower_split_program(
+    exported_program,
+    *,
+    backend: str,
+    enable_dynamic_shape: bool,
+    dtype: str,
+    vulkan_force_fp16: bool = False,
+    xnnpack_partitioner=None,
+    vulkan_fallback_partitioner=None,
+    constant_methods=None,
+):
+    partitioner = xnnpack_partitioner
+    if backend == "vulkan":
+        partitioner = [
+            _foundation_vulkan_partitioner(
+                dtype=dtype,
+                enable_dynamic_shape=enable_dynamic_shape,
+                force_fp16=vulkan_force_fp16,
+            )
+        ]
+        if vulkan_fallback_partitioner:
+            partitioner.extend(vulkan_fallback_partitioner)
+        with _vulkan_preprocess_option_patch():
+            return to_edge_transform_and_lower(
+                exported_program,
+                partitioner=partitioner,
+                constant_methods=constant_methods,
+                compile_config=EdgeCompileConfig(_check_ir_validity=False),
+            )
+    return to_edge_transform_and_lower(
+        exported_program,
+        partitioner=partitioner,
+        constant_methods=constant_methods,
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    )
+
+
 def export_xnnpack(args: argparse.Namespace) -> int:
-    """Foundation-native XNNPACK export. Split PTE only."""
+    """Foundation-native XNNPACK/Vulkan export. Split PTE only."""
     output_dir = Path(args.artifact_root).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    backend = getattr(args, "backend", "xnnpack")
+    if backend not in {"xnnpack", "vulkan"}:
+        raise SystemExit(f"Unsupported split backend: {backend}")
 
     max_context_len = getattr(args, "max_context_len", None) or args.max_seq_len
 
     model_path = args.model_path or _DEFAULT_HF_MODELS.get(args.decoder_model)
     if not model_path:
         raise SystemExit(
-            f"Unsupported decoder_model for XNNPACK: {args.decoder_model}. "
+            f"Unsupported decoder_model for {backend}: {args.decoder_model}. "
             f"Use one of {list(_DEFAULT_HF_MODELS.keys())} or set --model_path."
         )
+    if backend == "vulkan":
+        supported_vulkan_decoder_quant = {"fp16", "8da4w"}
+        if args.vision_quant != "fp16" or args.embedding_quant != "fp16":
+            raise SystemExit(
+                "Vulkan foundation export currently keeps vision/embedding quant as fp16."
+            )
+        if args.decoder_quant not in supported_vulkan_decoder_quant:
+            raise SystemExit(
+                "Vulkan foundation export currently supports decoder_quant fp16 or 8da4w."
+            )
 
     params_path = args.params or str(_default_params_path(args.decoder_model))
 
@@ -185,7 +325,10 @@ def export_xnnpack(args: argparse.Namespace) -> int:
         model_path, args.checkpoint, output_dir
     )
     try:
-        dtype = DType[args.dtype]
+        requested_dtype = args.dtype
+        vulkan_force_fp16 = backend == "vulkan" and requested_dtype == "fp16"
+        export_dtype = "fp32" if backend == "vulkan" else requested_dtype
+        dtype = DType[export_dtype]
         torch_dtype = dtype.to_torch_dtype()
         use_decoder_quant = args.decoder_quant != "fp16"
 
@@ -198,11 +341,12 @@ def export_xnnpack(args: argparse.Namespace) -> int:
         llm_config.base.metadata = json.dumps(
             {"get_bos_id": bos_token_id, "get_eos_ids": eos_ids}
         )
-        llm_config.model.dtype_override = DtypeOverride(args.dtype)
+        llm_config.model.dtype_override = DtypeOverride(export_dtype)
         llm_config.model.use_kv_cache = True
-        llm_config.model.use_sdpa_with_kv_cache = getattr(
-            args, "use_sdpa_with_kv_cache", True
-        )
+        use_sdpa_with_kv_cache = getattr(args, "use_sdpa_with_kv_cache", True)
+        if backend == "vulkan":
+            use_sdpa_with_kv_cache = True
+        llm_config.model.use_sdpa_with_kv_cache = use_sdpa_with_kv_cache
         enable_dynamic_shape = getattr(args, "dynamic_shape", True)
         llm_config.model.enable_dynamic_shape = enable_dynamic_shape
         llm_config.export.max_seq_length = args.max_seq_len
@@ -212,54 +356,39 @@ def export_xnnpack(args: argparse.Namespace) -> int:
         llm_config.quantization.qmode = (
             args.decoder_quant if args.decoder_quant != "fp16" else None
         )
-        llm_config.quantization.group_size = getattr(args, "text_group_size", 128)
+        text_group_size = getattr(args, "text_group_size", None)
+        if text_group_size is None:
+            text_group_size = 64 if backend == "vulkan" and args.decoder_quant == "8da4w" else 128
+        llm_config.quantization.group_size = text_group_size
         llm_config.quantization.embedding_quantize = (
             args.embedding_quant if args.embedding_quant != "fp16" else None
         )
-        llm_config.backend.xnnpack.enabled = True
-        llm_config.backend.xnnpack.extended_ops = True
+        if backend == "xnnpack":
+            llm_config.backend.xnnpack.enabled = True
+            llm_config.backend.xnnpack.extended_ops = True
+        elif backend == "vulkan":
+            llm_config.backend.vulkan.enabled = True
+            llm_config.backend.vulkan.force_fp16 = vulkan_force_fp16
 
         text_edge_manager = _prepare_for_llama_export(llm_config)
         eager_text_model = text_edge_manager.model
-
-        vision_encoder = load_vision_encoder(
-            model_path, encoder_weights=getattr(args, "encoder_weights", None)
-        ).eval()
-        example_inputs = vision_encoder.get_example_inputs()
 
         vision_quant = getattr(args, "vision_quant", "fp16")
         calibration_num = getattr(args, "calibration_num", 8)
         calibration_images = getattr(args, "calibration_images", None)
 
-        if vision_quant == "8a8w":
-            quantizer = XNNPACKQuantizer()
-            quantizer.set_global(get_symmetric_quantization_config(is_per_channel=True))
-            calibration_sources = calibration_images or [_DEFAULT_CALIBRATION_URL]
-            calibration_data = _load_calibration_data(
-                calibration_sources, img_size=448, num_samples=calibration_num
-            )
-            prepared_ep = torch.export.export(vision_encoder, example_inputs, strict=False)
-            from torchao.quantization.pt2e import move_exported_model_to_eval
-            from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+        requested_decoder_input_mode = getattr(args, "decoder_input_mode", "token_ids")
 
-            prepared = prepare_pt2e(prepared_ep.module(), quantizer)
-            for inp in calibration_data:
-                prepared(*inp)
-            vision_encoder = convert_pt2e(prepared)
-            move_exported_model_to_eval(vision_encoder)
-            example_inputs = calibration_data[0]
-        elif vision_quant == "fp16":
-            vision_encoder = vision_encoder.to(torch.float16)
-            inp = example_inputs if isinstance(example_inputs, tuple) else (example_inputs,)
-            example_inputs = tuple(
-                x.to(torch.float16) if isinstance(x, torch.Tensor) and x.is_floating_point() else x
-                for x in inp
-            )
-
-        with torch.no_grad():
-            vision_encoder_ep = torch.export.export(vision_encoder, example_inputs, strict=False)
-
-        sample_seq_len = min(256, args.max_seq_len)
+        # Upstream ExecuTorch static KV-cache runners disable parallel prefill
+        # and feed one token per decoder step. Dynamic exports keep a larger
+        # representative sample while allowing the sequence dim to vary.
+        sample_seq_len = (
+            args.max_seq_len
+            if backend == "vulkan"
+            and requested_decoder_input_mode == "embeddings"
+            and enable_dynamic_shape
+            else min(256, args.max_seq_len) if enable_dynamic_shape else 1
+        )
         token_ids = torch.arange(1, sample_seq_len + 1, dtype=torch.long).unsqueeze(0)
         token_emb = eager_text_model.tok_embeddings
         if torch_dtype != torch.float32:
@@ -276,7 +405,7 @@ def export_xnnpack(args: argparse.Namespace) -> int:
                 strict=True,
             )
 
-        class InternVL3TextDecoder(torch.nn.Module):
+        class InternVL3EmbeddingTextDecoder(torch.nn.Module):
             def __init__(self, decoder):
                 super().__init__()
                 self.decoder = decoder
@@ -284,19 +413,38 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             def forward(self, embeddings, input_pos):
                 return self.decoder(None, {"input_pos": input_pos}, embeddings)
 
+        class InternVL3TokenTextDecoder(torch.nn.Module):
+            def __init__(self, decoder):
+                super().__init__()
+                self.decoder = decoder
+
+            def forward(self, token_ids, input_pos):
+                return self.decoder(token_ids, {"input_pos": input_pos})
+
         sample_embeddings = eager_text_model.tok_embeddings(token_ids)
         sample_input_pos = torch.tensor([0], dtype=torch.long)
         seq_dim = torch.export.Dim("seq_dim", min=1, max=llm_config.export.max_seq_length)
-        decoder_dynamic_shapes = (
-            ({1: seq_dim}, {0: 1}) if enable_dynamic_shape else None
-        )
+        if backend == "vulkan" and requested_decoder_input_mode == "token_ids":
+            decoder_model = InternVL3TokenTextDecoder(eager_text_model)
+            decoder_example_inputs = (token_ids, sample_input_pos)
+            decoder_dynamic_shapes = (
+                ({1: seq_dim}, {0: 1}) if enable_dynamic_shape else None
+            )
+            decoder_input_mode = "token_ids"
+        else:
+            decoder_model = InternVL3EmbeddingTextDecoder(eager_text_model)
+            decoder_example_inputs = (sample_embeddings, sample_input_pos)
+            decoder_dynamic_shapes = (
+                ({1: seq_dim}, {0: 1}) if enable_dynamic_shape else None
+            )
+            decoder_input_mode = "embeddings"
         manager = LLMEdgeManager(
-            model=InternVL3TextDecoder(eager_text_model),
+            model=decoder_model,
             modelname="internvl3_text_decoder",
             max_seq_len=llm_config.export.max_seq_length,
             dtype=dtype,
             use_kv_cache=True,
-            example_inputs=(sample_embeddings, sample_input_pos),
+            example_inputs=decoder_example_inputs,
             enable_dynamic_shape=enable_dynamic_shape,
             dynamic_shapes=decoder_dynamic_shapes,
         )
@@ -317,6 +465,8 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             "get_max_context_len": max_context_len,
             "enable_dynamic_shape": enable_dynamic_shape,
             "use_kv_cache": True,
+            "use_sdpa_with_kv_cache": use_sdpa_with_kv_cache,
+            "decoder_input_mode": decoder_input_mode,
         }
 
         exec_config = ExecutorchBackendConfig(
@@ -326,25 +476,7 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             sym_shape_eval_pass=ConstraintBasedSymShapeEvalPass(),
         )
 
-        vision_edge = to_edge_transform_and_lower(
-            vision_encoder_ep,
-            partitioner=[XnnpackPartitioner()],
-            compile_config=EdgeCompileConfig(_check_ir_validity=False),
-        )
-        vision_pte_path = output_dir / f"{VISION_ENCODER_PTE}.pte"
-        with open(vision_pte_path, "wb") as f:
-            vision_edge.to_executorch(exec_config).write_to_file(f)
-        LOG.info("Saved vision encoder to %s", vision_pte_path)
-
-        emb_edge = to_edge_transform_and_lower(
-            token_embedding_ep,
-            partitioner=[XnnpackPartitioner()],
-            compile_config=EdgeCompileConfig(_check_ir_validity=False),
-        )
-        emb_pte_path = output_dir / f"{TEXT_EMBEDDING_PTE}.pte"
-        with open(emb_pte_path, "wb") as f:
-            emb_edge.to_executorch(exec_config).write_to_file(f)
-        LOG.info("Saved token embedding to %s", emb_pte_path)
+        vision_pte_name, emb_pte_name, decoder_pte_name = _split_pte_names(backend)
 
         text_decoder_partitioner = [
             XnnpackPartitioner(
@@ -356,16 +488,85 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             ),
             XnnpackPartitioner(),
         ]
-        decoder_edge = to_edge_transform_and_lower(
+        decoder_edge = _lower_split_program(
             text_decoder_ep,
-            partitioner=text_decoder_partitioner,
+            backend=backend,
+            enable_dynamic_shape=enable_dynamic_shape,
+            dtype=export_dtype,
+            vulkan_force_fp16=vulkan_force_fp16,
+            xnnpack_partitioner=text_decoder_partitioner,
             constant_methods=metadata,
-            compile_config=EdgeCompileConfig(_check_ir_validity=False),
         )
-        decoder_pte_path = output_dir / f"{TEXT_DECODER_PTE}.pte"
+        decoder_delegate = backend
+        decoder_pte_path = output_dir / f"{decoder_pte_name}.pte"
         with open(decoder_pte_path, "wb") as f:
             decoder_edge.to_executorch(exec_config).write_to_file(f)
         LOG.info("Saved text decoder to %s", decoder_pte_path)
+
+        vision_encoder = load_vision_encoder(
+            model_path, encoder_weights=getattr(args, "encoder_weights", None)
+        ).eval()
+        example_inputs = vision_encoder.get_example_inputs()
+
+        if vision_quant == "8a8w":
+            quantizer = XNNPACKQuantizer()
+            quantizer.set_global(get_symmetric_quantization_config(is_per_channel=True))
+            calibration_sources = calibration_images or [_DEFAULT_CALIBRATION_URL]
+            calibration_data = _load_calibration_data(
+                calibration_sources, img_size=448, num_samples=calibration_num
+            )
+            prepared_ep = torch.export.export(vision_encoder, example_inputs, strict=False)
+            from torchao.quantization.pt2e import move_exported_model_to_eval
+            from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+
+            prepared = prepare_pt2e(prepared_ep.module(), quantizer)
+            for inp in calibration_data:
+                prepared(*inp)
+            vision_encoder = convert_pt2e(prepared)
+            move_exported_model_to_eval(vision_encoder)
+            example_inputs = calibration_data[0]
+        elif vision_quant == "fp16" and backend != "vulkan":
+            vision_encoder = vision_encoder.to(torch.float16)
+            inp = example_inputs if isinstance(example_inputs, tuple) else (example_inputs,)
+            example_inputs = tuple(
+                x.to(torch.float16) if isinstance(x, torch.Tensor) and x.is_floating_point() else x
+                for x in inp
+            )
+
+        with torch.no_grad():
+            vision_encoder_ep = torch.export.export(vision_encoder, example_inputs, strict=False)
+
+        vision_edge = _lower_split_program(
+            vision_encoder_ep,
+            backend=backend,
+            enable_dynamic_shape=enable_dynamic_shape,
+            dtype=export_dtype,
+            vulkan_force_fp16=vulkan_force_fp16,
+            xnnpack_partitioner=[XnnpackPartitioner()],
+            vulkan_fallback_partitioner=(
+                [XnnpackPartitioner()] if getattr(args, "vulkan_xnnpack_fallback", False) else None
+            ),
+        )
+        vision_pte_path = output_dir / f"{vision_pte_name}.pte"
+        with open(vision_pte_path, "wb") as f:
+            vision_edge.to_executorch(exec_config).write_to_file(f)
+        LOG.info("Saved vision encoder to %s", vision_pte_path)
+
+        emb_edge = _lower_split_program(
+            token_embedding_ep,
+            backend=backend,
+            enable_dynamic_shape=enable_dynamic_shape,
+            dtype=export_dtype,
+            vulkan_force_fp16=vulkan_force_fp16,
+            xnnpack_partitioner=[XnnpackPartitioner()],
+            vulkan_fallback_partitioner=(
+                [XnnpackPartitioner()] if getattr(args, "vulkan_xnnpack_fallback", False) else None
+            ),
+        )
+        emb_pte_path = output_dir / f"{emb_pte_name}.pte"
+        with open(emb_pte_path, "wb") as f:
+            emb_edge.to_executorch(exec_config).write_to_file(f)
+        LOG.info("Saved token embedding to %s", emb_pte_path)
 
         artifact_dir = output_dir / "artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -376,7 +577,7 @@ def export_xnnpack(args: argparse.Namespace) -> int:
 
         foundation_manifest = build_manifest(
             artifact_root=output_dir,
-            backend="xnnpack",
+            backend=backend,
             variant=args.decoder_model,
             runner_type="multimodal_split",
             vision_encoder_pte=vision_pte_path,
@@ -387,7 +588,17 @@ def export_xnnpack(args: argparse.Namespace) -> int:
                 "max_seq_len": args.max_seq_len,
                 "max_context_len": max_context_len,
                 "dtype": args.dtype,
+                "vulkan_export_dtype": export_dtype if backend == "vulkan" else None,
+                "vulkan_force_fp16": vulkan_force_fp16 if backend == "vulkan" else None,
                 "model_source": model_path,
+                "enable_dynamic_shape": enable_dynamic_shape,
+                "use_sdpa_with_kv_cache": use_sdpa_with_kv_cache,
+                "decoder_input_mode": decoder_input_mode,
+                "text_group_size": text_group_size,
+                "static_prefill_mode": (
+                    "parallel_dynamic" if enable_dynamic_shape else "sequential_1_token"
+                ),
+                "vulkan_xnnpack_fallback": getattr(args, "vulkan_xnnpack_fallback", False),
             },
             quant={
                 "vision": vision_quant,
@@ -397,6 +608,10 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             runtime={
                 "decoder_model_version": "internvl3",
                 "preferred_runner": "xnnpack_qnn_runner",
+                "split_runner_backend": "xnnpack" if backend == "xnnpack" else "vulkan",
+                "vision_delegate": backend,
+                "embedding_delegate": backend,
+                "decoder_delegate": decoder_delegate,
             },
         )
         write_manifest(foundation_manifest, output_dir / FOUNDATION_MANIFEST_FILENAME)
