@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from my_research.foundation.export import export_with_backend
+from my_research.foundation.host.launcher import run_with_manifest
+from my_research.foundation.manifest import load_manifest
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    return export_with_backend(args)
+
+
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    manifest = load_manifest(Path(args.manifest))
+    print(f"backend: {manifest.backend}")
+    print(f"model_family: {manifest.model_family}")
+    print(f"variant: {manifest.variant}")
+    print(f"runner_type: {manifest.runner_type}")
+    print("paths:")
+    for key, value in manifest.paths.items():
+        print(f"  {key}: {value}")
+    if manifest.export:
+        print("export:")
+        for key, value in manifest.export.items():
+            print(f"  {key}: {value}")
+    if manifest.quant:
+        print("quant:")
+        for key, value in manifest.quant.items():
+            print(f"  {key}: {value}")
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    manifest = load_manifest(Path(args.manifest))
+    eval_mode = args.eval_mode
+    if eval_mode is None:
+        eval_mode = 1 if manifest.backend == "qnn" else 0
+    return run_with_manifest(
+        Path(args.manifest),
+        build_path=args.build_path,
+        device=args.device,
+        model=args.model,
+        image=args.image,
+        video=args.video,
+        questions=args.questions,
+        timestamps=args.timestamps,
+        seq_len=args.seq_len,
+        temperature=args.temperature,
+        eval_mode=eval_mode,
+        save_log=args.save_log,
+        stream=args.stream,
+        runner_binary=args.runner_binary,
+        force_push=args.force_push,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Unified foundation CLI for QNN/XNNPACK multimodal export and run."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    export_parser = subparsers.add_parser(
+        "export",
+        help="Export foundation artifacts natively for QNN or XNNPACK.",
+    )
+    export_parser.add_argument("--backend", required=True, choices=["qnn", "xnnpack"])
+    export_parser.add_argument("--artifact_root", required=True)
+    export_parser.add_argument("--decoder_model", required=True)
+    export_parser.add_argument("--max_seq_len", type=int, default=1024)
+    export_parser.add_argument(
+        "--max_context_len",
+        type=int,
+        default=None,
+        help="미지정 시 max_seq_len과 동일. prefill_ar_len 이상이어야 함.",
+    )
+    export_parser.add_argument("--dtype", default="fp16", choices=["fp16", "fp32"])
+    export_parser.add_argument(
+        "--vision_quant",
+        default="fp16",
+        help="Backend-specific vision quant mode.",
+    )
+    export_parser.add_argument(
+        "--decoder_quant",
+        default="fp16",
+        help="Backend-specific decoder quant mode.",
+    )
+    export_parser.add_argument(
+        "--embedding_quant",
+        default="fp16",
+        help="Backend-specific embedding quant mode.",
+    )
+    export_parser.add_argument("--model_path", default=None)
+    export_parser.add_argument("--checkpoint", default=None)
+    export_parser.add_argument("--params", default=None)
+    export_parser.add_argument("--encoder_weights", default=None)
+    export_parser.add_argument("--calibration_images", nargs="+", default=None)
+    export_parser.add_argument("--calibration_num", type=int, default=8)
+    export_parser.add_argument("--text_group_size", type=int, default=128)
+    export_parser.add_argument(
+        "--trust_remote_code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    export_parser.add_argument(
+        "--use_sdpa_with_kv_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    export_parser.add_argument(
+        "--dynamic_shape",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable dynamic sequence shapes for XNNPACK text embedding/decoder export.",
+    )
+    export_parser.add_argument(
+        "--disable_dynamic_shape",
+        action="store_false",
+        dest="dynamic_shape",
+        help="Disable dynamic sequence shapes for XNNPACK text embedding/decoder export.",
+    )
+    export_parser.add_argument("-b", "--build_path", default=None)
+    export_parser.add_argument("-s", "--device", default=None)
+    export_parser.add_argument("-m", "--model", default=None)
+    export_parser.add_argument("--prompts", nargs="+", default=None)
+    export_parser.add_argument("--system_prompt", default="")
+    export_parser.add_argument("--tokenizer_model", default=None)
+    export_parser.add_argument("--tokenizer_bin", default=None)
+    export_parser.add_argument("--image_path", default=None)
+    export_parser.add_argument(
+        "--model_mode",
+        default="hybrid",
+        choices=["kv", "hybrid", "lookahead"],
+    )
+    export_parser.add_argument("--prefill_ar_len", type=int, default=32)
+    export_parser.add_argument("--ngram", type=int, default=5)
+    export_parser.add_argument("--window", type=int, default=8)
+    export_parser.add_argument("--gcap", type=int, default=8)
+    export_parser.add_argument(
+        "--enable_x86_64",
+        action="store_true",
+        help="QNN x86 emulator build flag.",
+    )
+    export_parser.set_defaults(func=_cmd_export)
+
+    inspect_parser = subparsers.add_parser("inspect-manifest", help="Print manifest details.")
+    inspect_parser.add_argument("manifest")
+    inspect_parser.set_defaults(func=_cmd_inspect)
+
+    run_parser = subparsers.add_parser("run", help="Run using a foundation manifest.")
+    run_parser.add_argument("--manifest", required=True)
+    run_parser.add_argument("-b", "--build_path", default=None)
+    run_parser.add_argument("-s", "--device", default=None)
+    run_parser.add_argument("-m", "--model", default=None)
+    run_parser.add_argument("--runner_binary", default=None)
+    run_parser.add_argument("--image", default=None)
+    run_parser.add_argument("--video", default=None)
+    run_parser.add_argument("--questions", nargs="+", default=None)
+    run_parser.add_argument("--timestamps", nargs="+", type=float, default=None)
+    run_parser.add_argument("--seq_len", type=int, default=None)
+    run_parser.add_argument("--temperature", type=float, default=None)
+    run_parser.add_argument(
+        "--eval_mode",
+        type=int,
+        default=None,
+        help="0=KV, 1=Hybrid, 2=Lookahead. 미지정 시 QNN→1, XNNPACK→0 자동.",
+    )
+    run_parser.add_argument("--stream", action="store_true")
+    run_parser.add_argument("--save_log", action="store_true")
+    run_parser.add_argument(
+        "--force_push",
+        action="store_true",
+        help="Re-push runner/model files even when cached on the Android device.",
+    )
+    run_parser.set_defaults(func=_cmd_run)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

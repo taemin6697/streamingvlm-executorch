@@ -1,0 +1,14 @@
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Build outputs and external dependency checkouts
+build/
+build-*/
+executorch/
+
+# Foundation generated artifacts
+my_research/foundation/results/
+
+# Local environment/debug snapshots
+pip_freeze_before_torchao_repair.txt

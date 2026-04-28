@@ -1,0 +1,62 @@
+---
+description: Keep ExecuTorch changes upgrade-safe through wrapper and overlay patterns
+alwaysApply: true
+---
+
+# StreamingVLM on Mobile
+
+# ExecuTorch Upgrade-Safe Development
+
+When implementing ExecuTorch-related features in this project, avoid modifying the original ExecuTorch source whenever possible.
+
+Treat ExecuTorch as an upstream dependency that should remain easy to update. Project-specific functionality should be implemented through wrappers, overlays, patches, scripts, or separate example directories.
+
+Introduction Flow:
+
+(
+- 최근 VLM의 비약적인 발전은 사용자의 시각적 입력을 이해하고 상호작용하는 새로운 지능형 에이전트의 시대를 열고 있습니다. 특히, 단일 Image 입력을 넘어 Video의 temporal context를 이해하는 수준으로 진화함에 따라, 기존보다 훨씬 확장된 작업의 수행이 가능해졌습니다.
+    - 예를 들어 자율주행이나 로보틱스에서 의사 결정을 하거나, VR/AR 스마트 글래스, 웨어러블 디바이스 그리고 스마트폰에서 지속적으로 관찰하며 상황에 맞는 도움을 제공하는 항상 켜져 있는 Visual Assistant로 활용될 수 있습니다.
+    - 이러한 작업들은 실시간으로 끊임없이 유입되는 비디오 스트림을 처리하고 실시간 상호작용을 제공해야 하는 제약이 따릅니다.
+- 이러한 Visual Assistant를 real-world에 배포하고 구현하기 위해서는, 끊임없이 유입되는 video stream의 특성상 시스템적 한계들이 존재합니다.
+    - video stream을 외부 서버로 지속 전송해야 하는 클라우드 방식은 네트워크 통신 및 queueing delay를 필연적으로 유발하여, 결과적으로 실시간 상호작용이 불가능합니다.
+        - 이를 회피하고자 사용자가 요청한 당시에만 몇몇의 프레임을 보내는 on demand 방식은 시간적 맥락와 과거의 기록을 보지 않아 QoS(성능)를 심각하게 훼손할 수 있습니다.
+    - 사용자의 민감한 일상 영상이 외부로 유출 될수 있어 Privacy 및 보안 문제를 수반합니다.
+- 기존에 이를 해결하고자 온디바이스 VLM을 활용하여 PC 환경에서 비디오 스트림을 처리한 연구들이 있었음
+    - VLM에서 Vision KV-Cache를 미리 생성하여 이를 추론때 활용하여 즉각적인 상호작용을 합니다.
+        - 입력되는 비디오 스트림을 사용자 입력이 이루어질때 처리하지 않고 프레임이 유입되는 즉시 미리 KV Cache를 생성 및 압축하여 저장 해두었다가 사용자가 입력하면 이를 활용합니다.
+        - 이를 통해, 시간적 맥락과 과거의 기록을 보며 실시간으로 상호작용하며 QoS(성능)를 보장하고자 했습니다.
+- 하지만 VR/AR 그리고 스마트폰과 같이 제한된 자원의 모바일 시스템에서는 몇가지 이유 때문에 기존의 온디바이스 VLM 방식들을 그대로 활용하는 것이 어렵습니다.
+    - 첫째, 대용량 VRAM을 갖춘 PC/서버 환경과 달리, 제한된 메모리를 지닌 모바일 환경에서는 이러한 무한한 누적이 필연적으로 OOM를 유발함
+        - 스트리밍에서 Vision KV-Cache를 미리 생성하여 Context가 빠르게 차오름에 따라 여러 압축 알고리즘 사용하여 이를 완화하긴 하지만, 모바일의 제한된 메모리에서는 이마저도 유효 컨텍스트 길이를 수 초 내로 제한해야 하며, 이는 시간적 맥락의 급격한 손실로 이어져 Visual Assistant의 QoS를 심각하게 저하시킵니다.
+        - 이를 회피하고자 저장장치로의 오프로딩을 진행하는 방식은 PC의 고성능 NVMe SSD와 달리 모바일 저장장치 UFS는 낮은 I/O 대역폭으로 인해 실시간 응답을 만족할 수 없습니다.
+    - 둘째, 기존 방식은 GPU 단일 프로세서에 의존하여 서로 다른 이질적인 연산(Vision Encoding, Prefill, Decoding)을 모두 처리하였습니다.
+        - VLM의 실행은 전력 소모가 극심하며 높은 연산량을 요구하는데, 모바일에서는 제한된 자원만으로는 실시간 응답과 성능을 보장하지 못합니다.
+            - 특히, 연산량이 높고 전력소모가 낮은 SoC의 NPU를 활용하더라도 NPU의 정적그래프 특성으로 인해 가변 길이를 처리해야하는 VLM의 특성 상 연산량이 심각하게 낭비됩니다.
+            - 이 경우, 동적 연산이 가능한 CPU/GPU를 활용하여도 높은 전력 소모와 함께 낮은 연산량으로 인해 실시간 응답을 보장하지 못하는 문제가 발생할 수 있습니다.
+    - 셋째 모바일 기기의 Thermal Constraint으로 인한 지속적 성능 보장의 어려움
+        - Visual Assistant는 특성상 장시간 상시 구동을 전제로 하는데, 지속적인 비디오 스트림 처리와 VLM 추론은 모바일 기기의 발열을 빠르게 야기합니다.
+        - 모바일 SoC는 발열이 임계치를 초과하면 Thermal Throttling을 통해 클럭을 강제로 낮추기 때문에, 초기에는 실시간 응답이 가능하더라도 시간이 지날수록 추론 지연이 길어져 일관된 QoS를 보장할 수 없습니다.
+        - 이는 단순히 빠른 추론을 설계하는 것으로는 해결되지 않으며, 열 상태 변화에 동적으로 적응하는 시스템 수준의 설계가 필요합니다.
+- 이러한 문제를 해결하기 위해, 본 논문에서는 아래를 제안함(임시)
+    - Hybrid Heterogeneous Execution: 정형화된 연산인 Vision Encoding은 NPU에서 수행하고, 가변 시퀀스 처리가 필수적인 Prefill, Decoding은 GPU/CPU로 파이프라이닝하여 전력 효율과 유연성을 동시에 확보합니다.
+    - Partial Vision Prefill: Prefill이 비록 오래 걸리지만 모든 영역을 매번 Prefill할 이유는 없습니다. 이에 따라 동적인 영역에 대해서만 Vision Prefill을 진행합니다.
+    - Effective Context Expansion: 모바일 환경을 고려한 제한된 컨텍스트 길이 내에서 최대한의 과거 정보, 중요한 정보를 유지하기 위해, 중요도가 낮은 KV-Cache를 압축하여 정보 밀도를 극대화합니다. (추후 실제 문제 제기에서 모바일 특화하게 압축(기존 압축이 오래걸리는거를 찾는다.))
+- 하지만 이러한 approach를 realize하는 것은 쉽지 않은 일이며, 이를 위해서는 몇 가지 challenge들을 해결해야 함
+    - C1:
+    - C2:
+    - C3:
+    - C4:
+    - etc:...
+
+Keywords : VLM, Video Streaming, VR/AR Glasses, Visual Assistant
+)
+
+Implementation Principles:
+
+- Before modifying an original ExecuTorch file, first check whether the feature can be implemented through a wrapper, adapter, overlay file, external script, or patch.
+- Add new project-specific functionality in separate directories or overlay files whenever possible.
+- If an upstream ExecuTorch file must be modified, keep the change minimal and structure it so it can be maintained as a patch and reapplied to future ExecuTorch versions.
+- Do not commit build outputs, generated files, third-party artifacts, or large binaries.
+- When updating ExecuTorch, prefer applying this project's overlays and patches on top of a clean upstream checkout instead of merging the entire upstream repository.
+- Write README and setup documents around the practical flow: clone ExecuTorch, apply overlays or patches, then build and run.
+- Continuously update `my_research/foundation/docs/for_cursor_llm.md` when implementing features, changing project structure, fixing errors, or making workflow decisions. Record what changed, why it changed, and any errors/fixes that future agents should know.
