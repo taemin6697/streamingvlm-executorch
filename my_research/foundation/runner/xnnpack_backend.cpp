@@ -16,10 +16,13 @@
 #include <executorch/extension/tensor/tensor.h>
 #include <executorch/runtime/platform/log.h>
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <cmath>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -42,6 +45,7 @@ constexpr int32_t kInternVL3ImageSeqLen = 256;
 constexpr const char* kInternVL3ImageToken = "<IMG_CONTEXT>";
 constexpr const char* kFoundationProcCsv = "foundation_proc.csv";
 constexpr const char* kAndroidMemoryTimelineCsv = "android_memory_timeline.csv";
+constexpr const char* kVisionOutputStatsCsv = "vision_output_stats.csv";
 
 long rss_kb() {
   const size_t bytes = executorch::extension::llm::get_rss_bytes();
@@ -81,6 +85,90 @@ void write_proc_row(
          << ",,,,,,"
          << token_idx << "\n";
   fproc->flush();
+}
+
+const char* scalar_type_name(executorch::aten::ScalarType dtype) {
+  switch (dtype) {
+    case executorch::aten::ScalarType::Float:
+      return "Float";
+    case executorch::aten::ScalarType::Half:
+      return "Half";
+    case executorch::aten::ScalarType::BFloat16:
+      return "BFloat16";
+    default:
+      return "Other";
+  }
+}
+
+template <typename T>
+void dump_vision_tensor_typed(
+    const executorch::aten::Tensor& tensor,
+    const std::string& bin_path,
+    std::ofstream& stats,
+    int frame_idx,
+    const char* dtype_name) {
+  const int64_t dim0 = tensor.size(0);
+  const int64_t dim1 = tensor.size(1);
+  const int64_t dim2 = tensor.size(2);
+  const int64_t numel = dim0 * dim1 * dim2;
+  const auto* data = tensor.const_data_ptr<T>();
+
+  std::vector<float> values;
+  values.reserve(static_cast<size_t>(numel));
+  double sum = 0.0;
+  double sum_sq = 0.0;
+  float min_value = std::numeric_limits<float>::infinity();
+  float max_value = -std::numeric_limits<float>::infinity();
+  for (int64_t i = 0; i < numel; ++i) {
+    const float value = static_cast<float>(data[i]);
+    values.push_back(value);
+    sum += value;
+    sum_sq += static_cast<double>(value) * static_cast<double>(value);
+    min_value = std::min(min_value, value);
+    max_value = std::max(max_value, value);
+  }
+
+  std::ofstream bin(bin_path, std::ios::binary);
+  ET_CHECK_MSG(bin.is_open(), "Failed to open vision dump: %s", bin_path.c_str());
+  bin.write(
+      reinterpret_cast<const char*>(values.data()),
+      static_cast<std::streamsize>(values.size() * sizeof(float)));
+  ET_CHECK_MSG(bin.good(), "Failed to write vision dump: %s", bin_path.c_str());
+
+  const double mean = numel > 0 ? sum / static_cast<double>(numel) : 0.0;
+  const double l2 = std::sqrt(sum_sq);
+  stats << frame_idx << "," << dtype_name << "," << dim0 << "," << dim1 << ","
+        << dim2 << "," << numel << "," << mean << "," << min_value << ","
+        << max_value << "," << l2;
+  const int64_t preview_count = std::min<int64_t>(16, numel);
+  for (int64_t i = 0; i < preview_count; ++i) {
+    stats << "," << values[static_cast<size_t>(i)];
+  }
+  stats << "\n";
+  stats.flush();
+}
+
+void dump_vision_tensor(
+    const executorch::aten::Tensor& tensor,
+    const std::string& bin_path,
+    std::ofstream& stats,
+    int frame_idx) {
+  switch (tensor.scalar_type()) {
+    case executorch::aten::ScalarType::Float:
+      dump_vision_tensor_typed<float>(
+          tensor, bin_path, stats, frame_idx, scalar_type_name(tensor.scalar_type()));
+      return;
+    case executorch::aten::ScalarType::Half:
+      dump_vision_tensor_typed<executorch::aten::Half>(
+          tensor, bin_path, stats, frame_idx, scalar_type_name(tensor.scalar_type()));
+      return;
+    case executorch::aten::ScalarType::BFloat16:
+      dump_vision_tensor_typed<executorch::aten::BFloat16>(
+          tensor, bin_path, stats, frame_idx, scalar_type_name(tensor.scalar_type()));
+      return;
+    default:
+      ET_CHECK_MSG(false, "Unsupported vision output dtype for dump");
+  }
 }
 
 std::string frame_path(const std::string& dir, int idx) {
@@ -200,11 +288,17 @@ void merge_image_features_typed(
 
   size_t image_token_offset = 0;
   for (const auto& image_tensor : image_tensors) {
+    ::executorch::extension::TensorPtr converted_image;
+    const executorch::aten::Tensor* image_for_merge = &image_tensor;
+    if (image_tensor.scalar_type() != text_embeddings.scalar_type()) {
+      converted_image = clone_tensor_ptr(image_tensor, text_embeddings.scalar_type());
+      image_for_merge = converted_image.get();
+    }
     ET_CHECK_MSG(
-        image_tensor.scalar_type() == text_embeddings.scalar_type(),
-        "Image hidden state dtype must match text embedding dtype");
-    const auto* image_ptr = image_tensor.const_data_ptr<T>();
-    const int64_t image_seq_len = image_tensor.size(1);
+        image_for_merge->size(2) == hidden_dim,
+        "Image hidden dim must match text embedding hidden dim");
+    const auto* image_ptr = image_for_merge->const_data_ptr<T>();
+    const int64_t image_seq_len = image_for_merge->size(1);
     for (int64_t i = 0; i < image_seq_len; ++i) {
       const size_t pos = placeholder_positions.at(image_token_offset + i);
       std::memcpy(
@@ -397,12 +491,15 @@ class XnnpackBackendRunner final : public BackendRunner {
       : manifest_(std::move(manifest)) {}
 
   executorch::runtime::Error validate() override {
+    if (manifest_.paths.vision_encoder_pte.empty()) {
+      ET_LOG(Error, "Missing vision_encoder_pte in manifest");
+      return executorch::runtime::Error::InvalidArgument;
+    }
     if (manifest_.paths.tokenizer_path.empty()) {
       ET_LOG(Error, "Missing tokenizer_path in manifest");
       return executorch::runtime::Error::InvalidArgument;
     }
-    if (manifest_.paths.vision_encoder_pte.empty() ||
-        manifest_.paths.text_embedding_pte.empty() ||
+    if (manifest_.paths.text_embedding_pte.empty() ||
         manifest_.paths.text_decoder_pte.empty()) {
       ET_LOG(Error, "XNNPACK manifest requires split-PTE paths.");
       return executorch::runtime::Error::NotSupported;
@@ -416,15 +513,10 @@ class XnnpackBackendRunner final : public BackendRunner {
         manifest_.decoder_input_mode == "embeddings" || decoder_uses_token_ids,
         "Unsupported decoder_input_mode: %s",
         manifest_.decoder_input_mode.c_str());
-    ET_CHECK_MSG(
-        decoder_uses_token_ids || !config.frame_dir.empty(),
-        "--frame_dir is required for embedding-input decoder artifacts.");
-    ET_CHECK_MSG(
-        decoder_uses_token_ids || config.frame_count > 0,
-        "--frame_count must be > 0 for embedding-input decoder artifacts.");
 
     const long t_run_start = executorch::extension::llm::time_in_ms();
     std::unique_ptr<std::ofstream> fproc;
+    std::unique_ptr<std::ofstream> fvision;
     std::unique_ptr<InternalMemorySampler> memory_sampler;
     if (config.save_log) {
       fproc = std::make_unique<std::ofstream>(kFoundationProcCsv);
@@ -433,6 +525,16 @@ class XnnpackBackendRunner final : public BackendRunner {
           "Failed to open proc csv file: %s",
           kFoundationProcCsv);
       write_proc_header(*fproc);
+      fvision = std::make_unique<std::ofstream>(kVisionOutputStatsCsv);
+      ET_CHECK_MSG(
+          fvision->is_open(),
+          "Failed to open vision stats csv file: %s",
+          kVisionOutputStatsCsv);
+      *fvision << "frame_idx,dtype,dim0,dim1,dim2,numel,mean,min,max,l2";
+      for (int i = 0; i < 16; ++i) {
+        *fvision << ",first_" << i;
+      }
+      *fvision << "\n";
       memory_sampler = std::make_unique<InternalMemorySampler>(
           kAndroidMemoryTimelineCsv, []() { return BackendMemoryMetrics{}; });
       memory_sampler->start();
@@ -440,26 +542,34 @@ class XnnpackBackendRunner final : public BackendRunner {
 
     const long t_load_start = executorch::extension::llm::time_in_ms();
     const long rss_load_start = rss_kb();
-    auto tokenizer = load_tokenizer(manifest_.paths.tokenizer_path);
-    ET_CHECK_MSG(
-        tokenizer != nullptr,
-        "Failed to load tokenizer: %s",
-        manifest_.paths.tokenizer_path.c_str());
-    const auto eos_token_id = static_cast<uint64_t>(tokenizer->eos_tok());
-    const auto image_placeholder_id =
-        decoder_uses_token_ids ? 0 : placeholder_token_id(tokenizer.get());
-    const auto stop_ids = stop_token_ids(tokenizer.get());
+    decltype(load_tokenizer(manifest_.paths.tokenizer_path)) tokenizer;
+    uint64_t eos_token_id = 0;
+    uint64_t image_placeholder_id = 0;
+    std::unordered_set<uint64_t> stop_ids;
+    if (!config.vision_only) {
+      tokenizer = load_tokenizer(manifest_.paths.tokenizer_path);
+      ET_CHECK_MSG(
+          tokenizer != nullptr,
+          "Failed to load tokenizer: %s",
+          manifest_.paths.tokenizer_path.c_str());
+      eos_token_id = static_cast<uint64_t>(tokenizer->eos_tok());
+      image_placeholder_id =
+          decoder_uses_token_ids ? 0 : placeholder_token_id(tokenizer.get());
+      stop_ids = stop_token_ids(tokenizer.get());
+    }
 
     std::unique_ptr<Module> vision_module;
     std::unique_ptr<Module> embedding_module;
-    if (!decoder_uses_token_ids) {
+    if ((config.vision_only || !decoder_uses_token_ids) && config.frame_count > 0) {
       vision_module = std::make_unique<Module>(
           manifest_.paths.vision_encoder_pte,
           Module::LoadMode::MmapUseMlockIgnoreErrors);
+      ET_CHECK_OK_OR_RETURN_ERROR(vision_module->load_method("forward"));
+    }
+    if (!config.vision_only && !decoder_uses_token_ids) {
       embedding_module = std::make_unique<Module>(
           manifest_.paths.text_embedding_pte,
           Module::LoadMode::MmapUseMlockIgnoreErrors);
-      ET_CHECK_OK_OR_RETURN_ERROR(vision_module->load_method("forward"));
       ET_CHECK_OK_OR_RETURN_ERROR(embedding_module->load_method("forward"));
     }
     const long t_load_end = executorch::extension::llm::time_in_ms();
@@ -475,16 +585,28 @@ class XnnpackBackendRunner final : public BackendRunner {
 
     std::vector<executorch::aten::Tensor> image_tensors;
     image_tensors.reserve(config.frame_count);
-    for (int idx = 0; !decoder_uses_token_ids && idx < config.frame_count; ++idx) {
+    for (int idx = 0;
+         (config.vision_only || !decoder_uses_token_ids) && idx < config.frame_count;
+         ++idx) {
       const long t_vision_start = executorch::extension::llm::time_in_ms();
       const long rss_vision_start = rss_kb();
       auto frame_tensor = load_preprocessed_frame(frame_path(config.frame_dir, idx), 448);
-      // fp16 vision artifacts expect Half; frame .bin is always float32.
-      auto vision_input =
-          clone_tensor_ptr(*frame_tensor, executorch::aten::ScalarType::Half);
+      auto vision_input = frame_tensor;
+      if (manifest_.backend != "vulkan") {
+        // XNNPACK fp16 vision artifacts expect Half; Vulkan force-fp16 artifacts
+        // still keep a Float input schema and cast inside the delegate.
+        vision_input =
+            clone_tensor_ptr(*frame_tensor, executorch::aten::ScalarType::Half);
+      }
       auto outputs = vision_module->execute("forward", vision_input);
       ET_CHECK_OK_OR_RETURN_ERROR(outputs.error());
-      image_tensors.push_back(outputs->at(0).toTensor());
+      auto vision_output = outputs->at(0).toTensor();
+      if (fvision != nullptr && fvision->is_open()) {
+        char dump_name[64];
+        std::snprintf(dump_name, sizeof(dump_name), "vision_output_%04d_f32.bin", idx);
+        dump_vision_tensor(vision_output, dump_name, *fvision, idx);
+      }
+      image_tensors.push_back(vision_output);
       const long t_vision_end = executorch::extension::llm::time_in_ms();
       const long rss_vision_end = rss_kb();
       write_proc_row(
@@ -497,6 +619,15 @@ class XnnpackBackendRunner final : public BackendRunner {
           rss_vision_end,
           /*kv_pos=*/0,
           /*token_idx=*/idx);
+    }
+
+    if (config.vision_only) {
+      std::ofstream fout(config.output_path.empty() ? "foundation_output.txt"
+                                                    : config.output_path);
+      if (fout.is_open()) {
+        fout << "vision_only frames=" << config.frame_count << "\n";
+      }
+      return executorch::runtime::Error::Ok;
     }
 
     std::ostringstream final_output;

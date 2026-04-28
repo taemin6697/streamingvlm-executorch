@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  export_internvl3_matrix.sh [all|qnn|xnnpack]
+  export_internvl3_matrix.sh [all|qnn|xnnpack|vulkan]
 
 Exports InternVL3 1B/2B/8B artifacts for context lengths:
   512 1024 2048 4096 8192 16384
@@ -16,6 +16,7 @@ Environment overrides:
   HF_MODEL_ROOT            Local HF/checkpoint root. Default: $ROOT_DIR/my_research/foundation/results/model/hf
   QNN_ARTIFACT_BASE        QNN output root. Default: $ROOT_DIR/my_research/foundation/results/model/qnn
   XNNPACK_ARTIFACT_BASE    XNNPACK output root. Default: $ROOT_DIR/my_research/foundation/results/model/xnnpack
+  VULKAN_ARTIFACT_BASE     Vulkan output root. Default: $ROOT_DIR/my_research/foundation/results/model/vulkan
   SKIP_EXISTING            If 1, skip artifact dirs that already contain manifest.json. Default: 0
 
 QNN overrides:
@@ -37,6 +38,14 @@ XNNPACK overrides:
   XNNPACK_DECODER_QUANT    Default: fp16
   XNNPACK_EMBEDDING_QUANT  Default: fp16
   DYNAMIC_SHAPE            If 0/false, disable XNNPACK dynamic sequence shapes. Default: 1
+
+Vulkan overrides:
+  VULKAN_DTYPE             Default: fp16
+  VULKAN_VISION_QUANT      Default: fp16
+  VULKAN_DECODER_QUANT     Default: fp16
+  VULKAN_EMBEDDING_QUANT   Default: fp16
+  VULKAN_DECODER_INPUT_MODE Default: embeddings
+  VULKAN_USE_SDPA_WITH_KV_CACHE If 0/false, pass --no-use_sdpa_with_kv_cache. Default: 1
 EOF
 }
 
@@ -56,7 +65,7 @@ FOUNDATION_MODULE="my_research.foundation.cli"
 
 BACKEND_MODE="${1:-all}"
 case "${BACKEND_MODE}" in
-  all|qnn|xnnpack)
+  all|qnn|xnnpack|vulkan)
     ;;
   -h|--help)
     usage
@@ -83,6 +92,7 @@ fi
 HF_MODEL_ROOT="${HF_MODEL_ROOT:-${ROOT_DIR}/my_research/foundation/results/model/hf}"
 QNN_ARTIFACT_BASE="${QNN_ARTIFACT_BASE:-${ROOT_DIR}/my_research/foundation/results/model/qnn}"
 XNNPACK_ARTIFACT_BASE="${XNNPACK_ARTIFACT_BASE:-${ROOT_DIR}/my_research/foundation/results/model/xnnpack}"
+VULKAN_ARTIFACT_BASE="${VULKAN_ARTIFACT_BASE:-${ROOT_DIR}/my_research/foundation/results/model/vulkan}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 
 QNN_BUILD_PATH="${QNN_BUILD_PATH:-${ROOT_DIR}/executorch/build-android}"
@@ -102,6 +112,13 @@ XNNPACK_VISION_QUANT="${XNNPACK_VISION_QUANT:-fp16}"
 XNNPACK_DECODER_QUANT="${XNNPACK_DECODER_QUANT:-fp16}"
 XNNPACK_EMBEDDING_QUANT="${XNNPACK_EMBEDDING_QUANT:-fp16}"
 DYNAMIC_SHAPE="${DYNAMIC_SHAPE:-1}"
+
+VULKAN_DTYPE="${VULKAN_DTYPE:-fp16}"
+VULKAN_VISION_QUANT="${VULKAN_VISION_QUANT:-fp16}"
+VULKAN_DECODER_QUANT="${VULKAN_DECODER_QUANT:-fp16}"
+VULKAN_EMBEDDING_QUANT="${VULKAN_EMBEDDING_QUANT:-fp16}"
+VULKAN_DECODER_INPUT_MODE="${VULKAN_DECODER_INPUT_MODE:-embeddings}"
+VULKAN_USE_SDPA_WITH_KV_CACHE="${VULKAN_USE_SDPA_WITH_KV_CACHE:-1}"
 
 length_tag() {
   local length="$1"
@@ -264,6 +281,44 @@ run_xnnpack_export() {
   "${cmd[@]}"
 }
 
+run_vulkan_export() {
+  local decoder_model="$1"
+  local length="$2"
+  local model_size
+  local tag
+  local artifact_root
+  model_size="$(model_size_tag "${decoder_model}")"
+  tag="$(length_tag "${length}")"
+  artifact_root="${VULKAN_ARTIFACT_BASE}/internvl3_vulkan_${model_size}_${tag}_${VULKAN_DECODER_QUANT}"
+
+  maybe_skip_existing "${artifact_root}" && return 0
+
+  local -a sdpa_args=(--use_sdpa_with_kv_cache)
+  if [[ "${VULKAN_USE_SDPA_WITH_KV_CACHE}" == "0" || "${VULKAN_USE_SDPA_WITH_KV_CACHE}" == "false" ]]; then
+    sdpa_args=(--no-use_sdpa_with_kv_cache)
+  fi
+
+  local -a cmd=(
+    python -m "${FOUNDATION_MODULE}" export
+    --backend vulkan
+    --artifact_root "${artifact_root}"
+    --decoder_model "${decoder_model}"
+    --max_seq_len "${length}"
+    --max_context_len "${length}"
+    --dtype "${VULKAN_DTYPE}"
+    --vision_quant "${VULKAN_VISION_QUANT}"
+    --decoder_quant "${VULKAN_DECODER_QUANT}"
+    --embedding_quant "${VULKAN_EMBEDDING_QUANT}"
+    --decoder_input_mode "${VULKAN_DECODER_INPUT_MODE}"
+    --dynamic_shape
+    "${sdpa_args[@]}"
+  )
+  append_local_model_args cmd "${decoder_model}"
+
+  log "Vulkan export: ${decoder_model}, ${length} (${artifact_root})"
+  "${cmd[@]}"
+}
+
 cd "${ROOT_DIR}"
 
 for decoder_model in "${DECODER_MODELS[@]}"; do
@@ -273,6 +328,9 @@ for decoder_model in "${DECODER_MODELS[@]}"; do
     fi
     if [[ "${BACKEND_MODE}" == "all" || "${BACKEND_MODE}" == "xnnpack" ]]; then
       run_xnnpack_export "${decoder_model}" "${length}"
+    fi
+    if [[ "${BACKEND_MODE}" == "all" || "${BACKEND_MODE}" == "vulkan" ]]; then
+      run_vulkan_export "${decoder_model}" "${length}"
     fi
   done
 done

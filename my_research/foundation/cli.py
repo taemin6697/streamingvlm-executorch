@@ -53,6 +53,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         stream=args.stream,
         runner_binary=args.runner_binary,
         force_push=args.force_push,
+        vision_only=args.vision_only,
     )
 
 
@@ -197,6 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--stream", action="store_true")
     run_parser.add_argument("--save_log", action="store_true")
+    run_parser.add_argument(
+        "--vision_only",
+        action="store_true",
+        help="Run only the vision encoder and dump vision output logs.",
+    )
     run_parser.add_argument(
         "--force_push",
         action="store_true",

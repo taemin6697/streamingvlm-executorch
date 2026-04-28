@@ -70,6 +70,98 @@ def _load_qualcomm_vision_encoder_class():
     return module.InternVL3VisionEncoder
 
 
+class VulkanFriendlyInternVLVisionAttention(torch.nn.Module):
+    """InternVL vision attention rewritten as bmm + softmax for Vulkan lowering."""
+
+    def __init__(self, original: torch.nn.Module):
+        super().__init__()
+        self.config = original.config
+        self.embed_dim = original.embed_dim
+        self.num_heads = original.num_heads
+        self.head_dim = original.head_dim
+        self.attention_dropout = original.attention_dropout
+        self.q_proj = original.q_proj
+        self.k_proj = original.k_proj
+        self.v_proj = original.v_proj
+        self.projection_layer = original.projection_layer
+        self.projection_dropout = original.projection_dropout
+        self.q_norm = original.q_norm
+        self.k_norm = original.k_norm
+        self.register_buffer(
+            "_scale",
+            torch.tensor(float(self.head_dim**-0.5), dtype=torch.float32),
+            persistent=False,
+        )
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask=None, **kwargs):
+        del attention_mask, kwargs
+        batch_size, seq_len, _ = hidden_states.size()
+
+        query_states = self.q_norm(self.q_proj(hidden_states))
+        key_states = self.k_norm(self.k_proj(hidden_states))
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.reshape(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        )
+        key_states = key_states.reshape(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        )
+        value_states = value_states.reshape(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        )
+
+        query_states = query_states.permute(0, 2, 1, 3).contiguous().reshape(
+            batch_size * self.num_heads, seq_len, self.head_dim
+        )
+        key_states = key_states.permute(0, 2, 1, 3).contiguous().reshape(
+            batch_size * self.num_heads, seq_len, self.head_dim
+        )
+        value_states = value_states.permute(0, 2, 1, 3).contiguous().reshape(
+            batch_size * self.num_heads, seq_len, self.head_dim
+        )
+
+        attn_weights = torch.bmm(
+            query_states.contiguous(),
+            key_states.transpose(1, 2).contiguous(),
+        )
+        scale = self._scale.to(dtype=attn_weights.dtype, device=attn_weights.device)
+        attn_weights = attn_weights * scale
+        attn_weights = torch.softmax(attn_weights.contiguous(), dim=-1)
+        attn_output = torch.bmm(attn_weights.contiguous(), value_states.contiguous())
+
+        attn_output = attn_output.reshape(
+            batch_size, self.num_heads, seq_len, self.head_dim
+        )
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().reshape(
+            batch_size, seq_len, self.embed_dim
+        )
+        output = self.projection_layer(attn_output)
+        output = self.projection_dropout(output)
+        return output, None
+
+
+class VulkanFriendlyGELU(torch.nn.Module):
+    """GELU expressed with primitive ops to avoid Vulkan gelu kernel issues."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        coeff = torch.tensor(0.7978845608028654, dtype=input.dtype, device=input.device)
+        cubic_coeff = torch.tensor(0.044715, dtype=input.dtype, device=input.device)
+        return 0.5 * input * (1.0 + torch.tanh(coeff * (input + cubic_coeff * input * input * input)))
+
+
+def replace_vision_attention_for_vulkan(encoder: torch.nn.Module) -> torch.nn.Module:
+    layers = getattr(getattr(encoder.vision_tower, "encoder", None), "layer", None)
+    if layers is None:
+        raise ValueError("InternVL3 vision tower encoder layers were not found.")
+    for layer in layers:
+        layer.attention = VulkanFriendlyInternVLVisionAttention(layer.attention)
+        activation_fn = getattr(getattr(layer, "mlp", None), "activation_fn", None)
+        if activation_fn is not None:
+            layer.mlp.activation_fn = VulkanFriendlyGELU()
+    return encoder
+
+
 class InternVL3Encoder:
     img_resized_h = 448
     img_resized_w = 448
@@ -111,6 +203,7 @@ def load_vision_encoder(
     model_path: Union[str, Path],
     encoder_weights: Optional[Union[str, Path]] = None,
     trust_remote_code: bool = True,
+    vulkan_friendly_attention: bool = False,
 ) -> torch.nn.Module:
     """
     InternVL3 전체 모델에서 비전 인코더만 로드.
@@ -121,6 +214,8 @@ def load_vision_encoder(
         encoder_weights: (선택) 미리 추출한 비전 인코더 .safetensors 경로.
             지정 시 model_path는 config만 로드하고, 가중치는 여기서 로드.
         trust_remote_code: transformers trust_remote_code 옵션
+        vulkan_friendly_attention: replace InternVL vision attention with a
+            bmm+softmax implementation that avoids generic SDPA decomposition.
 
     Returns:
         InternVL3VisionEncoder (eval 모드)
@@ -162,6 +257,9 @@ def load_vision_encoder(
             encoder.load_state_dict(encoder_sd, strict=False)
         else:
             encoder.load_state_dict(full_sd, strict=False)
+
+    if vulkan_friendly_attention:
+        encoder = replace_vision_attention_for_vulkan(encoder)
 
     return encoder
 

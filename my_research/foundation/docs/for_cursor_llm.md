@@ -1337,6 +1337,230 @@ tensor sizes requires a larger texture than the current one
 - Output/logs:
   `my_research/foundation/results/log/vulkan/internvl3_hybrid_xnnpack_vision_embedding_vulkan_decoder_512/`
 
+## 26. Vulkan-Friendly InternVL3 Vision Attention Overlay
+
+User asked to make the InternVL3 vision encoder Vulkan-compatible by avoiding the
+generic vision SDPA decomposition that produced unsupported Vulkan ops.
+
+What changed:
+
+- `my_research/foundation/models/internvl3/vision_encoder/model.py`
+  - Added `VulkanFriendlyInternVLVisionAttention`.
+  - Replaces InternVL vision self-attention with explicit `bmm + softmax + bmm`.
+  - Adds `replace_vision_attention_for_vulkan()` and
+    `load_vision_encoder(..., vulkan_friendly_attention=True)`.
+- `my_research/foundation/exporters/xnnpack.py`
+  - Vulkan vision export now requests `vulkan_friendly_attention=True`.
+  - XNNPACK/QNN behavior is unchanged.
+
+Verification:
+
+- Vision graph no longer contains repeated `aten::scaled_dot_product_attention`.
+- Repeated attention-mask unsupported ops disappeared:
+  `logical_not`, `any.dim`, `eq.Scalar`, `full_like`, and attention-path
+  `expand_copy`.
+- Vision-only Vulkan export succeeded:
+  `my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_vision_attention_overlay_smoke/vision_encoder_vulkan.pte`
+- Size: ~589MB (`617255810` bytes).
+- Vulkan partitioner reported `Found 1 Vulkan subgraphs to be partitioned.`
+- One remaining skip was `aten.expand_copy.default` on shape `[1, 1, 1024]`,
+  likely CLS token expansion before `cat`, not the repeated attention mask path.
+- ExecuTorch source and Transformers site-packages were not modified.
+
+### Vulkan Vision Runtime Input Dtype Fix
+
+Full image Vulkan run with the attention-overlay vision artifact reached the
+runner but failed during vision execution:
+
+```text
+Input 0 has unexpected scalar type: expected Float but was Half.
+```
+
+Cause:
+
+- `xnnpack_backend.cpp` always converted preprocessed image frames from Float to
+  Half before calling the vision module.
+- This is correct for existing XNNPACK fp16 vision artifacts, but Vulkan
+  force-fp16 artifacts keep a Float input schema and cast inside the Vulkan
+  delegate.
+
+Fix:
+
+- `my_research/foundation/runner/xnnpack_backend.cpp`
+  - Keep frame input as Float when `manifest_.backend == "vulkan"`.
+  - Continue casting to Half for XNNPACK fp16 vision artifacts.
+
+Next step:
+
+```bash
+SKIP_ET_BUILD=1 JOBS=8 my_research/foundation/scripts/build_backend_and_runner.sh xnnpack-vulkan
+```
+
+Then rerun the same full image Vulkan command.
+
+### Embedding-Input Text-Only Vulkan Runs
+
+Observation:
+
+- Embedding-input artifacts do not intrinsically require an image. If no image is
+  supplied, the prompt contains no `<IMG_CONTEXT>` tokens, so the runner can use
+  `text_embedding_pte -> text_decoder_pte` directly.
+- The previous launcher/runner incorrectly required `--image_path` whenever
+  `decoder_input_mode != token_ids`.
+
+Changed:
+
+- `my_research/foundation/host/launcher.py`
+  - Allows XNNPACK/Vulkan text-only runs for both `token_ids` and `embeddings`
+    decoder input modes.
+- `my_research/foundation/runner/xnnpack_qnn_runner.cpp`
+  - Removed the `--image_path` requirement for embedding-input decoder artifacts.
+- `my_research/foundation/runner/xnnpack_backend.cpp`
+  - Removed `frame_dir` / `frame_count` assertions for embedding-input artifacts.
+  - Loads the vision module only when `frame_count > 0`.
+  - Still loads the text embedding module for embedding-input text-only runs.
+
+Next step:
+
+```bash
+SKIP_ET_BUILD=1 JOBS=8 my_research/foundation/scripts/build_backend_and_runner.sh xnnpack-vulkan
+```
+
+Then an embedding-input Vulkan artifact can run text-only by omitting `--image`.
+
+### Vulkan 1K FP16 Text-Only Smoke
+
+User compiled a 1K Vulkan FP16 artifact and ran a text-only prompt.
+
+Observed output:
+
+```text
+<|im_start|>user:
+Where is capital of Korea?<|im_end|>
+<|im_start|>assistant
+The capital of South Korea is Seoul.<|im_end|>
+```
+
+Result:
+
+- Text-only Vulkan FP16 path produced a correct answer.
+- Output log:
+  `my_research/foundation/results/log/vulkan/internvl3_vulkan_1b_1k_fp16/foundation_output.txt`
+
+### Vulkan Vision NaN Root Cause and GELU Fix
+
+Problem:
+
+- Full Vulkan image runs initially produced `!` immediately after prefill.
+- Dumping the vision encoder output showed the Vulkan vision tensor
+  `[1, 256, 896]` was entirely NaN:
+  `nan_count=229376`.
+- The same image with XNNPACK vision and Vulkan text embedding/decoder produced
+  a normal answer, so the failure was isolated to the Vulkan vision encoder.
+- Vulkan fp32 vision export also produced NaNs, so the issue was not simply
+  fp16 overflow from `force_fp16`.
+
+Debug changes:
+
+- `my_research/foundation/runner/xnnpack_qnn_runner.cpp`
+  - Added `--vision_only` so the Android runner can execute only the vision
+    encoder.
+- `my_research/foundation/runner/backend.h`
+  - Added `UnifiedRunConfig::vision_only`.
+- `my_research/foundation/runner/xnnpack_backend.cpp`
+  - In `vision_only` mode, loads and runs only the vision module.
+  - Dumps `vision_output_stats.csv` and `vision_output_0000_f32.bin` when
+    `--save_log` is supplied.
+- `my_research/foundation/host/launcher.py`
+  - Added `vision_only` plumbing and pulls the vision dump artifacts.
+  - Skips pushing text embedding/decoder/tokenizer files in vision-only runs.
+- Debug scripts under `my_research/foundation/debug/vision_compare/`:
+  - `compare_dumped_vision_outputs.py`
+  - `export_vulkan_vision_fp32.py`
+  - `export_vulkan_vision_prefix_fix.py`
+  - `export_vulkan_vision_stage_fix.py`
+
+Isolation results:
+
+- `prefix0`, `prefix1`, `prefix4`, `prefix8`, `prefix10`, `prefix11` were
+  numerically valid.
+- `prefix12` produced NaNs.
+- Layer 11 attention-only was valid.
+- Layer 11 full block produced NaNs.
+- Therefore the first failure was isolated to the layer-11 MLP path, not the
+  rewritten attention path.
+
+Fix:
+
+- `my_research/foundation/models/internvl3/vision_encoder/model.py`
+  - Kept the Vulkan-friendly attention overlay as explicit
+    `bmm -> softmax -> bmm`.
+  - Added `contiguous()` around the attention permute/reshape/bmm boundaries to
+    avoid Vulkan layout ambiguity.
+  - Added `VulkanFriendlyGELU`, a tanh-form GELU written with primitive ops.
+  - `replace_vision_attention_for_vulkan()` now also replaces each vision MLP
+    `activation_fn` with `VulkanFriendlyGELU`.
+
+Verification:
+
+- Exported through the regular CLI path, without `_fix`-specific code:
+
+```bash
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
+python -m my_research.foundation.cli export \
+  --backend vulkan \
+  --artifact_root my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k_fp16_fix \
+  --decoder_model internvl3_1b \
+  --model_path my_research/foundation/results/model/hf/InternVL3-1B-hf \
+  --max_seq_len 1024 \
+  --max_context_len 1024 \
+  --dtype fp16 \
+  --vision_quant fp16 \
+  --decoder_quant fp16 \
+  --embedding_quant fp16 \
+  --decoder_input_mode embeddings \
+  --dynamic_shape \
+  --use_sdpa_with_kv_cache
+```
+
+- Full image run succeeded:
+
+```bash
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
+python -m my_research.foundation.cli run \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k_fp16_fix/manifest.json \
+  --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
+  --device R3CX50FQ62L \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions "Describe this image briefly using around 10 words." \
+  --seq_len 320 \
+  --temperature 0.0 \
+  --save_log \
+  --force_push
+```
+
+- Output:
+
+```text
+Two cats are sleeping on a pink blanket with a remote control nearby.<|im_end|>
+```
+
+- Vision stats after the fix:
+  - shape `[1, 256, 896]`
+  - mean `-0.0566381`
+  - min/max `-7.58984 / 6.57031`
+  - no NaNs
+- XNNPACK-vs-Vulkan fixed vision dump comparison:
+  - cosine `0.9986975`
+  - mean abs diff `0.0320589`
+- Result logs:
+  - `my_research/foundation/results/log/vulkan/internvl3_vulkan_1b_1k_fp16_fix/`
+
+Next:
+
+- The GELU fix is now part of the default Vulkan vision overlay. Future Vulkan
+  exports do not need `_fix` artifact names.
+
 ## Update Checklist for Future Changes
 
 When modifying implementation:

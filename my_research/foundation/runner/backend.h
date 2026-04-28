@@ -45,6 +45,7 @@ struct UnifiedRunConfig {
   int eval_mode{0};
   bool stream{false};
   bool save_log{false};
+  bool vision_only{false};
   std::string output_path;
 };
 

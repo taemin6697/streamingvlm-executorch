@@ -119,7 +119,12 @@ def _finalize_run_logs(
     )
     if save_log:
         pulled = False
-        for name in ("foundation_proc.csv", "android_memory_timeline.csv"):
+        for name in (
+            "foundation_proc.csv",
+            "android_memory_timeline.csv",
+            "vision_output_stats.csv",
+            "vision_output_0000_f32.bin",
+        ):
             pulled = (
                 _pull_if_exists(adb, f"{remote_root}/{name}", log_dir / name) or pulled
             )
@@ -289,6 +294,7 @@ def _run_unified_xnnpack(
     temperature: float | None,
     eval_mode: int = 0,
     save_log: bool = False,
+    vision_only: bool = False,
     force_push: bool = False,
 ) -> int:
     adb = _adb_base(device)
@@ -312,11 +318,6 @@ def _run_unified_xnnpack(
         elif video:
             frame_count = _extract_frames(video, 1.0, frame_dir, manifest.variant)
         else:
-            if decoder_input_mode != "token_ids":
-                raise SystemExit(
-                    "XNNPACK/Vulkan text-only run requires a token-id decoder artifact. "
-                    "Use --image or --video for embedding-input artifacts."
-                )
             frame_count = 0
 
         device_manifest = manifest.resolve_paths(manifest_path.parent)
@@ -342,12 +343,17 @@ def _run_unified_xnnpack(
                 force_push=force_push,
             )
 
-        for key in (
-            "vision_encoder_pte",
-            "text_embedding_pte",
-            "text_decoder_pte",
-            "tokenizer_path",
-        ):
+        push_keys = (
+            ("vision_encoder_pte",)
+            if vision_only
+            else (
+                "vision_encoder_pte",
+                "text_embedding_pte",
+                "text_decoder_pte",
+                "tokenizer_path",
+            )
+        )
+        for key in push_keys:
             path = manifest.paths.get(key)
             if path:
                 _push_file_cached(
@@ -384,6 +390,8 @@ def _run_unified_xnnpack(
         if not text_only:
             args.append(f"--image_path={remote_frames}")
         args.append(f"--decoder_input_mode={decoder_input_mode}")
+        if vision_only:
+            args.append("--vision_only")
         for q in questions:
             args.extend(["--prompt", shlex.quote(q)])
         if save_log:
@@ -527,6 +535,7 @@ def run_with_manifest(
     stream: bool = False,
     runner_binary: str | None = None,
     force_push: bool = False,
+    vision_only: bool = False,
 ) -> int:
     manifest = load_manifest(Path(manifest_path))
     artifact_root = _artifact_root(manifest)
@@ -582,6 +591,7 @@ def run_with_manifest(
             eval_mode=eval_mode,
             save_log=save_log,
             force_push=force_push,
+            vision_only=vision_only,
         )
 
     raise SystemExit(f"지원하지 않는 backend: {manifest.backend}")

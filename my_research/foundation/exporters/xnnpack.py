@@ -504,7 +504,9 @@ def export_xnnpack(args: argparse.Namespace) -> int:
         LOG.info("Saved text decoder to %s", decoder_pte_path)
 
         vision_encoder = load_vision_encoder(
-            model_path, encoder_weights=getattr(args, "encoder_weights", None)
+            model_path,
+            encoder_weights=getattr(args, "encoder_weights", None),
+            vulkan_friendly_attention=(backend == "vulkan"),
         ).eval()
         example_inputs = vision_encoder.get_example_inputs()
 

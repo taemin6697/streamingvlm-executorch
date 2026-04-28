@@ -57,6 +57,7 @@ DEFINE_int32(window, 0, "Lookahead window.");
 DEFINE_int32(gcap, 0, "Lookahead gcap.");
 DEFINE_int32(num_iters, 1, "Number of iterations.");
 DEFINE_bool(save_log, false, "Reserved for launcher compatibility.");
+DEFINE_bool(vision_only, false, "Run only the vision encoder and dump its output.");
 
 namespace {
 
@@ -133,11 +134,6 @@ int main(int argc, char** argv) {
       FLAGS_eval_mode != 0) {
     ET_CHECK_MSG(false, "dump_logits only supported in KV mode.");
   }
-  if (FLAGS_image_path.empty() && FLAGS_decoder_input_mode != "token_ids") {
-    ET_LOG(Error, "--image_path is required.");
-    return 1;
-  }
-
   std::string frame_dir =
       FLAGS_image_path.empty() ? "" : normalize_frame_dir(FLAGS_image_path);
 
@@ -160,6 +156,7 @@ int main(int argc, char** argv) {
   config.temperature = FLAGS_temperature;
   config.eval_mode = FLAGS_eval_mode;
   config.save_log = FLAGS_save_log;
+  config.vision_only = FLAGS_vision_only;
   config.output_path = FLAGS_output_path;
 
   std::unique_ptr<executorch::examples::foundation::BackendRunner> runner;

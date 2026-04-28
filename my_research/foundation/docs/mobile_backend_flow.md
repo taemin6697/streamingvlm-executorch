@@ -6,7 +6,7 @@ under `my_research/foundation`.
 Supported backend targets:
 
 - `xnnpack`: CPU backend, currently implemented.
-- `vulkan`: Android GPU backend, planned.
+- `vulkan`: Android GPU backend, currently implemented for export/run experiments.
 - `qnn`: Qualcomm NPU backend, currently implemented.
 
 ## 1. Directory
@@ -28,7 +28,7 @@ Supported backend targets:
       exporters/
         xnnpack.py
         qnn.py
-        # vulkan.py             # planned
+        # Vulkan export is handled by the XNNPACK/Vulkan split exporter path.
       models/
         internvl3/              # project-local InternVL3 model/export helpers
       host/
@@ -38,7 +38,7 @@ Supported backend targets:
         xnnpack_qnn_runner.cpp
         xnnpack_backend.cpp
         qnn_backend.cpp
-        # vulkan_backend.cpp    # planned
+        # Vulkan currently shares the XNNPACK split runner implementation.
       results/
         model/
           hf/                   # local HF model/checkpoint inputs
@@ -165,14 +165,17 @@ python -m my_research.foundation.cli export \
 
 ### 4.2 Vulkan Export
 
-Planned command shape:
+Vulkan uses the same split exporter as XNNPACK. `--dtype fp16` maps to
+`vulkan_export_dtype=fp32` plus Vulkan `force_fp16=true`, matching upstream
+Llama-style Vulkan export behavior.
 
 ```bash
 cd /workspace/streamingvlm
 
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
 python -m my_research.foundation.cli export \
   --backend vulkan \
-  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k \
+  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k_fp16 \
   --decoder_model internvl3_1b \
   --model_path /workspace/streamingvlm/my_research/foundation/results/model/hf/InternVL3-1B-hf \
   --checkpoint /workspace/streamingvlm/my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth \
@@ -181,31 +184,49 @@ python -m my_research.foundation.cli export \
   --dtype fp16 \
   --vision_quant fp16 \
   --decoder_quant fp16 \
-  --embedding_quant fp16
+  --embedding_quant fp16 \
+  --decoder_input_mode embeddings \
+  --dynamic_shape \
+  --use_sdpa_with_kv_cache
 ```
 
-This requires adding `exporters/vulkan.py` and enabling `--backend vulkan` in the CLI.
+Current Vulkan component support:
+
+- Vision: `fp16` only in the regular exporter.
+- Text embedding: `fp16` only in the regular exporter.
+- Text decoder: `fp16` or `8da4w`.
+- Dynamic shape is supported and is the default.
+
+InternVL3 Vulkan vision uses a local overlay for backend compatibility:
+
+- Attention is rewritten as explicit `bmm -> softmax -> bmm`.
+- MLP GELU is rewritten as a tanh-form primitive expression because the Vulkan
+  `aten.gelu` path produced NaNs in deeper vision layers.
+
+This fix is part of the default Vulkan export path; `_fix` artifact names are no
+longer required for new exports.
 
 ### 4.3 QNN Export
 
 ```bash
 cd /workspace/streamingvlm
 
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
 python -m my_research.foundation.cli export \
   --backend qnn \
-  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_qnn_1b_512_16a8w \
+  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_1b_qnn_512_16a16w \
   --decoder_model internvl3_1b \
   -b executorch/build-android \
-  -s R3KYC01FW1P \
+  -s R3CX50FQ62L \
   -m SM8750 \
   --model_mode hybrid \
   --prefill_ar_len 16 \
   --max_seq_len 512 \
   --max_context_len 512 \
   --dtype fp32 \
-  --vision_quant 16a8w \
-  --decoder_quant 16a8w \
-  --embedding_quant 16a8w \
+  --vision_quant 16a16w \
+  --decoder_quant 16a16w \
+  --embedding_quant 16a16w \
   --prompts "Can you describe this image?" \
   --image_path "http://images.cocodataset.org/val2017/000000039769.jpg"
 ```
@@ -215,12 +236,46 @@ QNN quantization modes use Qualcomm-style names: `16a16w`, `16a8w`,
 `fp16` is treated as an alias for `16a16w`, which makes comparisons with
 XNNPACK fp16 exports explicit.
 
+The current QNN export flow requires a connected Android device and SoC model
+at compile time (`--device` and `--model`).
+
 ### 4.4 Batch Export
+
+Use the matrix script for repeated context-length exports:
 
 ```bash
 cd /workspace/streamingvlm
 
-bash my_research/foundation/export_internvl3_all_lengths.sh all
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
+EXPORT_MODELS="internvl3_1b" \
+EXPORT_LENGTHS="512 1024 2048 4096 8192 16384" \
+my_research/foundation/scripts/export_internvl3_matrix.sh xnnpack
+```
+
+QNN `16a16w` matrix:
+
+```bash
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
+EXPORT_MODELS="internvl3_1b" \
+EXPORT_LENGTHS="512 1024 2048 4096 8192 16384" \
+QNN_DEVICE=R3CX50FQ62L \
+QNN_SOC_MODEL=SM8750 \
+QNN_QUANT=16a16w \
+my_research/foundation/scripts/export_internvl3_matrix.sh qnn
+```
+
+Vulkan fp16 matrix:
+
+```bash
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
+EXPORT_MODELS="internvl3_1b" \
+EXPORT_LENGTHS="512 1024 2048 4096 8192 16384" \
+VULKAN_DTYPE=fp16 \
+VULKAN_VISION_QUANT=fp16 \
+VULKAN_DECODER_QUANT=fp16 \
+VULKAN_EMBEDDING_QUANT=fp16 \
+VULKAN_DECODER_INPUT_MODE=embeddings \
+my_research/foundation/scripts/export_internvl3_matrix.sh vulkan
 ```
 
 Useful overrides:
@@ -230,6 +285,8 @@ Useful overrides:
 - `QNN_DEVICE=...`
 - `QNN_BUILD_PATH=...`
 - `QNN_SOC_MODEL=SM8750`
+- `VULKAN_DECODER_QUANT=8da4w`
+- `SKIP_EXISTING=1`
 
 ## 5. Inspect / Run
 
@@ -253,7 +310,7 @@ Check that these paths exist:
 python -m my_research.foundation.cli run \
   --manifest /workspace/streamingvlm/my_research/foundation/results/model/xnnpack/internvl3_xnnpack_1b_1k_fp16_static/manifest.json \
   --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
-  --device R3KYC01FW1P \
+  --device R3CX50FQ62L \
   --image http://images.cocodataset.org/val2017/000000039769.jpg \
   --questions "Describe this image briefly using around 10 words." \
   --seq_len 320 \
@@ -277,6 +334,8 @@ my_research/foundation/results/log/<backend>/<artifact_dir_name>/
   foundation_output.txt
   foundation_proc.csv
   android_memory_timeline.csv
+  vision_output_stats.csv          # if vision output dump support is enabled
+  vision_output_0000_f32.bin       # if vision output dump support is enabled
   memory_timeline_plot.png
 ```
 
@@ -291,27 +350,58 @@ Add `--force_push` when you need to refresh the cached runner/model files.
 
 ### 5.3 Run Vulkan
 
-Planned command shape:
+Full Vulkan image run:
 
 ```bash
 python -m my_research.foundation.cli run \
-  --manifest /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_2k/manifest.json \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k_fp16/manifest.json \
   --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
-  --device R3KYC01FW1P \
+  --device R3CX50FQ62L \
   --image http://images.cocodataset.org/val2017/000000039769.jpg \
   --questions "Describe this image briefly using around 10 words." \
   --seq_len 320 \
-  --temperature 0.0
+  --temperature 0.0 \
+  --save_log
 ```
+
+Text-only Vulkan run with an embedding-input artifact:
+
+```bash
+python -m my_research.foundation.cli run \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_1k_fp16/manifest.json \
+  --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
+  --device R3CX50FQ62L \
+  --questions "Briefly explain what a vision-language model is." \
+  --seq_len 128 \
+  --temperature 0.0 \
+  --save_log
+```
+
+Hybrid image run using XNNPACK vision and Vulkan text embedding/decoder:
+
+```bash
+python -m my_research.foundation.cli run \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/xnnpack/internvl3_hybrid_xnnpack_vision_vulkan_embedding_decoder_fp16_1k/manifest.json \
+  --runner_binary /workspace/streamingvlm/executorch/build-android-xnnpack-vulkan/foundation/xnnpack_qnn_runner \
+  --device R3CX50FQ62L \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions "Describe this image briefly using around 10 words." \
+  --seq_len 320 \
+  --temperature 0.0 \
+  --save_log
+```
+
+This hybrid path is still useful as a comparison baseline, but full Vulkan image
+runs should now work after the Vulkan-friendly GELU overlay fix.
 
 ### 5.4 Run QNN
 
 ```bash
 python -m my_research.foundation.cli run \
-  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_qnn_1b_2k_fp16/manifest.json \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_1b_qnn_2k_16a8w/manifest.json \
   --runner_binary /workspace/streamingvlm/executorch/build-android/foundation/xnnpack_qnn_runner \
   -b executorch/build-android \
-  -s R3KYC01FW1P \
+  -s R3CX50FQ62L \
   -m SM8750 \
   --image http://images.cocodataset.org/val2017/000000039769.jpg \
   --questions "Describe this image briefly using around 10 words." \
@@ -326,7 +416,9 @@ For video input, replace `--image` with `--video /workspace/streamingvlm/sample.
 
 - XNNPACK path: implemented.
 - QNN path: implemented.
-- Vulkan path: planned; needs exporter, runner backend, CLI choice, and CMake wiring.
+- Vulkan path: implemented for export/run experiments. Text-only Vulkan decoder
+  runs work, and full image Vulkan runs now work after the InternVL3 vision
+  attention/GELU overlay fixes.
 - The common artifact contract assumes split PTEs: vision encoder, text embedding, text decoder.
 - The current runner path is batch-oriented. A full streaming loop is not implemented yet.
 - ExecuTorch source should remain clean. Project-specific changes belong in `my_research/foundation`.
