@@ -2491,298 +2491,52 @@ Notes:
 - No ExecuTorch source was modified.
 - No llama.cpp source was modified.
 
-## llama.cpp Android CPU VLM Smoke Test
+## llama.cpp Android VLM Hybrid Docs
 
 Context:
 
-- User wanted a small VLM example that runs on an Android phone without Vulkan.
-- Tested llama.cpp's `llama-mtmd-cli` with SmolVLM-500M on Android CPU.
+- User explored llama.cpp as an Android VLM runtime and as a possible decoder
+  target for ExecuTorch vision-encoder output.
+- Detailed commands, logs, timings, memory, and backend-specific notes now live
+  under `hybrid_docs/` instead of this foundation tracker.
 
 Changes:
 
-- Added `hybrid_docs/llamacpp_android_cpu_vlm_smoke.md`.
-- Downloaded sample COCO cats image to:
-  `my_research/foundation/sample_coco_cats.jpg`.
-- Built llama.cpp Android CPU binary with OpenMP disabled:
-  `build-android-cpu-noomp`.
+- Added/updated:
+  - `hybrid_docs/README.md`
+  - `hybrid_docs/executorch_vision_llamacpp_decoder.md`
+  - `hybrid_docs/llamacpp_android_cpu_vlm_smoke.md`
+  - `hybrid_docs/llamacpp_android_vulkan_vlm_smoke.md`
+  - `hybrid_docs/llamacpp_android_opencl_vlm_attempt.md`
+  - `hybrid_docs/llamacpp_android_internvl3_1b_smoke.md`
+  - `hybrid_docs/llamacpp_android_memory_summary.md`
+- Added sample images:
+  - `my_research/foundation/sample_coco_cats.jpg`
+  - `my_research/foundation/sample_coco_cats_448.jpg`
 
-Why:
+Key outcomes:
 
-- The first Android CPU build depended on `libomp.so`, which was not available
-  on the device.
-- Rebuilding with `-DGGML_OPENMP=OFF` produced a working CPU-only smoke path.
-
-Verification:
-
-- Pushed `llama-mtmd-cli`, required llama.cpp `.so` files, SmolVLM-500M Q8 GGUF
-  files, and the sample image to `/data/local/tmp/llama-vlm`.
-- Ran:
-
-```bash
-adb shell 'cd /data/local/tmp/llama-vlm && LD_LIBRARY_PATH=. ./llama-mtmd-cli \
-  -m SmolVLM-500M-Instruct-GGUF/SmolVLM-500M-Instruct-Q8_0.gguf \
-  --mmproj SmolVLM-500M-Instruct-GGUF/mmproj-SmolVLM-500M-Instruct-Q8_0.gguf \
-  --image image.jpg \
-  -p "Describe this image briefly." \
-  -n 64 \
-  -t 4'
-```
-
-- Output:
-  `In this image we can see two cats are lying on the bed. We can also see a remote on the bed.`
-- Timing:
-  - image encode: `2688 ms`
-  - image decode/prefill batch: `504 ms`
-  - prompt eval: `23.96 tok/s`
-  - decode eval: `26.51 tok/s`
+- SmolVLM-500M ran successfully on Android CPU and Vulkan.
+- OpenCL built successfully but rejected `Samsung Xclipse 940`, so it fell back
+  to CPU on the tested device.
+- InternVL3 1B ran successfully on Android CPU and Vulkan.
+- llama.cpp InternVL dynamic tiling explained the `1280` image-token run:
+  original `640x480` input became `5 * 256` tokens. Resizing to `448x448`
+  reduced it to `256` tokens.
+- On the tested Xclipse 940 device, Vulkan improved token decode but was slower
+  for VLM vision/prompt prefill.
+- Memory details are summarized in
+  `hybrid_docs/llamacpp_android_memory_summary.md`.
+- `hybrid_docs/README.md` now acts as the high-level index and conclusion page
+  for runtime terminology, streaming-task direction, memory behavior, backend
+  outcomes, and links to the detailed hybrid notes.
 
 Notes:
 
-- This is llama.cpp GGML CPU backend, not ExecuTorch XNNPACK/QNN/Vulkan.
-- No ExecuTorch source was modified.
-- llama.cpp source was not modified, but local build outputs and model files
-  exist under the ignored `llama.cpp/` tree.
-
-## llama.cpp Android Vulkan VLM Smoke Test
-
-Context:
-
-- User asked to try Vulkan or OpenCL for the same llama.cpp Android VLM path.
-- Vulkan was tested first because it is the more standard Android GPU path for
-  llama.cpp and does not require device-specific OpenCL SDK/runtime setup.
-
-Changes:
-
-- Added `hybrid_docs/llamacpp_android_vulkan_vlm_smoke.md`.
-- Added `third_party/` to `.gitignore` because the Vulkan smoke build needed
-  local external header checkouts:
-  - `KhronosGroup/Vulkan-Headers` for `vulkan/vulkan.hpp`
-  - `KhronosGroup/SPIRV-Headers` for `spirv/unified1/spirv.hpp`
-
-Build:
-
-```bash
-cd /workspace/streamingvlm/llama.cpp
-cmake -B build-android-vulkan-noomp \
-  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-30 \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_VULKAN=ON \
-  -DGGML_OPENMP=OFF \
-  -DCMAKE_CXX_FLAGS="-I/workspace/streamingvlm/third_party/Vulkan-Headers/include -I/workspace/streamingvlm/third_party/SPIRV-Headers/include"
-cmake --build build-android-vulkan-noomp --target llama-mtmd-cli -j
-```
-
-Errors fixed:
-
-- First Vulkan build failed with:
-  `fatal error: 'vulkan/vulkan.hpp' file not found`
-- After adding Vulkan-Headers, it failed with:
-  `fatal error: 'spirv/unified1/spirv.hpp' file not found`
-- Adding SPIRV-Headers to `CMAKE_CXX_FLAGS` fixed the build.
-
-Verification:
-
-- Pushed `build-android-vulkan-noomp/bin/llama-mtmd-cli` and all `.so` files to
-  `/data/local/tmp/llama-vlm`.
-- Ran SmolVLM-500M with `--n-gpu-layers 99`.
-- The runtime selected:
-  - `Vulkan0 (Samsung Xclipse 940)`
-  - `offloaded 33/33 layers to GPU`
-  - `llama_kv_cache: Vulkan0 KV buffer size = 320.00 MiB`
-  - `clip_ctx: CLIP using Vulkan0 backend`
-- Output:
-  `In this image, we can see two cats on the bed. There is a remote on the bed.`
-- Timing:
-  - image encode: `14178 ms`
-  - image decode/prefill batch: `5 ms`
-  - prompt eval: `5.59 tok/s`
-  - decode eval: `66.05 tok/s`
-  - total: `15530.12 ms`
-
-Notes:
-
-- Vulkan decode was faster than the previous CPU-only run, but image encoding
-  was slower in this single smoke run. Repeat measurements are needed before
-  treating Vulkan vision encoding as a win.
-- OpenCL exists in llama.cpp as `GGML_OPENCL=ON`, but was not tested. On Android
-  it is less direct than Vulkan because it needs OpenCL headers/libraries and a
-  compatible vendor OpenCL runtime on device.
 - No ExecuTorch source was modified.
 - No llama.cpp source was modified.
-
-## llama.cpp Android OpenCL VLM Attempt
-
-Context:
-
-- User asked to try OpenCL after the Vulkan smoke test.
-- llama.cpp documents OpenCL primarily for Qualcomm Adreno GPUs
-  (`Adreno 750`, `Adreno 830`, `Adreno X85`).
-
-Changes:
-
-- Added `hybrid_docs/llamacpp_android_opencl_vlm_attempt.md`.
-- Added local ignored dependency checkouts under `third_party/`:
-  - `KhronosGroup/OpenCL-Headers`
-  - `KhronosGroup/OpenCL-ICD-Loader`
-
-Build:
-
-```bash
-cd /workspace/streamingvlm
-cmake -S third_party/OpenCL-ICD-Loader \
-  -B third_party/OpenCL-ICD-Loader/build-android \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
-  -DOPENCL_ICD_LOADER_HEADERS_DIR=/workspace/streamingvlm/third_party/OpenCL-Headers \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-30 \
-  -DANDROID_STL=c++_shared
-cmake --build third_party/OpenCL-ICD-Loader/build-android -j
-
-cd /workspace/streamingvlm/llama.cpp
-cmake -B build-android-opencl-noomp \
-  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-30 \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_OPENCL=ON \
-  -DGGML_OPENMP=OFF \
-  -DOpenCL_INCLUDE_DIR=/workspace/streamingvlm/third_party/OpenCL-Headers \
-  -DOpenCL_LIBRARY=/workspace/streamingvlm/third_party/OpenCL-ICD-Loader/build-android/libOpenCL.so
-cmake --build build-android-opencl-noomp --target llama-mtmd-cli -j
-```
-
-Verification:
-
-- Android OpenCL build succeeded.
-- Pushed `build-android-opencl-noomp/bin/llama-mtmd-cli`, llama.cpp `.so` files,
-  and `libOpenCL.so` to `/data/local/tmp/llama-vlm-opencl`.
-- Runtime detected:
-  `Samsung Xclipse 940 (OpenCL 3.0)`
-- llama.cpp rejected the OpenCL device:
-  `Unsupported GPU: Samsung Xclipse 940`
-- It then warned:
-  `no usable GPU found, --gpu-layers option will be ignored`
-- Execution fell back to CPU:
-  - `load_tensors: CPU_Mapped model buffer size = 414.86 MiB`
-  - `llama_kv_cache: CPU KV buffer size = 320.00 MiB`
-  - `clip_ctx: CLIP using CPU backend`
-- Output remained correct:
-  `In this image we can see two cats lying on the bed. We can also see a remote on the bed.`
-- CPU fallback timing:
-  - image encode: `2717 ms`
-  - image decode/prefill batch: `512 ms`
-  - prompt eval: `23.99 tok/s`
-  - decode eval: `24.84 tok/s`
-  - total: `4679.77 ms`
-
-Notes:
-
-- OpenCL is not usable for acceleration on the tested Samsung Xclipse 940 device
-  with upstream llama.cpp's current OpenCL device filter/support.
-- The fallback timing closely matches the previous CPU-only smoke test.
-- No ExecuTorch source was modified.
-- No llama.cpp source was modified.
-
-## llama.cpp Android InternVL3 1B Smoke Test
-
-Context:
-
-- User asked to try InternVL3 1B with llama.cpp on Android.
-- llama.cpp `tools/mtmd/tests.sh` includes
-  `ggml-org/InternVL3-1B-Instruct-GGUF:Q8_0`, confirming upstream mtmd support.
-
-Changes:
-
-- Added `hybrid_docs/llamacpp_android_internvl3_1b_smoke.md`.
-- Downloaded:
-  - `InternVL3-1B-Instruct-Q8_0.gguf` (`644 MiB`)
-  - `mmproj-InternVL3-1B-Instruct-Q8_0.gguf` (`318 MiB`)
-- Local model path:
-  `llama.cpp/models/InternVL3-1B-Instruct-GGUF/`
-- Device path:
-  `/data/local/tmp/llama-internvl3/`
-
-CPU verification:
-
-- Command used the CPU no-OpenMP llama.cpp build with the sample cats image.
-- Output was correct:
-  `The image shows two cats lying on a pink blanket next to two remote controls. One cat is on the left side, and the other is on the right side of the blanket.`
-- Important shape/runtime details:
-  - text context length: `32768`
-  - image tokens: `1280`
-  - CPU KV buffer: `384.00 MiB`
-- Timing:
-  - image encode: `44818 ms`
-  - image decode/prefill batch: `11527 ms`
-  - prompt eval: `22.83 tok/s` over `1295` tokens
-  - decode eval: `18.06 tok/s`
-  - total: `59728.92 ms`
-
-Vulkan verification:
-
-- Command used the Vulkan no-OpenMP llama.cpp build with `--n-gpu-layers 99`.
-- Vulkan was used:
-  - `offloaded 25/25 layers to GPU`
-  - `llama_kv_cache: Vulkan0 KV buffer size = 384.00 MiB`
-  - `clip_ctx: CLIP using Vulkan0 backend`
-- Output was correct:
-  `The image shows two cats lying on a pink blanket next to two remote controls. The cats appear relaxed and comfortable, with one cat lying on its side and the other lying on its back.`
-- Timing:
-  - image encode: `194521 ms`
-  - image decode/prefill batch: `44501 ms`
-  - prompt eval: `5.15 tok/s` over `1295` tokens
-  - decode eval: `34.56 tok/s`
-  - total: `253792.90 ms`
-
-Notes:
-
-- InternVL3 1B works on Android with llama.cpp CPU and Vulkan.
-- InternVL3 produces `1280` image tokens, versus `64` for the SmolVLM-500M smoke
-  test, so prefill dominates latency.
-- On the tested Samsung Xclipse 940 device, Vulkan helped token decode but was
-  much slower for vision encode and image prefill. CPU total was about `59.7 s`;
-  Vulkan total was about `253.8 s`.
-- This supports the hybrid design direction: use a faster dedicated vision path
-  where possible and use llama.cpp mainly for decoder/KV-control experiments.
-- No ExecuTorch source was modified.
-- No llama.cpp source was modified.
-
-Follow-up: 448x448 resize to match ExecuTorch-style single tile:
-
-- User noticed ExecuTorch used `256` vision tokens at image size `448`, while
-  the llama.cpp InternVL3 run used `1280`.
-- Root cause:
-  - Original COCO cats image was `640 x 480`.
-  - llama.cpp InternVL preprocessor applies dynamic high-resolution tiling for
-    larger-than-native images.
-  - InternVL3 single tile tokens:
-    `448 / 14 = 32`, `n_merge = 2`, so `16 * 16 = 256`.
-  - llama.cpp original run used `5` tiles:
-    `5 * 256 = 1280`.
-- Created resized image:
-  `my_research/foundation/sample_coco_cats_448.jpg`
-- CPU resized-image verification:
-  - `n_tokens_batch = 256`
-  - image encode: `8961 ms`
-  - image decode/prefill batch: `2149 ms`
-  - prompt eval: `23.96 tok/s` over `271` tokens
-  - decode eval: `21.41 tok/s`
-  - total: `13653.77 ms`
-- Vulkan resized-image verification:
-  - `n_tokens_batch = 256`
-  - image encode: `47550 ms`
-  - image decode/prefill batch: `497 ms`
-  - prompt eval: `4.48 tok/s` over `271` tokens
-  - decode eval: `40.27 tok/s`
-  - total: `62346.23 ms`
-- Conclusion:
-  - Resizing confirmed the 1280-token behavior was due to dynamic tiling.
-  - On the tested Samsung Xclipse 940 device, Vulkan remains slower than CPU
-    for InternVL3 vision/prompt prefill even with a single 448 tile, but Vulkan
-    token decode remains faster.
+- Local external checkouts/build/model artifacts live under ignored paths such
+  as `llama.cpp/` and `third_party/`.
 
 ## Update Checklist for Future Changes
 
