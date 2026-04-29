@@ -208,6 +208,9 @@ large context can stay closer to KV-cache capacity.
   InternVL3 1B CPU/Vulkan tests, including the `448 x 448` resize follow-up.
 - `llamacpp_android_memory_summary.md`:
   Backend memory breakdown for the llama.cpp Android VLM runs.
+- `aot_static_graph_vs_runtime_token_loop.md`:
+  Discussion note on ExecuTorch AOT memory growth, llama.cpp runtime token
+  execution, and why the split matters for streaming VLMs.
 
 ## Current Recommendation
 

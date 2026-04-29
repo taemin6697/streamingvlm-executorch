@@ -2530,6 +2530,10 @@ Key outcomes:
 - `hybrid_docs/README.md` now acts as the high-level index and conclusion page
   for runtime terminology, streaming-task direction, memory behavior, backend
   outcomes, and links to the detailed hybrid notes.
+- Added `hybrid_docs/aot_static_graph_vs_runtime_token_loop.md` to preserve the
+  follow-up discussion about ExecuTorch AOT max-shape memory growth,
+  llama.cpp's runtime-managed token loop, 8192-token prefill behavior, and why
+  AOT remains useful for fixed-shape mobile accelerator paths.
 
 Notes:
 
