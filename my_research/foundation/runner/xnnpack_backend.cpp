@@ -466,6 +466,18 @@ int64_t static_embedding_seq_len(Module& embedding_module) {
   return input_meta->sizes()[1];
 }
 
+executorch::aten::ScalarType decoder_embedding_input_dtype(Module& decoder_module) {
+  auto method_meta = decoder_module.method_meta("forward");
+  if (!method_meta.ok()) {
+    return executorch::aten::ScalarType::Float;
+  }
+  auto input_meta = method_meta->input_tensor_meta(0);
+  if (!input_meta.ok()) {
+    return executorch::aten::ScalarType::Float;
+  }
+  return input_meta->scalar_type();
+}
+
 executorch::runtime::Result<executorch::aten::Tensor> run_decoder_forward(
     Module& decoder_module,
     const executorch::runtime::EValue& embeddings,
@@ -645,6 +657,8 @@ class XnnpackBackendRunner final : public BackendRunner {
           Module::LoadMode::MmapUseMlockIgnoreErrors);
       ET_CHECK_OK_OR_RETURN_ERROR(decoder_module.load_method("forward"));
       const bool enable_dynamic_shape = decoder_uses_dynamic_shape(decoder_module);
+      const auto decoder_embedding_dtype =
+          decoder_embedding_input_dtype(decoder_module);
       if (!enable_dynamic_shape) {
         ET_CHECK_MSG(
             !decoder_uses_token_ids,
@@ -698,7 +712,7 @@ class XnnpackBackendRunner final : public BackendRunner {
             static_cast<long>(prompt_tokens.size()));
 
           auto decoder_embeddings = decoder_uses_vulkan
-              ? clone_tensor_ptr(*merged_embeddings, executorch::aten::ScalarType::Float)
+              ? clone_tensor_ptr(*merged_embeddings, decoder_embedding_dtype)
               : std::move(merged_embeddings);
           auto logits_res = run_decoder_forward(
             decoder_module,
@@ -767,16 +781,23 @@ class XnnpackBackendRunner final : public BackendRunner {
       std::ostringstream answer;
       const long t_decode_start = executorch::extension::llm::time_in_ms();
       const long rss_decode_start = rss_kb();
+      const bool force_generate = config.force_generate_token > 0;
+      const int generation_len =
+          force_generate ? config.force_generate_token : config.seq_len;
 
-      for (int i = 0; i < config.seq_len; ++i) {
+      for (int i = 0; i < generation_len; ++i) {
         auto decode_piece = tokenizer->decode(prev_token, cur_token);
         if (decode_piece.ok()) {
           answer << *decode_piece;
-          if (contains_stop_marker(*decode_piece)) {
+          if (!force_generate && contains_stop_marker(*decode_piece)) {
             break;
           }
         }
-        if (cur_token == eos_token_id || stop_ids.count(cur_token) > 0) {
+        if (!force_generate &&
+            (cur_token == eos_token_id || stop_ids.count(cur_token) > 0)) {
+          break;
+        }
+        if (i + 1 >= generation_len) {
           break;
         }
 
@@ -799,7 +820,7 @@ class XnnpackBackendRunner final : public BackendRunner {
           const bool decoder_uses_vulkan =
               manifest_.paths.text_decoder_pte.find("vulkan") != std::string::npos;
           auto decoder_next_emb = decoder_uses_vulkan
-              ? clone_tensor_ptr(next_emb, executorch::aten::ScalarType::Float)
+              ? clone_tensor_ptr(next_emb, decoder_embedding_dtype)
               : clone_tensor_ptr(next_emb, next_emb.scalar_type());
           auto next_logits_res =
               run_decoder_forward(decoder_module, *decoder_next_emb, start_pos, 1);

@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  build_backend_and_runner.sh <xnnpack-vulkan|qnn|all>
+  build_backend_and_runner.sh <xnnpack-vulkan|qnn|unified|all>
 
 Builds the upstream ExecuTorch backend tree first, then builds the
 project-local foundation runner against that tree.
@@ -15,12 +15,15 @@ Environment overrides:
   ANDROID_NDK_ROOT    Android NDK path. Default: /opt/android-ndk-r26c
   CMAKE_BUILD_TYPE    CMake build type. Default: Release
   JOBS                Parallel build jobs. Default: nproc
+  VULKAN_QUERY_POOL_SIZE
+                      Vulkan timestamp query slots. Default: 65536
   SKIP_ET_BUILD       If 1, skip ExecuTorch backend build and build runner only.
   SKIP_RUNNER_BUILD   If 1, skip foundation runner build.
 
 Output build trees:
   xnnpack-vulkan      $EXECUTORCH_ROOT/build-android-xnnpack-vulkan
   qnn                 $EXECUTORCH_ROOT/build-android
+  unified             $EXECUTORCH_ROOT/build-android-unified
 EOF
 }
 
@@ -40,12 +43,13 @@ EXECUTORCH_ROOT="${EXECUTORCH_ROOT:-${ROOT_DIR}/executorch}"
 ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-/opt/android-ndk-r26c}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$(nproc)}"
+VULKAN_QUERY_POOL_SIZE="${VULKAN_QUERY_POOL_SIZE:-65536}"
 SKIP_ET_BUILD="${SKIP_ET_BUILD:-0}"
 SKIP_RUNNER_BUILD="${SKIP_RUNNER_BUILD:-0}"
 
 MODE="${1:-}"
 case "${MODE}" in
-  xnnpack-vulkan|qnn|all)
+  xnnpack-vulkan|qnn|unified|all)
     ;;
   -h|--help|"")
     usage
@@ -69,6 +73,7 @@ build_et_xnnpack_vulkan() {
     -DANDROID_PLATFORM=android-30 \
     -DCMAKE_INSTALL_PREFIX="${build_dir}" \
     -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+    -DCMAKE_CXX_FLAGS="-DVULKAN_QUERY_POOL_SIZE=${VULKAN_QUERY_POOL_SIZE}" \
     -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
     -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \
     -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
@@ -92,6 +97,45 @@ build_et_xnnpack_vulkan() {
 build_et_qnn() {
   log "Building ExecuTorch QNN"
   (cd "${EXECUTORCH_ROOT}" && ./backends/qualcomm/scripts/build.sh --skip_x86_64)
+}
+
+build_et_unified() {
+  local build_dir="${EXECUTORCH_ROOT}/build-android-unified"
+  local qnn_sdk_cmake_flag=()
+  if [[ -n "${QNN_SDK_ROOT:-}" ]]; then
+    qnn_sdk_cmake_flag=(-DQNN_SDK_ROOT="${QNN_SDK_ROOT}")
+  fi
+
+  log "Configuring ExecuTorch unified XNNPACK+Vulkan+QNN: ${build_dir}"
+  cmake -S "${EXECUTORCH_ROOT}" -B "${build_dir}" \
+    -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-30 \
+    -DCMAKE_INSTALL_PREFIX="${build_dir}" \
+    -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+    -DCMAKE_CXX_FLAGS="-DVULKAN_QUERY_POOL_SIZE=${VULKAN_QUERY_POOL_SIZE}" \
+    -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_NAMED_DATA_MAP=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_LLM=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON \
+    -DEXECUTORCH_ENABLE_EVENT_TRACER=ON \
+    -DEXECUTORCH_ENABLE_LOGGING=ON \
+    -DPYTHON_EXECUTABLE=python \
+    -DEXECUTORCH_BUILD_QNN=ON \
+    -DEXECUTORCH_BUILD_XNNPACK=ON \
+    -DEXECUTORCH_BUILD_VULKAN=ON \
+    -DEXECUTORCH_BUILD_DEVTOOLS=ON \
+    -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON \
+    -DEXECUTORCH_BUILD_KERNELS_QUANTIZED=ON \
+    -DEXECUTORCH_BUILD_KERNELS_LLM=ON \
+    -DSUPPORT_REGEX_LOOKAHEAD=ON \
+    "${qnn_sdk_cmake_flag[@]}"
+
+  log "Building ExecuTorch unified XNNPACK+Vulkan+QNN"
+  cmake --build "${build_dir}" -j"${JOBS}" --target install --config "${CMAKE_BUILD_TYPE}"
 }
 
 build_runner() {
@@ -136,12 +180,25 @@ run_qnn() {
   fi
 }
 
+run_unified() {
+  local build_dir="${EXECUTORCH_ROOT}/build-android-unified"
+  if [[ "${SKIP_ET_BUILD}" != "1" ]]; then
+    build_et_unified
+  fi
+  if [[ "${SKIP_RUNNER_BUILD}" != "1" ]]; then
+    build_runner "${build_dir}"
+  fi
+}
+
 case "${MODE}" in
   xnnpack-vulkan)
     run_xnnpack_vulkan
     ;;
   qnn)
     run_qnn
+    ;;
+  unified)
+    run_unified
     ;;
   all)
     run_xnnpack_vulkan

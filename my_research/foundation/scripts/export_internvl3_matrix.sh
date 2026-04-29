@@ -25,10 +25,11 @@ QNN overrides:
   QNN_SOC_MODEL            Default: SM8750
   QNN_MODEL_MODE           Default: hybrid
   QNN_PREFILL_AR_LEN       Default: 16
-  QNN_QUANT                Default for all QNN components. Default: fp16 (=16a16w)
+  QNN_QUANT                Default for all QNN components. Default: fp16 (QNN HTP fp16 compile)
   QNN_VISION_QUANT         QNN vision quant mode. Default: $QNN_QUANT
   QNN_DECODER_QUANT        QNN decoder quant mode. Default: $QNN_QUANT
   QNN_EMBEDDING_QUANT      QNN embedding quant mode. Default: $QNN_QUANT
+  QNN_EXTRA_ARGS           Extra args appended to each QNN export command
   QNN_PROMPT               Default: Can you describe this image?
   QNN_IMAGE_PATH           Default: COCO sample image URL
 
@@ -37,6 +38,7 @@ XNNPACK overrides:
   XNNPACK_VISION_QUANT     Default: fp16
   XNNPACK_DECODER_QUANT    Default: fp16
   XNNPACK_EMBEDDING_QUANT  Default: fp16
+  XNNPACK_EXTRA_ARGS       Extra args appended to each XNNPACK export command
   DYNAMIC_SHAPE            If 0/false, disable XNNPACK dynamic sequence shapes. Default: 1
 
 Vulkan overrides:
@@ -46,6 +48,7 @@ Vulkan overrides:
   VULKAN_EMBEDDING_QUANT   Default: fp16
   VULKAN_DECODER_INPUT_MODE Default: embeddings
   VULKAN_USE_SDPA_WITH_KV_CACHE If 0/false, pass --no-use_sdpa_with_kv_cache. Default: 1
+  VULKAN_EXTRA_ARGS        Extra args appended to each Vulkan export command
 EOF
 }
 
@@ -106,11 +109,13 @@ QNN_DECODER_QUANT="${QNN_DECODER_QUANT:-${QNN_QUANT}}"
 QNN_EMBEDDING_QUANT="${QNN_EMBEDDING_QUANT:-${QNN_QUANT}}"
 QNN_PROMPT="${QNN_PROMPT:-Can you describe this image?}"
 QNN_IMAGE_PATH="${QNN_IMAGE_PATH:-http://images.cocodataset.org/val2017/000000039769.jpg}"
+read -r -a QNN_EXTRA_ARGS_ARRAY <<< "${QNN_EXTRA_ARGS:-}"
 
 XNNPACK_DTYPE="${XNNPACK_DTYPE:-fp16}"
 XNNPACK_VISION_QUANT="${XNNPACK_VISION_QUANT:-fp16}"
 XNNPACK_DECODER_QUANT="${XNNPACK_DECODER_QUANT:-fp16}"
 XNNPACK_EMBEDDING_QUANT="${XNNPACK_EMBEDDING_QUANT:-fp16}"
+read -r -a XNNPACK_EXTRA_ARGS_ARRAY <<< "${XNNPACK_EXTRA_ARGS:-}"
 DYNAMIC_SHAPE="${DYNAMIC_SHAPE:-1}"
 
 VULKAN_DTYPE="${VULKAN_DTYPE:-fp16}"
@@ -119,6 +124,7 @@ VULKAN_DECODER_QUANT="${VULKAN_DECODER_QUANT:-fp16}"
 VULKAN_EMBEDDING_QUANT="${VULKAN_EMBEDDING_QUANT:-fp16}"
 VULKAN_DECODER_INPUT_MODE="${VULKAN_DECODER_INPUT_MODE:-embeddings}"
 VULKAN_USE_SDPA_WITH_KV_CACHE="${VULKAN_USE_SDPA_WITH_KV_CACHE:-1}"
+read -r -a VULKAN_EXTRA_ARGS_ARRAY <<< "${VULKAN_EXTRA_ARGS:-}"
 
 length_tag() {
   local length="$1"
@@ -137,7 +143,8 @@ model_size_tag() {
 qnn_quant_tag_value() {
   local quant="${1,,}"
   case "${quant}" in
-    fp16|16a16w) echo "16a16w" ;;
+    fp16) echo "fp16" ;;
+    16a16w) echo "16a16w" ;;
     16a8w|16a4w|16a4w_block|8a8w|8a4w) echo "${quant}" ;;
     *) die "unsupported QNN quant mode for artifact tag: ${1}" ;;
   esac
@@ -235,6 +242,7 @@ run_qnn_export() {
     --embedding_quant "${QNN_EMBEDDING_QUANT}"
     --prompts "${QNN_PROMPT}"
     --image_path "${QNN_IMAGE_PATH}"
+    "${QNN_EXTRA_ARGS_ARRAY[@]}"
   )
   append_local_model_args cmd "${decoder_model}"
 
@@ -274,6 +282,7 @@ run_xnnpack_export() {
     --decoder_quant "${XNNPACK_DECODER_QUANT}"
     --embedding_quant "${XNNPACK_EMBEDDING_QUANT}"
     "${dynamic_shape_args[@]}"
+    "${XNNPACK_EXTRA_ARGS_ARRAY[@]}"
   )
   append_local_model_args cmd "${decoder_model}"
 
@@ -312,6 +321,7 @@ run_vulkan_export() {
     --decoder_input_mode "${VULKAN_DECODER_INPUT_MODE}"
     --dynamic_shape
     "${sdpa_args[@]}"
+    "${VULKAN_EXTRA_ARGS_ARRAY[@]}"
   )
   append_local_model_args cmd "${decoder_model}"
 

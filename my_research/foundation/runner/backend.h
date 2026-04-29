@@ -41,6 +41,7 @@ struct UnifiedRunConfig {
   std::string questions;
   std::string query_timestamps;
   int seq_len{128};
+  int force_generate_token{0};
   double temperature{0.0};
   int eval_mode{0};
   bool stream{false};

@@ -1,14 +1,37 @@
 # Python generated files
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Build outputs and external dependency checkouts
 build/
 build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
 executorch/
 
 # Foundation generated artifacts
 my_research/foundation/results/
 
+# Model/runtime artifacts should be regenerated or downloaded, not committed.
+*.pte
+*.ptd
+*.pth
+*.safetensors
+*.onnx
+*.bin
+*.so
+*.a
+
 # Local environment/debug snapshots
+.env
+.venv/
+venv/
 pip_freeze_before_torchao_repair.txt
+
+# Logs and profiler outputs
+*.log
+*.csv

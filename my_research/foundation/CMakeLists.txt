@@ -51,9 +51,14 @@ list(APPEND CMAKE_FIND_ROOT_PATH ${EXECUTORCH_BUILD_DIR})
 find_package(executorch CONFIG REQUIRED FIND_ROOT_PATH_BOTH)
 executorch_target_link_options_shared_lib(executorch)
 
-if(TARGET qnn_executorch_backend)
+if(TARGET qnn_executorch_backend AND NOT TARGET portable_ops_lib)
   executorch_load_build_variables()
-  gen_selected_ops(LIB_NAME "full_portable_ops_lib" INCLUDE_ALL_OPS "ON")
+  gen_selected_ops(
+    LIB_NAME "full_portable_ops_lib"
+    ROOT_OPS
+      "aten::expand_copy.out"
+      "aten::embedding.out"
+  )
   generate_bindings_for_kernels(
     LIB_NAME "full_portable_ops_lib" FUNCTIONS_YAML
     ${EXECUTORCH_ROOT}/kernels/portable/functions.yaml
@@ -111,9 +116,7 @@ if(TARGET vulkan_backend)
   target_link_libraries(xnnpack_qnn_runner PUBLIC vulkan_backend)
 endif()
 
-# portable_ops_lib: XNNPACK 전용. QNN 사용 시 full_portable_ops_lib(custom_ops)만 사용하여
-# _cdist_forward.out 등 kernel 중복 등록 충돌 방지.
-if(TARGET portable_ops_lib AND NOT TARGET qnn_executorch_backend)
+if(TARGET portable_ops_lib)
   target_link_libraries(xnnpack_qnn_runner PUBLIC portable_ops_lib portable_kernels)
 endif()
 
@@ -136,7 +139,7 @@ if(TARGET qnn_executorch_backend)
       ${EXECUTORCH_ROOT}/extension/llm/custom_ops/op_fallback.cpp
     )
     target_include_directories(custom_ops PUBLIC ${_common_include_directories})
-    target_link_libraries(custom_ops PUBLIC executorch_core full_portable_ops_lib)
+    target_link_libraries(custom_ops PUBLIC executorch_core)
     executorch_target_link_options_shared_lib(custom_ops)
   endif()
 
@@ -166,8 +169,25 @@ if(TARGET qnn_executorch_backend)
     extension_llm_runner
     extension_module
     extension_tensor
-    custom_ops
     tokenizers::tokenizers)
+  if(TARGET custom_ops)
+    target_link_libraries(
+      xnnpack_qnn_runner PUBLIC $<LINK_LIBRARY:WHOLE_ARCHIVE,custom_ops>
+    )
+  endif()
+  if(NOT TARGET portable_ops_lib AND TARGET full_portable_ops_lib)
+    add_dependencies(xnnpack_qnn_runner full_portable_ops_lib)
+    target_link_options(
+      xnnpack_qnn_runner PRIVATE
+      "LINKER:--whole-archive"
+      "$<TARGET_FILE:full_portable_ops_lib>"
+      "LINKER:--no-whole-archive"
+    )
+    target_link_libraries(
+      xnnpack_qnn_runner PUBLIC
+      portable_kernels
+    )
+  endif()
   if(TARGET quantized_ops_lib)
     target_link_libraries(xnnpack_qnn_runner PUBLIC quantized_ops_lib quantized_kernels)
   endif()

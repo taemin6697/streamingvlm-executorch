@@ -20,26 +20,26 @@ from my_research.foundation.manifest import (
 )
 
 
-_QNN_QUANT_ALIASES = {
-    "fp16": "16a16w",
-    "16a16w": "16a16w",
-    "16a8w": "16a8w",
-    "16a4w": "16a4w",
-    "16a4w_block": "16a4w_block",
-    "8a8w": "8a8w",
-    "8a4w": "8a4w",
+_QNN_QUANT_MODES = {
+    "fp16",
+    "16a16w",
+    "16a8w",
+    "16a4w",
+    "16a4w_block",
+    "8a8w",
+    "8a4w",
 }
 
 
 def _normalize_qnn_quant(name: str | None, *, component: str) -> str:
     key = (name or "fp16").lower()
-    if key not in _QNN_QUANT_ALIASES:
-        supported = ", ".join(sorted(_QNN_QUANT_ALIASES))
+    if key not in _QNN_QUANT_MODES:
+        supported = ", ".join(sorted(_QNN_QUANT_MODES))
         raise SystemExit(
             f"Unsupported QNN {component} quant mode: {name}. "
             f"Supported modes: {supported}"
         )
-    return _QNN_QUANT_ALIASES[key]
+    return key
 
 
 def _qnn_quant_dtype(name: str):
@@ -56,6 +56,7 @@ def _qnn_quant_recipe_class(
     target_granularity,
     base_cls,
     observer,
+    force_kv_8bit: bool = False,
     target_extra_kwargs: dict | None = None,
 ):
     quant_dtype = _qnn_quant_dtype(name)
@@ -81,6 +82,12 @@ def _qnn_quant_recipe_class(
                 granularity=target_granularity,
                 extra_kwargs=target_extra_kwargs,
             )
+            if force_kv_8bit:
+                from executorch.backends.qualcomm.quantizer.custom_annotation import (
+                    annotate_kv_8bit,
+                )
+
+                self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
     FoundationQNNQuantRecipe.__name__ = (
         f"FoundationQNN_{name}_{op_target.name().replace('::', '_')}_Recipe"
@@ -95,6 +102,7 @@ def _qnn_quant_overrides(
     decoder_quant: str,
     vision_quant: str,
     embedding_quant: str,
+    qnn_kv_quant: str,
 ) -> Iterator[None]:
     import torch
     from executorch.backends.qualcomm.quantizer.quant_recipe import QuantGranularity
@@ -125,6 +133,7 @@ def _qnn_quant_overrides(
         ),
         base_cls=StaticLLMQuantRecipe,
         observer=MinMaxObserver,
+        force_kv_8bit=qnn_kv_quant == "8",
         target_extra_kwargs=(
             {"block_size": (1, 32, 1, 1)} if decoder_quant == "16a4w_block" else None
         ),
@@ -166,6 +175,105 @@ def _qnn_quant_overrides(
         llm_wrappers.make_quantizer = original_make_quantizer
 
 
+@contextlib.contextmanager
+def _qnn_true_fp16_overrides(decoder_model_config) -> Iterator[None]:
+    """Reserve a scoped hook point for QNN HTP fp16 compile precision."""
+    try:
+        yield
+    finally:
+        pass
+
+
+def _qnn_compile_true_fp16(
+    qnn_compile,
+    args,
+    decoder_model_config,
+    pte_filenames,
+    _tokenizer,
+    _calibration_data,
+    is_multimodal,
+) -> None:
+    """Compile through QNN HTP fp16 without editing ExecuTorch's llama.py."""
+    globals_ = qnn_compile.__globals__
+    os = globals_["os"]
+    MultiModalManager = globals_["MultiModalManager"]
+    from executorch.examples.qualcomm.oss_scripts.llama.wrappers.llm_wrappers import (
+        HybridTextDecoder,
+    )
+
+    get_soc_to_chipset_map = globals_["get_soc_to_chipset_map"]
+    generate_htp_compiler_spec = globals_["generate_htp_compiler_spec"]
+    generate_qnn_executorch_compiler_spec = globals_[
+        "generate_qnn_executorch_compiler_spec"
+    ]
+    AUDIO_ENCODER = globals_["AUDIO_ENCODER"]
+    TEXT_ENCODER = globals_["TEXT_ENCODER"]
+    VISION_ENCODER = globals_["VISION_ENCODER"]
+    TOK_EMBEDDING = globals_["TOK_EMBEDDING"]
+    TEXT_DECODER = globals_["TEXT_DECODER"]
+    TOK_EMBEDDING_GRAPH_NAMES = globals_["TOK_EMBEDDING_GRAPH_NAMES"]
+    DECODER_GRAPH_NAMES = globals_["DECODER_GRAPH_NAMES"]
+
+    os.makedirs(args.artifact, exist_ok=True)
+    multi_modal_mgr = MultiModalManager(control_args=args, config=decoder_model_config)
+    compile_specs = {
+        AUDIO_ENCODER: None,
+        TEXT_ENCODER: None,
+        VISION_ENCODER: None,
+        TOK_EMBEDDING: None,
+        TEXT_DECODER: None,
+    }
+    for modality in compile_specs:
+        if is_multimodal and modality in {AUDIO_ENCODER, TEXT_ENCODER, VISION_ENCODER}:
+            backend_options = generate_htp_compiler_spec(use_fp16=True)
+            compile_specs[modality] = generate_qnn_executorch_compiler_spec(
+                soc_model=get_soc_to_chipset_map()[args.soc_model],
+                backend_options=backend_options,
+                shared_buffer=not args.enable_x86_64,
+            )
+        elif is_multimodal and modality == TOK_EMBEDDING:
+            backend_options = generate_htp_compiler_spec(
+                use_fp16=True,
+                use_weight_sharing=not args.enable_x86_64,
+            )
+            compile_specs[modality] = [
+                generate_qnn_executorch_compiler_spec(
+                    soc_model=get_soc_to_chipset_map()[args.soc_model],
+                    backend_options=backend_options,
+                    shared_buffer=not args.enable_x86_64,
+                )
+            ] * len(TOK_EMBEDDING_GRAPH_NAMES)
+        elif modality == TEXT_DECODER:
+            backend_options = generate_htp_compiler_spec(
+                use_fp16=True,
+                use_multi_contexts=decoder_model_config.num_sharding > 1,
+                use_weight_sharing=not args.enable_x86_64,
+            )
+            compile_specs[modality] = [
+                generate_qnn_executorch_compiler_spec(
+                    soc_model=get_soc_to_chipset_map()[args.soc_model],
+                    backend_options=backend_options,
+                    shared_buffer=not args.enable_x86_64,
+                    use_mha2sha=True,
+                )
+            ] * len(DECODER_GRAPH_NAMES)
+
+    # Do not call MultiModalManager.quantize() for true fp16. That method applies
+    # PTQ/QDQ recipes before lowering; fp16 should lower the eager modules
+    # directly with HTP fp16 compiler specs. Hybrid encoding override only aligns
+    # QDQ encodings, so it must be skipped when no QDQ graph exists.
+    original_encoding_override = HybridTextDecoder._encoding_override
+
+    def _skip_encoding_override(self, decode_model, prefill_model):
+        return None
+
+    HybridTextDecoder._encoding_override = _skip_encoding_override
+    try:
+        multi_modal_mgr.compile(compile_specs=compile_specs, pte_filenames=pte_filenames)
+    finally:
+        HybridTextDecoder._encoding_override = original_encoding_override
+
+
 def export_qnn(args: argparse.Namespace) -> int:
     """Export QNN artifacts without modifying ExecuTorch's Qualcomm sources."""
     if not args.build_path or not args.device or not args.model:
@@ -205,6 +313,19 @@ def export_qnn(args: argparse.Namespace) -> int:
     embedding_quant = _normalize_qnn_quant(
         getattr(args, "embedding_quant", "fp16"), component="embedding"
     )
+    qnn_true_fp16 = {vision_quant, decoder_quant, embedding_quant} == {"fp16"}
+    qnn_kv_quant = getattr(args, "qnn_kv_quant", "default")
+    if qnn_kv_quant == "8" and qnn_true_fp16:
+        raise SystemExit(
+            "QNN --qnn_kv_quant 8 requires a quantized QNN path. The true fp16 "
+            "compile path skips PTQ/QDQ, so KV 8-bit annotation is not available."
+        )
+    if "fp16" in {vision_quant, decoder_quant, embedding_quant} and not qnn_true_fp16:
+        raise SystemExit(
+            "QNN fp16 now means HTP fp16 compile precision and must be used for "
+            "vision, decoder, and embedding together. Use explicit 16a16w for "
+            "the old 16a16w quantized path."
+        )
     # llama.py: max_context_len defaults to max_seq_len; must be >= prefill_ar_len
     max_context_len = getattr(args, "max_context_len", None) or args.max_seq_len
     if max_context_len < args.max_seq_len:
@@ -312,20 +433,33 @@ def export_qnn(args: argparse.Namespace) -> int:
         for modality in (vision_encoder, audio_encoder)
     )
 
-    with _qnn_quant_overrides(
-        decoder_model_config,
-        decoder_quant=decoder_quant,
-        vision_quant=vision_quant,
-        embedding_quant=embedding_quant,
-    ):
-        qnn_compile(
-            qnn_args,
+    if qnn_true_fp16:
+        with _qnn_true_fp16_overrides(decoder_model_config):
+            _qnn_compile_true_fp16(
+                qnn_compile,
+                qnn_args,
+                decoder_model_config,
+                pte_filenames,
+                tokenizer,
+                calibration_data,
+                is_multimodal,
+            )
+    else:
+        with _qnn_quant_overrides(
             decoder_model_config,
-            pte_filenames,
-            tokenizer,
-            calibration_data,
-            is_multimodal,
-        )
+            decoder_quant=decoder_quant,
+            vision_quant=vision_quant,
+            embedding_quant=embedding_quant,
+            qnn_kv_quant=qnn_kv_quant,
+        ):
+            qnn_compile(
+                qnn_args,
+                decoder_model_config,
+                pte_filenames,
+                tokenizer,
+                calibration_data,
+                is_multimodal,
+            )
 
     manifest = build_manifest(
         artifact_root=Path(qnn_args.artifact),
@@ -341,13 +475,18 @@ def export_qnn(args: argparse.Namespace) -> int:
             "prefill_ar_len": args.prefill_ar_len,
             "model_mode": model_mode,
             "soc_model": args.model,
-            "qnn_quant_aliases": {"fp16": "16a16w"},
+            "qnn_fp16_compile": qnn_true_fp16,
+            "qnn_kv_quant": qnn_kv_quant,
+            "qnn_quant_note": (
+                "fp16 uses QNN HTP fp16 compile precision; use 16a16w for the old quantized path"
+            ),
         },
         quant={
             "dtype": args.dtype,
             "vision": vision_quant,
             "decoder": decoder_quant,
             "embedding": embedding_quant,
+            "kv_cache": "8" if qnn_kv_quant == "8" else None,
         },
     )
     write_manifest(manifest, Path(qnn_args.artifact) / FOUNDATION_MANIFEST_FILENAME)

@@ -49,6 +49,10 @@ DEFINE_string(system_prompt, "", "System prompt.");
 
 DEFINE_double(temperature, 0.0f, "Sampling temperature.");
 DEFINE_int32(seq_len, 128, "Max tokens to generate.");
+DEFINE_int32(
+    force_generate_token,
+    0,
+    "If >0, generate exactly this many tokens and ignore EOS/stop tokens.");
 DEFINE_int32(eval_mode, 1, "0=KV, 1=Hybrid, 2=Lookahead.");
 DEFINE_bool(shared_buffer, false, "Use shared buffers where supported.");
 
@@ -153,6 +157,7 @@ int main(int argc, char** argv) {
   config.frame_count = frame_dir.empty() ? 0 : count_frames(frame_dir);
   config.questions = join_prompts(prompts);
   config.seq_len = FLAGS_seq_len;
+  config.force_generate_token = FLAGS_force_generate_token;
   config.temperature = FLAGS_temperature;
   config.eval_mode = FLAGS_eval_mode;
   config.save_log = FLAGS_save_log;

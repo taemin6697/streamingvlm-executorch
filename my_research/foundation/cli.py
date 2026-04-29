@@ -47,6 +47,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         questions=args.questions,
         timestamps=args.timestamps,
         seq_len=args.seq_len,
+        force_generate_token=args.force_generate_token,
         temperature=args.temperature,
         eval_mode=eval_mode,
         save_log=args.save_log,
@@ -82,24 +83,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--vision_quant",
         default="fp16",
         help=(
-            "Backend-specific vision quant mode. QNN supports fp16(alias 16a16w), "
-            "16a16w, 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
+            "Backend-specific vision quant mode. For QNN, fp16 uses HTP fp16 "
+            "compile precision; explicit 16a16w uses the quantized 16a16w path. "
+            "Other QNN modes: 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
         ),
     )
     export_parser.add_argument(
         "--decoder_quant",
         default="fp16",
         help=(
-            "Backend-specific decoder quant mode. QNN supports fp16(alias 16a16w), "
-            "16a16w, 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
+            "Backend-specific decoder quant mode. For QNN, fp16 uses HTP fp16 "
+            "compile precision; explicit 16a16w uses the quantized 16a16w path. "
+            "Other QNN modes: 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w. "
+            "For Vulkan: fp16 and vulkan_8w use the Vulkan PT2E quantizer; "
+            "4w/8da8w/8da4w use the upstream Llama qmode source-transform path."
         ),
     )
     export_parser.add_argument(
         "--embedding_quant",
         default="fp16",
         help=(
-            "Backend-specific embedding quant mode. QNN supports fp16(alias 16a16w), "
-            "16a16w, 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
+            "Backend-specific embedding quant mode. For QNN, fp16 uses HTP fp16 "
+            "compile precision; explicit 16a16w uses the quantized 16a16w path. "
+            "Other QNN modes: 16a8w, 16a4w, 16a4w_block, 8a8w, 8a4w."
         ),
     )
     export_parser.add_argument("--model_path", default=None)
@@ -125,6 +131,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
     )
     export_parser.add_argument(
+        "--quantize_kv_cache",
+        action="store_true",
+        help=(
+            "For XNNPACK/Vulkan exports, use upstream int8 per-token quantized "
+            "KV-cache. This is separate from QNN KV I/O quantization."
+        ),
+    )
+    export_parser.add_argument(
+        "--qnn_kv_quant",
+        choices=["default", "8"],
+        default="default",
+        help=(
+            "For QNN quantized exports, override decoder KV I/O quantization. "
+            "'8' forces annotate_kv_8bit; 'default' follows the quant recipe."
+        ),
+    )
+    export_parser.add_argument(
         "--decoder_input_mode",
         choices=["token_ids", "embeddings"],
         default="token_ids",
@@ -137,6 +160,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--vulkan_xnnpack_fallback",
         action="store_true",
         help="For Vulkan export, lower unsupported non-decoder subgraphs with XNNPACK.",
+    )
+    export_parser.add_argument(
+        "--vulkan-force-fp16",
+        "--vulkan_force_fp16",
+        action="store_true",
+        dest="vulkan_force_fp16",
+        help=(
+            "For Vulkan export, keep the requested export dtype but force fp16 "
+            "storage/compute in the Vulkan delegate. This allows fp32 graph export "
+            "with Vulkan force-fp16."
+        ),
+    )
+    export_parser.add_argument(
+        "--vulkan_debug_fp32_kv_cache",
+        action="store_true",
+        help=(
+            "Debug only: keep Vulkan fp16 decoder export but force transformed "
+            "KV-cache buffers and update inputs to fp32."
+        ),
+    )
+    export_parser.add_argument(
+        "--vulkan_debug_block_sdpa_delegate",
+        action="store_true",
+        help=(
+            "Debug only: keep sdpa_with_kv_cache in the graph, but block it "
+            "from Vulkan delegation so the custom op runs outside Vulkan."
+        ),
+    )
+    export_parser.add_argument(
+        "--decoder_only_from",
+        default=None,
+        help=(
+            "Export only the text decoder and reuse vision/embedding/tokenizer "
+            "artifacts from this existing foundation artifact root or manifest."
+        ),
     )
     export_parser.add_argument(
         "--dynamic_shape",
@@ -189,6 +247,15 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--questions", nargs="+", default=None)
     run_parser.add_argument("--timestamps", nargs="+", type=float, default=None)
     run_parser.add_argument("--seq_len", type=int, default=None)
+    run_parser.add_argument(
+        "--force_generate_token",
+        type=int,
+        default=None,
+        help=(
+            "If set, generate exactly this many tokens and ignore EOS/stop "
+            "tokens. Overrides --seq_len for generation length."
+        ),
+    )
     run_parser.add_argument("--temperature", type=float, default=None)
     run_parser.add_argument(
         "--eval_mode",

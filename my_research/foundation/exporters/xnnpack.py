@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import json
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
@@ -47,6 +48,7 @@ from my_research.foundation.models.internvl3.vision_encoder.model import (
 from my_research.foundation.manifest import (
     FOUNDATION_MANIFEST_FILENAME,
     build_manifest,
+    load_manifest,
     write_manifest,
 )
 
@@ -171,6 +173,55 @@ def _split_pte_names(backend: str) -> Tuple[str, str, str]:
     return (VISION_ENCODER_PTE, TEXT_EMBEDDING_PTE, TEXT_DECODER_PTE)
 
 
+def _manifest_path_from_artifact(path: str) -> Path:
+    manifest_path = Path(path).resolve()
+    if manifest_path.is_dir():
+        manifest_path = manifest_path / FOUNDATION_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Foundation manifest not found: {manifest_path}")
+    return manifest_path
+
+
+def _copy_reused_file(src: Path, dst: Path) -> Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+    return dst
+
+
+def _ensure_quantized_aot_lib_search_path() -> None:
+    """Make upstream QuantizedKVCache's AOT op lookup find the host build lib."""
+    import executorch
+
+    roots = [
+        Path.cwd(),
+        Path(__file__).resolve().parents[3],
+    ]
+    for root in roots:
+        lib_path = root / "executorch/build-x86/kernels/quantized/libquantized_ops_aot_lib.so"
+        if lib_path.exists():
+            # Upstream searches recursively for "*quantized_ops_aot_lib.*" and
+            # asserts exactly one match. The CMake build tree also contains a
+            # `quantized_ops_aot_lib.dir`, so expose a clean one-file directory.
+            clean_root = Path(tempfile.gettempdir()) / "foundation_quantized_aot_lib"
+            clean_root.mkdir(parents=True, exist_ok=True)
+            clean_lib = clean_root / lib_path.name
+            shutil.copy2(lib_path, clean_lib)
+            search_root = str(clean_root)
+            if search_root not in executorch.__path__:
+                executorch.__path__.append(search_root)
+                LOG.info(
+                    "Added ExecuTorch host AOT quantized ops search path: %s",
+                    search_root,
+                )
+            return
+    LOG.warning(
+        "Quantized KV-cache requested, but host libquantized_ops_aot_lib.so "
+        "was not found under executorch/build-x86. Build target "
+        "`quantized_ops_aot_lib` if export fails."
+    )
+
+
 @contextlib.contextmanager
 def _vulkan_preprocess_option_patch() -> Iterator[None]:
     """Teach ExecuTorch Vulkan preprocess about bool options it already checks."""
@@ -235,19 +286,246 @@ def _vulkan_preprocess_option_patch() -> Iterator[None]:
         vulkan_sdpa.CausalSDPAMatch.__init__ = original_causal_sdpa_match_init
 
 
+@contextlib.contextmanager
+def _vulkan_sdpa_fp16_meta_patch(enabled: bool) -> Iterator[None]:
+    """Allow Vulkan fp16 graph export through sdpa_with_kv_cache meta validation.
+
+    Upstream's Python meta validation for llama.sdpa_with_kv_cache currently
+    asserts fp32 tensors, while Vulkan's op registry accepts floating-point
+    tensors and the backend has an fp16 path. Keep this scoped to foundation
+    Vulkan fp16 export experiments instead of editing ExecuTorch source.
+    """
+    if not enabled:
+        yield
+        return
+
+    from executorch.extension.llm.custom_ops import custom_ops
+
+    original_validate_params = custom_ops._validate_params
+
+    def _validate_params_allow_fp16(
+        query,
+        key,
+        value,
+        key_cache,
+        value_cache,
+        start_pos,
+        seq_len,
+        attn_mask,
+        drpout_p,
+        is_causal,
+        scale,
+    ):
+        float_dtypes = {torch.float16, torch.float32}
+        assert query.dim() == 4, (
+            f"Expected query to be 4 dimensional but got {query.dim()} dimensions."
+        )
+        assert key.dim() == 4, (
+            f"Expected key to be 4 dimensional but got {key.dim()} dimensions."
+        )
+        assert value.dim() == 4, (
+            f"Expected value to be 4 dimensional but got {value.dim()} dimensions."
+        )
+        assert query.dtype in float_dtypes, f"Expected query to be fp16/fp32 but got {query.dtype}"
+        assert key.dtype in float_dtypes, f"Expected key to be fp16/fp32 but got {key.dtype}"
+        assert value.dtype in float_dtypes, f"Expected value to be fp16/fp32 but got {value.dtype}"
+
+        assert key_cache.dim() == 4, (
+            f"Expected key_cache to be 4 dimensional but got {key_cache.dim()}"
+        )
+        assert value_cache.dim() == 4, (
+            f"Expected value_cache to be 4 dimensional but got {value_cache.dim()}"
+        )
+        assert key_cache.dtype in float_dtypes, (
+            f"Expected key_cache to be fp16/fp32 but got {key_cache.dtype}"
+        )
+        assert value_cache.dtype in float_dtypes, (
+            f"Expected value_cache to be fp16/fp32 but got {value_cache.dtype}"
+        )
+        assert key_cache.size() == value_cache.size(), (
+            "Key cache and value cache must have same size but got "
+            f"{key_cache.size()} and {value_cache.size()}"
+        )
+        if attn_mask is not None:
+            assert attn_mask.dim() == 2, (
+                f"Expected attn_mask to be 2 dimensional but got {attn_mask.dim()} dimensions."
+            )
+            assert attn_mask.dtype in float_dtypes, (
+                f"Expected attn_mask to be fp16/fp32 but got {attn_mask.dtype}"
+            )
+
+    custom_ops._validate_params = _validate_params_allow_fp16
+    try:
+        yield
+    finally:
+        custom_ops._validate_params = original_validate_params
+
+
+@contextlib.contextmanager
+def _vulkan_rms_norm_symbolic_eps_patch(enabled: bool) -> Iterator[None]:
+    """Skip Vulkan RMSNorm fusion when eps cannot be materialized statically.
+
+    Vulkan's RMSNorm replacement extracts epsilon with float(val.item()). In
+    dynamic-shape quantized exports this can become a data-dependent symbolic
+    value, which fails during FusePatternsPass before runtime testing.
+    """
+    if not enabled:
+        yield
+        return
+
+    import executorch.backends.vulkan.patterns.rms_norm as vulkan_rms_norm
+    import executorch.backends.vulkan.patterns.pattern_registry as pattern_registry
+
+    pattern_entry = pattern_registry.fusable_patterns.get("rms_norm")
+    original_replace = (
+        pattern_entry.create_replacement_fn if pattern_entry is not None else None
+    )
+
+    def replace_rms_norm_skip_symbolic_eps(ep, graph_module, match):
+        try:
+            assert original_replace is not None
+            original_replace(ep, graph_module, match)
+        except Exception as exc:
+            if "GuardOnDataDependentSymNode" not in type(exc).__name__ and (
+                "data-dependent expression" not in str(exc)
+            ):
+                raise
+            LOG.warning(
+                "Skipping Vulkan RMSNorm fusion because eps is symbolic: %s",
+                exc,
+            )
+
+    vulkan_rms_norm.replace_rms_norm_with_fused_op = replace_rms_norm_skip_symbolic_eps
+    if pattern_entry is not None:
+        pattern_entry.create_replacement_fn = replace_rms_norm_skip_symbolic_eps
+    try:
+        yield
+    finally:
+        if original_replace is not None:
+            vulkan_rms_norm.replace_rms_norm_with_fused_op = original_replace
+            if pattern_entry is not None:
+                pattern_entry.create_replacement_fn = original_replace
+
+
 def _foundation_vulkan_partitioner(
-    *, dtype: str, enable_dynamic_shape: bool, force_fp16: bool
+    *,
+    dtype: str,
+    enable_dynamic_shape: bool,
+    force_fp16: bool,
+    block_sdpa_delegate: bool = False,
 ):
     assert (
-        dtype == "fp32" or dtype is None
-    ), "Vulkan backend does not support non fp32 dtype_override; use force_fp16."
+        dtype in {"fp16", "fp32"} or dtype is None
+    ), "Vulkan foundation export supports fp16/fp32 dtype_override."
     from executorch.backends.vulkan.partitioner.vulkan_partitioner import (
         VulkanPartitioner,
     )
 
+    operator_blocklist = None
+    if block_sdpa_delegate:
+        operator_blocklist = [torch.ops.llama.sdpa_with_kv_cache.default]
+
     return VulkanPartitioner(
-        {"require_dynamic_shapes": enable_dynamic_shape, "force_fp16": force_fp16}
+        {"require_dynamic_shapes": enable_dynamic_shape, "force_fp16": force_fp16},
+        operator_blocklist=operator_blocklist,
     )
+
+
+_VULKAN_DECODER_QUANT_MODES = {
+    "fp16": ("fp16", False, 0),
+    "8w": ("vulkan_8w", False, 8),
+    "vulkan_8w": ("vulkan_8w", False, 8),
+    # Match the upstream Llama Vulkan tutorial: these are source-transform
+    # qmode paths, not Vulkan PT2E graph quantizer paths. This avoids leaving
+    # quantized_decomposed.quantize_per_tensor dynamic-shape ops outside Vulkan.
+    "4w": ("4w", False, 0),
+    "vulkan_4w": ("4w", False, 0),
+    "8da8w": ("8da8w", False, 0),
+    "vulkan_8da8w": ("8da8w", False, 0),
+    "8da4w": ("8da4w", False, 0),
+    "vulkan_8da4w": ("8da4w", False, 0),
+}
+
+
+def _normalize_vulkan_decoder_quant(name: str | None) -> str:
+    key = (name or "fp16").lower()
+    if key not in _VULKAN_DECODER_QUANT_MODES:
+        supported = ", ".join(sorted(_VULKAN_DECODER_QUANT_MODES))
+        raise SystemExit(
+            f"Unsupported Vulkan decoder_quant mode: {name}. "
+            f"Supported modes: {supported}"
+        )
+    return _VULKAN_DECODER_QUANT_MODES[key][0]
+
+
+def _foundation_vulkan_quantizers(decoder_quant: str):
+    normalized, is_dynamic, weight_bits = _VULKAN_DECODER_QUANT_MODES[decoder_quant]
+    if normalized in {"fp16", "4w", "8da8w", "8da4w"}:
+        return []
+
+    from executorch.backends.vulkan.quantizer.vulkan_quantizer import (
+        get_symmetric_quantization_config as get_vulkan_quantization_config,
+        VulkanQuantizer,
+    )
+
+    config = get_vulkan_quantization_config(
+        is_dynamic=is_dynamic,
+        weight_bits=weight_bits,
+    )
+    return [VulkanQuantizer().set_global(config)]
+
+
+def _force_custom_kv_cache_fp32(module: torch.nn.Module) -> int:
+    """Keep sdpa_with_kv_cache enabled, but store/update CustomKVCache in fp32.
+
+    The upstream custom SDPA transform already casts Q/K/V to fp32 inside
+    SDPACustom. For a true Vulkan fp16 export debug run, the missing piece is
+    that CustomKVCache buffers may be converted to fp16 with the rest of the
+    model. This wrapper keeps cache buffers fp32 and casts update inputs to the
+    cache dtype before calling the original update implementation.
+    """
+    import types
+
+    patched = 0
+    for child in module.modules():
+        if not (
+            hasattr(child, "k_cache")
+            and hasattr(child, "v_cache")
+            and callable(getattr(child, "update", None))
+        ):
+            continue
+
+        k_cache = getattr(child, "k_cache")
+        v_cache = getattr(child, "v_cache")
+        if not (
+            isinstance(k_cache, torch.Tensor)
+            and isinstance(v_cache, torch.Tensor)
+            and k_cache.is_floating_point()
+            and v_cache.is_floating_point()
+        ):
+            continue
+
+        child.k_cache = k_cache.to(torch.float32)
+        child.v_cache = v_cache.to(torch.float32)
+        original_update = child.update
+
+        def make_update_with_fp32_inputs(update_fn):
+            def update_with_fp32_inputs(self, input_pos, k_val, v_val, *args, **kwargs):
+                cache_dtype = self.k_cache.dtype
+                return update_fn(
+                    input_pos,
+                    k_val.to(cache_dtype),
+                    v_val.to(cache_dtype),
+                    *args,
+                    **kwargs,
+                )
+
+            return update_with_fp32_inputs
+
+        child.update = types.MethodType(make_update_with_fp32_inputs(original_update), child)
+        patched += 1
+
+    return patched
 
 
 def _lower_split_program(
@@ -257,6 +535,7 @@ def _lower_split_program(
     enable_dynamic_shape: bool,
     dtype: str,
     vulkan_force_fp16: bool = False,
+    vulkan_debug_block_sdpa_delegate: bool = False,
     xnnpack_partitioner=None,
     vulkan_fallback_partitioner=None,
     constant_methods=None,
@@ -268,11 +547,16 @@ def _lower_split_program(
                 dtype=dtype,
                 enable_dynamic_shape=enable_dynamic_shape,
                 force_fp16=vulkan_force_fp16,
+                block_sdpa_delegate=vulkan_debug_block_sdpa_delegate,
             )
         ]
         if vulkan_fallback_partitioner:
             partitioner.extend(vulkan_fallback_partitioner)
-        with _vulkan_preprocess_option_patch():
+        with (
+            _vulkan_preprocess_option_patch(),
+            _vulkan_sdpa_fp16_meta_patch(enabled=dtype == "fp16"),
+            _vulkan_rms_norm_symbolic_eps_patch(enabled=True),
+        ):
             return to_edge_transform_and_lower(
                 exported_program,
                 partitioner=partitioner,
@@ -303,16 +587,15 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             f"Unsupported decoder_model for {backend}: {args.decoder_model}. "
             f"Use one of {list(_DEFAULT_HF_MODELS.keys())} or set --model_path."
         )
+    decoder_quant = getattr(args, "decoder_quant", "fp16")
+    vulkan_decoder_quant = None
     if backend == "vulkan":
-        supported_vulkan_decoder_quant = {"fp16", "8da4w"}
+        vulkan_decoder_quant = _normalize_vulkan_decoder_quant(decoder_quant)
         if args.vision_quant != "fp16" or args.embedding_quant != "fp16":
             raise SystemExit(
                 "Vulkan foundation export currently keeps vision/embedding quant as fp16."
             )
-        if args.decoder_quant not in supported_vulkan_decoder_quant:
-            raise SystemExit(
-                "Vulkan foundation export currently supports decoder_quant fp16 or 8da4w."
-            )
+        decoder_quant = vulkan_decoder_quant
 
     params_path = args.params or str(_default_params_path(args.decoder_model))
 
@@ -326,11 +609,14 @@ def export_xnnpack(args: argparse.Namespace) -> int:
     )
     try:
         requested_dtype = args.dtype
-        vulkan_force_fp16 = backend == "vulkan" and requested_dtype == "fp16"
-        export_dtype = "fp32" if backend == "vulkan" else requested_dtype
+        vulkan_force_fp16 = bool(
+            backend == "vulkan"
+            and (requested_dtype == "fp16" or getattr(args, "vulkan_force_fp16", False))
+        )
+        export_dtype = requested_dtype
         dtype = DType[export_dtype]
         torch_dtype = dtype.to_torch_dtype()
-        use_decoder_quant = args.decoder_quant != "fp16"
+        use_decoder_quant = decoder_quant != "fp16"
 
         llm_config = LlmConfig()
         llm_config.base.model_class = _ModelName(
@@ -343,6 +629,11 @@ def export_xnnpack(args: argparse.Namespace) -> int:
         )
         llm_config.model.dtype_override = DtypeOverride(export_dtype)
         llm_config.model.use_kv_cache = True
+        llm_config.model.quantize_kv_cache = bool(
+            getattr(args, "quantize_kv_cache", False)
+        )
+        if llm_config.model.quantize_kv_cache:
+            _ensure_quantized_aot_lib_search_path()
         use_sdpa_with_kv_cache = getattr(args, "use_sdpa_with_kv_cache", True)
         if backend == "vulkan":
             use_sdpa_with_kv_cache = True
@@ -353,12 +644,14 @@ def export_xnnpack(args: argparse.Namespace) -> int:
         llm_config.export.max_context_length = max_context_len
         llm_config.export.output_dir = str(output_dir.parent)
         llm_config.export.output_name = output_dir.name
-        llm_config.quantization.qmode = (
-            args.decoder_quant if args.decoder_quant != "fp16" else None
-        )
+        llm_config.quantization.qmode = None
+        if decoder_quant in {"4w", "8da4w", "8da8w"}:
+            llm_config.quantization.qmode = decoder_quant
+        elif backend != "vulkan" and decoder_quant != "fp16":
+            llm_config.quantization.qmode = decoder_quant
         text_group_size = getattr(args, "text_group_size", None)
         if text_group_size is None:
-            text_group_size = 64 if backend == "vulkan" and args.decoder_quant == "8da4w" else 128
+            text_group_size = 64 if backend == "vulkan" and decoder_quant == "8da4w" else 128
         llm_config.quantization.group_size = text_group_size
         llm_config.quantization.embedding_quantize = (
             args.embedding_quant if args.embedding_quant != "fp16" else None
@@ -372,6 +665,22 @@ def export_xnnpack(args: argparse.Namespace) -> int:
 
         text_edge_manager = _prepare_for_llama_export(llm_config)
         eager_text_model = text_edge_manager.model
+        vulkan_debug_fp32_kv_cache = bool(
+            backend == "vulkan"
+            and requested_dtype == "fp16"
+            and getattr(args, "vulkan_debug_fp32_kv_cache", False)
+        )
+        vulkan_debug_block_sdpa_delegate = bool(
+            backend == "vulkan"
+            and getattr(args, "vulkan_debug_block_sdpa_delegate", False)
+        )
+        fp32_kv_cache_modules = 0
+        if vulkan_debug_fp32_kv_cache:
+            fp32_kv_cache_modules = _force_custom_kv_cache_fp32(eager_text_model)
+            LOG.info(
+                "Vulkan debug: forced %d CustomKVCache-like modules to fp32.",
+                fp32_kv_cache_modules,
+            )
 
         vision_quant = getattr(args, "vision_quant", "fp16")
         calibration_num = getattr(args, "calibration_num", 8)
@@ -449,6 +758,8 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             dynamic_shapes=decoder_dynamic_shapes,
         )
         _, quantizers, _ = get_quantizer_and_quant_params(llm_config)
+        if backend == "vulkan":
+            quantizers.extend(_foundation_vulkan_quantizers(decoder_quant))
         manager = manager.export().pt2e_quantize(quantizers)
         with torch.no_grad():
             text_decoder_ep = torch.export.export(
@@ -465,8 +776,12 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             "get_max_context_len": max_context_len,
             "enable_dynamic_shape": enable_dynamic_shape,
             "use_kv_cache": True,
+            "quantize_kv_cache": llm_config.model.quantize_kv_cache,
             "use_sdpa_with_kv_cache": use_sdpa_with_kv_cache,
             "decoder_input_mode": decoder_input_mode,
+            "vulkan_debug_fp32_kv_cache": vulkan_debug_fp32_kv_cache,
+            "vulkan_debug_fp32_kv_cache_modules": fp32_kv_cache_modules,
+            "vulkan_debug_block_sdpa_delegate": vulkan_debug_block_sdpa_delegate,
         }
 
         exec_config = ExecutorchBackendConfig(
@@ -494,6 +809,7 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             enable_dynamic_shape=enable_dynamic_shape,
             dtype=export_dtype,
             vulkan_force_fp16=vulkan_force_fp16,
+            vulkan_debug_block_sdpa_delegate=vulkan_debug_block_sdpa_delegate,
             xnnpack_partitioner=text_decoder_partitioner,
             constant_methods=metadata,
         )
@@ -502,6 +818,70 @@ def export_xnnpack(args: argparse.Namespace) -> int:
         with open(decoder_pte_path, "wb") as f:
             decoder_edge.to_executorch(exec_config).write_to_file(f)
         LOG.info("Saved text decoder to %s", decoder_pte_path)
+
+        decoder_only_from = getattr(args, "decoder_only_from", None)
+        if decoder_only_from:
+            source_manifest_path = _manifest_path_from_artifact(decoder_only_from)
+            source_manifest = load_manifest(source_manifest_path, resolve_paths=True)
+            source_paths = source_manifest.paths
+
+            vision_pte_path = _copy_reused_file(
+                Path(source_paths["vision_encoder_pte"]),
+                output_dir / Path(source_paths["vision_encoder_pte"]).name,
+            )
+            emb_pte_path = _copy_reused_file(
+                Path(source_paths["text_embedding_pte"]),
+                output_dir / Path(source_paths["text_embedding_pte"]).name,
+            )
+            source_tokenizer_path = Path(source_paths["tokenizer_path"])
+            tokenizer_dir = output_dir / "artifacts" / "tokenizer"
+            if source_tokenizer_path.parent.resolve() != tokenizer_dir.resolve():
+                shutil.copytree(source_tokenizer_path.parent, tokenizer_dir, dirs_exist_ok=True)
+            tokenizer_path = tokenizer_dir / source_tokenizer_path.name
+
+            foundation_manifest = build_manifest(
+                artifact_root=output_dir,
+                backend=backend,
+                variant=args.decoder_model,
+                runner_type="multimodal_split",
+                vision_encoder_pte=vision_pte_path,
+                text_embedding_pte=emb_pte_path,
+                text_decoder_pte=decoder_pte_path,
+                tokenizer_path=tokenizer_path,
+                export={
+                    **dict(source_manifest.export),
+                    "max_seq_len": args.max_seq_len,
+                    "max_context_len": max_context_len,
+                    "dtype": args.dtype,
+                    "vulkan_export_dtype": export_dtype if backend == "vulkan" else None,
+                    "vulkan_force_fp16": vulkan_force_fp16 if backend == "vulkan" else None,
+                    "model_source": model_path,
+                    "enable_dynamic_shape": enable_dynamic_shape,
+                    "use_sdpa_with_kv_cache": use_sdpa_with_kv_cache,
+                    "quantize_kv_cache": llm_config.model.quantize_kv_cache,
+                    "decoder_input_mode": decoder_input_mode,
+                    "vulkan_debug_fp32_kv_cache": vulkan_debug_fp32_kv_cache,
+                    "vulkan_debug_fp32_kv_cache_modules": fp32_kv_cache_modules,
+                    "vulkan_debug_block_sdpa_delegate": vulkan_debug_block_sdpa_delegate,
+                    "text_group_size": text_group_size,
+                    "decoder_only_from": str(source_manifest_path),
+                },
+                quant={
+                    **dict(source_manifest.quant),
+                    "decoder": decoder_quant,
+                    "kv_cache": "int8" if llm_config.model.quantize_kv_cache else None,
+                },
+                runtime={
+                    **dict(source_manifest.runtime),
+                    "decoder_model_version": "internvl3",
+                    "preferred_runner": "xnnpack_qnn_runner",
+                    "split_runner_backend": "xnnpack" if backend == "xnnpack" else "vulkan",
+                    "decoder_delegate": decoder_delegate,
+                },
+            )
+            write_manifest(foundation_manifest, output_dir / FOUNDATION_MANIFEST_FILENAME)
+            LOG.info("Saved decoder-only manifest to %s", output_dir / FOUNDATION_MANIFEST_FILENAME)
+            return 0
 
         vision_encoder = load_vision_encoder(
             model_path,
@@ -595,7 +975,11 @@ def export_xnnpack(args: argparse.Namespace) -> int:
                 "model_source": model_path,
                 "enable_dynamic_shape": enable_dynamic_shape,
                 "use_sdpa_with_kv_cache": use_sdpa_with_kv_cache,
+                "quantize_kv_cache": llm_config.model.quantize_kv_cache,
                 "decoder_input_mode": decoder_input_mode,
+                "vulkan_debug_fp32_kv_cache": vulkan_debug_fp32_kv_cache,
+                "vulkan_debug_fp32_kv_cache_modules": fp32_kv_cache_modules,
+                "vulkan_debug_block_sdpa_delegate": vulkan_debug_block_sdpa_delegate,
                 "text_group_size": text_group_size,
                 "static_prefill_mode": (
                     "parallel_dynamic" if enable_dynamic_shape else "sequential_1_token"
@@ -604,8 +988,9 @@ def export_xnnpack(args: argparse.Namespace) -> int:
             },
             quant={
                 "vision": vision_quant,
-                "decoder": args.decoder_quant,
+                "decoder": decoder_quant,
                 "embedding": args.embedding_quant,
+                "kv_cache": "int8" if llm_config.model.quantize_kv_cache else None,
             },
             runtime={
                 "decoder_model_version": "internvl3",

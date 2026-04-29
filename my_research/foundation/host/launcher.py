@@ -291,6 +291,7 @@ def _run_unified_xnnpack(
     questions: list[str],
     timestamps: list[float] | None,
     seq_len: int | None,
+    force_generate_token: int | None,
     temperature: float | None,
     eval_mode: int = 0,
     save_log: bool = False,
@@ -382,7 +383,7 @@ def _run_unified_xnnpack(
             f"--embedding_path={embedding_path}",
             f"--decoder_path={decoder_path}",
             f"--tokenizer_path={tokenizer_path}",
-            f"--seq_len={seq_len or 128}",
+            f"--seq_len={seq_len or manifest.export.get('max_seq_len', 128)}",
             f"--temperature={temperature if temperature is not None else 0.0}",
             f"--eval_mode={eval_mode}",
             f"--output_path=foundation_output.txt",
@@ -392,6 +393,8 @@ def _run_unified_xnnpack(
         args.append(f"--decoder_input_mode={decoder_input_mode}")
         if vision_only:
             args.append("--vision_only")
+        if force_generate_token is not None:
+            args.append(f"--force_generate_token={force_generate_token}")
         for q in questions:
             args.extend(["--prompt", shlex.quote(q)])
         if save_log:
@@ -419,6 +422,7 @@ def _run_unified_qnn(
     questions: list[str],
     timestamps: list[float] | None,
     seq_len: int | None,
+    force_generate_token: int | None,
     temperature: float | None,
     eval_mode: int = 0,
     save_log: bool = False,
@@ -496,6 +500,8 @@ def _run_unified_qnn(
             f"--eval_mode={eval_mode}",
             "--output_path=foundation_output.txt",
         ]
+        if force_generate_token is not None:
+            cmd.append(f"--force_generate_token={force_generate_token}")
         for q in questions:
             cmd.extend(["--prompt", shlex.quote(q)])
         if save_log:
@@ -529,6 +535,7 @@ def run_with_manifest(
     questions: list[str] | None = None,
     timestamps: list[float] | None = None,
     seq_len: int | None = None,
+    force_generate_token: int | None = None,
     temperature: float | None = None,
     eval_mode: int = 0,
     save_log: bool = False,
@@ -562,6 +569,7 @@ def run_with_manifest(
             questions=questions,
             timestamps=timestamps,
             seq_len=seq_len,
+            force_generate_token=force_generate_token,
             temperature=temperature,
             eval_mode=eval_mode,
             save_log=save_log,
@@ -587,6 +595,7 @@ def run_with_manifest(
             questions=questions,
             timestamps=timestamps,
             seq_len=seq_len,
+            force_generate_token=force_generate_token,
             temperature=temperature,
             eval_mode=eval_mode,
             save_log=save_log,
