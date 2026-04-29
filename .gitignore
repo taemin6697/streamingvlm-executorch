@@ -12,6 +12,8 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 executorch/
+llama.cpp/
+third_party/
 
 # Foundation generated artifacts
 my_research/foundation/results/
