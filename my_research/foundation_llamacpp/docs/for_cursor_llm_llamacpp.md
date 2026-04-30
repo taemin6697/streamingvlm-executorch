@@ -15,6 +15,9 @@ Use it to record:
 
 ## Patch Policy
 
+- This file must be updated continuously whenever `my_research/foundation_llamacpp`
+  is patched, rebuilt, rerun, debugged, or reorganized. Treat it as the durable
+  handoff log for future agents.
 - Add new findings here first instead of scattering them across multiple notes.
 - When a run changes behavior, write the reason for the change and the observed effect.
 - Keep the log cumulative: do not delete old notes unless they are clearly wrong.
@@ -111,6 +114,89 @@ follow_up:
   split the bs=256 graph into 51 pieces. In short: decoder layers were offloaded
   (`offloaded 25/25 layers`), but VLM prefill is still limited by image-token
   batch size and CPU/HTP orchestration overhead.
+- 2026-04-30: Started hybrid runtime Option A (split-process bridge) without
+  modifying upstream `llama.cpp` or ExecuTorch. Added
+  `my_research/foundation_llamacpp/hybrid_bridge/` with a small binary
+  float32 embedding file format, `hybrid_vision_dump` for ExecuTorch QNN vision
+  encoder output, and `hybrid_decode` for llama.cpp decoder injection through
+  the public `mtmd_helper_decode_image_chunk()` path. The decoder still uses
+  `mmproj` only to build the text/image token layout; the image embedding bytes
+  come from the external QNN output file.
+- 2026-04-30: Added `run_android_hybrid_bridge.py` to orchestrate the Android
+  split process: preprocess one image to the existing InternVL 448x448 CHW
+  float32 `.bin`, push QNN/llama runtime files, run `hybrid_vision_dump`, then
+  run `hybrid_decode` with OpenCL and pull `hybrid_vision_stdout.txt`,
+  `hybrid_decode_stdout.txt`, `vision_output_stats.csv`, and the bridge
+  embedding file into `results/log/hybrid_bridge/<GGUF-stem>/`.
+- 2026-04-30: Build validation notes for Option A. Host `hybrid_decode` builds
+  successfully in `my_research/foundation_llamacpp/build-hybrid-host`. Android
+  OpenCL/QNN bridge builds successfully in
+  `my_research/foundation_llamacpp/build-hybrid-android-opencl` after matching
+  the ExecuTorch QNN build API level (`ANDROID_PLATFORM=android-30`). Using
+  `android-28` failed at link time because
+  `libqnn_executorch_backend.so` referenced `memfd_create@LIBC_R`; the unified
+  ExecuTorch QNN build was configured with `ANDROID_PLATFORM=android-30`, so
+  the overlay bridge must use the same API level.
+- 2026-04-30: Re-ran Option A after reconnecting ADB and successfully forced
+  the decoder onto OpenCL. The key fix was to avoid the local ICD-loader
+  `libOpenCL.so` in `/data/local/tmp/llama-vlm`; renaming it let the runtime use
+  the device system OpenCL library, after which `--device GPUOpenCL` detected
+  `QUALCOMM Adreno(TM) 830`. Results are under
+  `my_research/foundation_llamacpp/results/log/hybrid_bridge_opencl/InternVL3-1B-Instruct-Q8_0/`.
+  QNN vision produced `1x256x896` embeddings in 434 ms. `hybrid_decode` used
+  OpenCL model/KV/compute buffers, decoded the external image embedding in 47
+  ms, prompt eval was 267.20 ms / 271 tokens (1014.24 tok/s), decode was
+  398.30 ms / 31 runs (77.83 tok/s), and total time was 1808.82 ms.
+- 2026-04-30: Added the same result artifacts for hybrid bridge runs that the
+  standalone llama.cpp runner produces: `foundation_output.txt`,
+  `foundation_proc.csv`, `vision_output_stats.csv`, `android_memory_timeline.csv`,
+  `memory_timeline_plot.png`, and `phase_duration_stacked_bar.png`. The memory
+  timeline intentionally plots only Android `MemAvailable`, matching the earlier
+  foundation plotting decision. A sampled rerun of the OpenCL hybrid bridge
+  completed with QNN vision encode 376 ms, external embedding decode 48 ms,
+  prompt eval 268.27 ms / 271 tokens, token decode 411.64 ms / 31 runs, and
+  total llama.cpp time 1767.83 ms.
+- 2026-04-30: Cleaned up hybrid bridge result naming. The canonical decoder log
+  is now only `foundation_output.txt`, matching the standalone runner layout.
+  The intermediate `hybrid_decode_stdout.txt` is used only on-device and removed
+  from the local result directory after metrics/plots are generated. Manual
+  rerun duplicates such as `hybrid_decode_opencl_stdout.txt` and
+  `hybrid_opencl_exit_code.txt` were removed from the OpenCL hybrid result.
+- 2026-04-30: Normalized the hybrid bridge decoder settings to match the
+  standalone OpenCL baseline: `n_ctx=32768`, `n_batch=2048`, and `n_ubatch=512`.
+  `run_android_hybrid_bridge.py` now defaults to those values and forwards
+  `-ub/--ubatch-size` to `hybrid_decode`. The matched OpenCL hybrid rerun
+  confirmed those settings in the log, with OpenCL KV buffer 384.00 MiB and
+  OpenCL compute buffer 297.99 MiB. Timing: QNN vision encode 378 ms, external
+  embedding decode/inject 46 ms, prompt eval 267.47 ms / 271 tokens, token
+  decode 401.33 ms / 30 runs, total llama.cpp time 1800.31 ms.
+- 2026-04-30: Expanded
+  `docs/executorch_vision_llamacpp_decoder.md` from a feasibility note into the
+  current end-to-end hybrid bridge guide. Added the split-process architecture,
+  `.svlmemb` boundary, Android run procedure, canonical result artifacts,
+  matched OpenCL/QNN timing interpretation, and troubleshooting notes. Important
+  conclusion: InternVL3 `vision_encoder_pte` includes `vision_tower`,
+  pixel-shuffle/downsample, and `multi_modal_projector`, producing projected
+  `1x256x896` decoder-ready image embeddings. Therefore compare hybrid
+  `QNN Vision Encoder` against standalone llama.cpp OpenCL `image slice encoded`,
+  not against `image decoded` or prompt eval. Also documented that OpenCL phase
+  counters can shift due to async queue/synchronization, so phase timing and
+  external wall time must be interpreted separately.
+- 2026-04-30: Further expanded
+  `docs/executorch_vision_llamacpp_decoder.md` with a detailed build guide for
+  the hybrid bridge. Documented dependency roles (llama.cpp OpenCL vs ExecuTorch
+  QNN vs llama.cpp Hexagon SDK), host sanity build commands, Android
+  OpenCL+QNN bridge CMake configure/build commands, expected targets/artifacts,
+  runner-pushed libraries, and build troubleshooting. Key build requirements:
+  keep host and Android build dirs separate, use `ANDROID_PLATFORM=android-30`
+  for the bridge to match `executorch/build-android-unified`, pass
+  `OpenCL_INCLUDE_DIR` and `OpenCL_LIBRARY` from `third_party`, and build both
+  `hybrid_decode` and `hybrid_vision_dump` from the overlay without patching
+  upstream sources.
+- 2026-04-30: Clarified the patch policy for this file itself. This document is
+  the persistent llama.cpp-side development/handoff log and must be updated
+  continuously whenever code, build scripts, docs, run outputs, measurements, or
+  troubleshooting decisions under `my_research/foundation_llamacpp` change.
 
 Suggested note format:
 

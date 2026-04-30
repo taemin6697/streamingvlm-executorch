@@ -11,6 +11,16 @@ my_research/foundation_llamacpp/results/log/<backend>/<model_name>/
 Use the GGUF stem as `model_name`, for example `InternVL3-1B-Instruct-Q8_0`,
 so the quantization suffix stays visible in the result path.
 
+Hybrid bridge prototype:
+
+- Source lives under `hybrid_bridge/` and stays outside upstream `llama.cpp` and
+  ExecuTorch.
+- `hybrid_vision_dump` runs the ExecuTorch QNN vision encoder and writes a
+  float32 embedding file.
+- `hybrid_decode` runs llama.cpp with OpenCL and injects that external
+  embedding through the public mtmd helper path.
+- `run_android_hybrid_bridge.py` orchestrates the split process on Android.
+
 Use the runner to collect:
 
 - control output from `llama.cpp` or hybrid runtime runs
