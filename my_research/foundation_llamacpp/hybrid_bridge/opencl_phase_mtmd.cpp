@@ -1,31 +1,24 @@
-#include "hybrid_embedding_file.h"
-
 #include "arg.h"
 #include "chat.h"
 #include "common.h"
+#include "debug.h"
 #include "log.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 #include "sampling.h"
 
 #include <clocale>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
 
 struct custom_args {
-  std::string embedding_path;
-  std::string phase_stats_path = "decoder_phase_stats.csv";
-  std::string ready_path;
-  bool wait_for_embedding = false;
-  int wait_timeout_ms = 120000;
+  std::string phase_stats_path = "foundation_phase_stats.csv";
   std::vector<std::string> passthrough;
 };
 
@@ -34,68 +27,18 @@ custom_args strip_custom_args(int argc, char** argv) {
   out.passthrough.push_back(argv[0]);
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg == "--external-embedding" || arg == "--embedding-file") {
-      if (i + 1 >= argc) {
-        die("missing value for --external-embedding");
-      }
-      out.embedding_path = argv[++i];
-    } else if (arg.rfind("--external-embedding=", 0) == 0) {
-      out.embedding_path = arg.substr(std::string("--external-embedding=").size());
-    } else if (arg.rfind("--embedding-file=", 0) == 0) {
-      out.embedding_path = arg.substr(std::string("--embedding-file=").size());
-    } else if (arg == "--phase-stats-path") {
+    if (arg == "--phase-stats-path") {
       if (i + 1 >= argc) {
         die("missing value for --phase-stats-path");
       }
       out.phase_stats_path = argv[++i];
     } else if (arg.rfind("--phase-stats-path=", 0) == 0) {
       out.phase_stats_path = arg.substr(std::string("--phase-stats-path=").size());
-    } else if (arg == "--ready-path") {
-      if (i + 1 >= argc) {
-        die("missing value for --ready-path");
-      }
-      out.ready_path = argv[++i];
-    } else if (arg.rfind("--ready-path=", 0) == 0) {
-      out.ready_path = arg.substr(std::string("--ready-path=").size());
-    } else if (arg == "--wait-for-embedding") {
-      out.wait_for_embedding = true;
-    } else if (arg == "--wait-timeout-ms") {
-      if (i + 1 >= argc) {
-        die("missing value for --wait-timeout-ms");
-      }
-      out.wait_timeout_ms = std::atoi(argv[++i]);
-    } else if (arg.rfind("--wait-timeout-ms=", 0) == 0) {
-      out.wait_timeout_ms = std::atoi(arg.substr(std::string("--wait-timeout-ms=").size()).c_str());
     } else {
       out.passthrough.push_back(std::move(arg));
     }
   }
   return out;
-}
-
-void write_text_file(const std::string& path, const std::string& value) {
-  if (path.empty()) {
-    return;
-  }
-  std::ofstream out(path);
-  if (!out.is_open()) {
-    die_fmt("failed to write file: %s", path.c_str());
-  }
-  out << value;
-}
-
-void wait_for_file(const std::string& path, int timeout_ms) {
-  const long start_ms = ggml_time_ms();
-  while (true) {
-    std::ifstream in(path);
-    if (in.good()) {
-      return;
-    }
-    if (ggml_time_ms() - start_ms > timeout_ms) {
-      die_fmt("timed out waiting for file: %s", path.c_str());
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
 }
 
 struct phase_recorder {
@@ -111,10 +54,12 @@ struct phase_recorder {
       out << "row_type,elapsed_s_start,elapsed_s_end,rss_kb_start,rss_kb_end,"
              "col_a_ms,col_b_ms,total_ms,kv_pos,kv_total,kv_used_pct,"
              "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
-      out << "# L_DecoderLoad: llama.cpp model/context/mmproj load  "
-             "ExternalEmbeddingRead: .svlmemb read  LayoutTokenize: mtmd text/image layout  "
-             "ImagePrefill: external image embedding decode  T_Prefill: text prompt eval  "
-             "D: one generated-token decode\n";
+      out << "# L_DecoderRuntimeInit: llama.cpp args/OpenCL runtime init  "
+             "L_DecoderLoad: llama.cpp text model/context/mmproj load  "
+             "ImageLoad: input image load  LayoutTokenize: mtmd text/image layout  "
+             "V_Encode: llama.cpp OpenCL vision encode/projector  "
+             "ImagePrefill: projected image embedding prefill  "
+             "T_Prefill: text prompt prefill  D: one generated-token decode\n";
     }
   }
 
@@ -139,13 +84,13 @@ struct decode_context {
   common_sampler* smpl = nullptr;
   common_chat_templates_ptr tmpls;
   std::vector<common_chat_msg> chat_history;
+  bool use_jinja = false;
   llama_batch batch;
   int n_batch = 0;
   llama_pos n_past = 0;
-  bool use_jinja = false;
+  common_debug_cb_user_data cb_data;
 
-  explicit decode_context(common_params& params)
-      : llama_init(common_init_from_params(params)) {
+  explicit decode_context(common_params& params) : llama_init(common_init_from_params(params)) {
     model = llama_init->model();
     lctx = llama_init->context();
     vocab = llama_model_get_vocab(model);
@@ -153,9 +98,11 @@ struct decode_context {
     batch = llama_batch_init(1, 0, 1);
     n_batch = params.n_batch;
     if (!model || !lctx) {
-      std::exit(1);
+      die("failed to initialize llama model/context");
     }
-
+    if (!llama_model_chat_template(model, nullptr) && params.chat_template.empty()) {
+      die("model does not have chat template");
+    }
     tmpls = common_chat_templates_init(model, params.chat_template);
     use_jinja = params.use_jinja;
 
@@ -167,9 +114,13 @@ struct decode_context {
     mparams.warmup = params.warmup;
     mparams.image_min_tokens = params.image_min_tokens;
     mparams.image_max_tokens = params.image_max_tokens;
+    if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
+      mparams.cb_eval_user_data = &cb_data;
+      mparams.cb_eval = common_debug_cb_eval;
+    }
     ctx_vision.reset(mtmd_init_from_file(params.mmproj.path.c_str(), model, mparams));
     if (!ctx_vision.get()) {
-      die_fmt("failed to load mmproj: %s", params.mmproj.path.c_str());
+      die_fmt("failed to load vision model from %s", params.mmproj.path.c_str());
     }
   }
 
@@ -179,94 +130,81 @@ struct decode_context {
   }
 };
 
-std::string chat_add_and_format(decode_context& ctx, common_chat_msg& msg) {
+std::string chat_add_and_format(decode_context& ctx, common_chat_msg& new_msg) {
   auto formatted = common_chat_format_single(
-      ctx.tmpls.get(), ctx.chat_history, msg, msg.role == "user", ctx.use_jinja);
-  ctx.chat_history.push_back(msg);
+      ctx.tmpls.get(),
+      ctx.chat_history,
+      new_msg,
+      new_msg.role == "user",
+      ctx.use_jinja);
+  ctx.chat_history.push_back(new_msg);
   return formatted;
 }
 
-int eval_with_external_embedding(
-    decode_context& ctx,
-    const std::string& prompt,
-    const std::vector<std::string>& image_paths,
-    streamingvlm::hybrid_bridge::EmbeddingFile& embedding,
-    phase_recorder& phases) {
-  if (prompt.empty()) {
-    die("prompt is required");
-  }
-  if (image_paths.empty()) {
-    die("at least one --image is required to create mtmd image tokens");
-  }
+int eval_message(decode_context& ctx, common_chat_msg& msg, const std::vector<std::string>& images, phase_recorder& phases) {
+  bool add_bos = ctx.chat_history.empty();
+  auto formatted_chat = chat_add_and_format(ctx, msg);
 
-  std::string content = prompt;
-  if (content.find(mtmd_default_marker()) == std::string::npos) {
-    for (size_t i = 0; i < image_paths.size(); ++i) {
-      content = std::string(mtmd_default_marker()) + content;
-    }
-  }
-
-  const long layout_start_ms = ggml_time_ms();
   mtmd::bitmaps bitmaps;
-  for (const auto& image : image_paths) {
+  for (const auto& image : images) {
+    const long image_load_start_ms = ggml_time_ms();
     mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_file(ctx.ctx_vision.get(), image.c_str()));
+    const long image_load_end_ms = ggml_time_ms();
+    phases.row("ImageLoad", image_load_start_ms, image_load_end_ms);
     if (!bmp.ptr) {
-      die_fmt("failed to load image for token layout: %s", image.c_str());
+      die_fmt("failed to load image: %s", image.c_str());
     }
     bitmaps.entries.push_back(std::move(bmp));
   }
 
-  common_chat_msg msg;
-  msg.role = "user";
-  msg.content = content;
-  std::string formatted = chat_add_and_format(ctx, msg);
-  mtmd_input_text text{formatted.c_str(), ctx.chat_history.size() == 1, true};
+  mtmd_input_text text;
+  text.text = formatted_chat.c_str();
+  text.add_special = add_bos;
+  text.parse_special = true;
+
   mtmd::input_chunks chunks(mtmd_input_chunks_init());
   auto bitmaps_c_ptr = bitmaps.c_ptr();
-  int32_t tokenize_res = mtmd_tokenize(
+  const long layout_start_ms = ggml_time_ms();
+  int32_t res = mtmd_tokenize(
       ctx.ctx_vision.get(),
       chunks.ptr.get(),
       &text,
       bitmaps_c_ptr.data(),
       bitmaps_c_ptr.size());
-  if (tokenize_res != 0) {
-    die_fmt("mtmd_tokenize failed: %d", tokenize_res);
-  }
   const long layout_end_ms = ggml_time_ms();
   phases.row("LayoutTokenize", layout_start_ms, layout_end_ms);
+  if (res != 0) {
+    die_fmt("mtmd_tokenize failed: %d", res);
+  }
 
-  bool used_external_embedding = false;
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+  std::vector<std::vector<float>> encoded_image_embeddings(n_chunks);
+  const int64_t decoder_embedding_size = llama_model_n_embd_inp(ctx.model);
+  for (size_t i = 0; i < n_chunks; ++i) {
+    const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
+    const auto chunk_type = mtmd_input_chunk_get_type(chunk);
+    if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+      const long vision_encode_start_ms = ggml_time_ms();
+      LOG_INF("encoding image slice...\n");
+      if (mtmd_encode_chunk(ctx.ctx_vision.get(), chunk) != 0) {
+        die("failed to encode image slice");
+      }
+      const long vision_encode_end_ms = ggml_time_ms();
+      LOG_INF("image slice encoded in %ld ms\n", vision_encode_end_ms - vision_encode_start_ms);
+      phases.row("V_Encode", vision_encode_start_ms, vision_encode_end_ms);
+
+      float* embd = mtmd_get_output_embd(ctx.ctx_vision.get());
+      const size_t n_values = static_cast<size_t>(decoder_embedding_size) * mtmd_input_chunk_get_n_tokens(chunk);
+      encoded_image_embeddings[i].assign(embd, embd + n_values);
+    }
+  }
+
   for (size_t i = 0; i < n_chunks; ++i) {
     const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
     const bool logits_last = i == n_chunks - 1;
     llama_pos new_n_past = ctx.n_past;
-    if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-      const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
-      const int32_t n_embd = llama_model_n_embd_inp(ctx.model);
-      if (embedding.values.size() != n_tokens * static_cast<size_t>(n_embd)) {
-        die_fmt(
-            "embedding size mismatch: file has %zu floats, image chunk expects %zu x %d",
-            embedding.values.size(),
-            n_tokens,
-            n_embd);
-      }
-      const long image_prefill_start_ms = ggml_time_ms();
-      if (mtmd_helper_decode_image_chunk(
-              ctx.ctx_vision.get(),
-              ctx.lctx,
-              chunk,
-              embedding.values.data(),
-              ctx.n_past,
-              0,
-              ctx.n_batch,
-              &new_n_past) != 0) {
-        die("failed to decode external image embedding");
-      }
-      const long image_prefill_end_ms = ggml_time_ms();
-      phases.row("ImagePrefill", image_prefill_start_ms, image_prefill_end_ms);
-      used_external_embedding = true;
-    } else {
+    const auto chunk_type = mtmd_input_chunk_get_type(chunk);
+    if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
       const long text_prefill_start_ms = ggml_time_ms();
       if (mtmd_helper_eval_chunk_single(
               ctx.ctx_vision.get(),
@@ -281,12 +219,30 @@ int eval_with_external_embedding(
       }
       const long text_prefill_end_ms = ggml_time_ms();
       phases.row("T_Prefill", text_prefill_start_ms, text_prefill_end_ms);
+    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+      if (encoded_image_embeddings[i].empty()) {
+        die("missing precomputed image embedding");
+      }
+      const long image_prefill_start_ms = ggml_time_ms();
+      if (mtmd_helper_decode_image_chunk(
+              ctx.ctx_vision.get(),
+              ctx.lctx,
+              chunk,
+              encoded_image_embeddings[i].data(),
+              ctx.n_past,
+              0,
+              ctx.n_batch,
+              &new_n_past) != 0) {
+        die("failed to decode image chunk");
+      }
+      const long image_prefill_end_ms = ggml_time_ms();
+      phases.row("ImagePrefill", image_prefill_start_ms, image_prefill_end_ms);
+    } else {
+      die("unsupported non-image multimodal chunk");
     }
     ctx.n_past = new_n_past;
   }
-  if (!used_external_embedding) {
-    die("prompt did not produce an image chunk");
-  }
+  LOG("\n");
   return 0;
 }
 
@@ -317,8 +273,7 @@ int generate_response(decode_context& ctx, int n_predict, phase_recorder& phases
 
 void show_usage(int, char** argv) {
   LOG(
-      "Usage: %s -m <model.gguf> --mmproj <mmproj.gguf> --image <layout-image> "
-      "--external-embedding <vision_embedding.svlmemb> -p <prompt> [llama.cpp opts]\n",
+      "Usage: %s -m <model.gguf> --mmproj <mmproj.gguf> --image <image> -p <prompt> [llama.cpp opts]\n",
       argv[0]);
 }
 
@@ -332,10 +287,6 @@ int main(int argc, char** argv) {
   const long origin_ms = ggml_time_ms();
 
   custom_args custom = strip_custom_args(argc, argv);
-  if (custom.embedding_path.empty()) {
-    show_usage(argc, argv);
-    die("missing --external-embedding");
-  }
   std::vector<char*> passthrough_argv;
   passthrough_argv.reserve(custom.passthrough.size());
   for (auto& arg : custom.passthrough) {
@@ -353,8 +304,9 @@ int main(int argc, char** argv) {
           show_usage)) {
     return 1;
   }
-  if (params.mmproj.path.empty()) {
-    die("missing --mmproj");
+  if (params.mmproj.path.empty() || params.model.path.empty() || params.image.empty()) {
+    show_usage(argc, argv);
+    return 1;
   }
 
   phase_recorder phases(custom.phase_stats_path, origin_ms);
@@ -363,17 +315,17 @@ int main(int argc, char** argv) {
   decode_context ctx(params);
   const long load_end_ms = ggml_time_ms();
   phases.row("L_DecoderLoad", load_start_ms, load_end_ms);
-  write_text_file(custom.ready_path, "ready\n");
-  if (custom.wait_for_embedding) {
-    wait_for_file(custom.embedding_path, custom.wait_timeout_ms);
+
+  if (params.prompt.find(mtmd_default_marker()) == std::string::npos) {
+    for (size_t i = 0; i < params.image.size(); ++i) {
+      params.prompt = mtmd_default_marker() + params.prompt;
+    }
   }
 
-  const long embedding_read_start_ms = ggml_time_ms();
-  auto embedding = streamingvlm::hybrid_bridge::read_embedding_file(custom.embedding_path);
-  const long embedding_read_end_ms = ggml_time_ms();
-  phases.row("ExternalEmbeddingRead", embedding_read_start_ms, embedding_read_end_ms);
-
-  if (eval_with_external_embedding(ctx, params.prompt, params.image, embedding, phases) != 0) {
+  common_chat_msg msg;
+  msg.role = "user";
+  msg.content = params.prompt;
+  if (eval_message(ctx, msg, params.image, phases) != 0) {
     return 1;
   }
   int n_predict = params.n_predict < 0 ? INT32_MAX : params.n_predict;

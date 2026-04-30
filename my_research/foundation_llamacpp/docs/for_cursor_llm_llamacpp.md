@@ -197,6 +197,109 @@ follow_up:
   the persistent llama.cpp-side development/handoff log and must be updated
   continuously whenever code, build scripts, docs, run outputs, measurements, or
   troubleshooting decisions under `my_research/foundation_llamacpp` change.
+- 2026-04-30: Added precise phase instrumentation for the hybrid bridge, similar
+  to the foundation ExecuTorch runners. `hybrid_vision_dump` now writes
+  `vision_phase_stats.csv` with `L_VisionLoad`, `ImageLoad`, `V_Encode`, and
+  `EmbeddingFileWrite`. `hybrid_decode` now writes `decoder_phase_stats.csv`
+  with `ExternalEmbeddingRead`, `L_DecoderLoad`, `LayoutTokenize`,
+  `ImagePrefill`, text `T_Prefill`, and per-token `D` rows. The Android runner
+  pulls both files, merges them into a foundation-style `foundation_proc.csv`,
+  writes summary metrics to `foundation_summary.csv`, and regenerates
+  `phase_duration_stacked_bar.png` and `memory_timeline_plot.png` from the
+  precise phase rows when available. Also changed the default `--soc-model` to
+  `SM8750`; using the old default `SM8550` pushed the v73 skel and caused QNN
+  HTP load failure on the current device. Latest precise OpenCL hybrid run:
+  QNN `V_Encode` 372 ms, decoder load 3197 ms, image prefill 46 ms, text prefill
+  215 ms after an initial 7 ms text chunk, and per-token decode mostly 12-14 ms.
+- 2026-04-30: Updated the hybrid bridge to enforce coordinated load-before-run
+  timing. `hybrid_decode` now supports `--ready-path`, `--wait-for-embedding`,
+  `--wait-timeout-ms`, and records `L_DecoderRuntimeInit` before
+  `L_DecoderLoad`.
+  `hybrid_vision_dump` now supports `--ready_path`, `--wait_path`, and
+  `--wait_timeout_ms`; it loads the QNN module and image tensor first, writes a
+  ready flag, then waits for the runner's `start_encode.flag` before `V_Encode`.
+  `run_android_hybrid_bridge.py` now pushes and runs a remote shell script that
+  starts decoder and vision processes together, waits until both are ready, then
+  starts QNN encode. The merged `foundation_proc.csv` is sorted by phase start
+  time and no longer appends decoder phases after the vision process. This makes
+  `memory_timeline_plot.png` show loading first, then QNN encode, embedding
+  handoff, prefill, and decode. Latest coordinated OpenCL hybrid run succeeded
+  with exit code 0: `V_Encode` 369 ms, `L_DecoderLoad` 2966 ms,
+  `ImagePrefill` 62 ms, prompt eval 278.20 ms / 271 tokens, token decode
+  409.38 ms / 31 runs, and total llama.cpp time 2248.70 ms.
+- 2026-04-30: Renamed the ambiguous `L_DecoderInit` phase to
+  `L_DecoderRuntimeInit`. It represents llama.cpp argument parsing plus OpenCL
+  runtime/device/kernel setup before GGUF model/context loading; it is not the
+  decoder model load itself. The Android runner also now treats
+  `foundation_proc.csv` as the canonical phase input for plotting: after merging
+  raw `vision_phase_stats.csv` and `decoder_phase_stats.csv`, it writes
+  `foundation_proc.csv`, reads it back, and generates `memory_timeline_plot.png`
+  and `phase_duration_stacked_bar.png` from those canonical rows.
+- 2026-04-30: Re-ran the coordinated hybrid OpenCL/QNN benchmark after the
+  `L_DecoderRuntimeInit` rename. Result directory:
+  `results/log/hybrid_bridge_opencl/InternVL3-1B-Instruct-Q8_0`. Exit code 0.
+  `foundation_proc.csv` now shows `L_DecoderRuntimeInit` 13644 ms,
+  `L_DecoderLoad` 2871 ms, `V_Encode` 369 ms, `ExternalEmbeddingRead` 3 ms,
+  `ImagePrefill` 57 ms, and text prefill 10 ms + 210 ms. Summary metrics:
+  prompt eval 276.44 ms / 271 tokens, token decode 410.27 ms / 31 runs, total
+  llama.cpp time 2225.85 ms. Regenerated `memory_timeline_plot.png` and
+  `phase_duration_stacked_bar.png` from the canonical `foundation_proc.csv`.
+- 2026-04-30: Updated `phase_duration_stacked_bar.png` generation to exclude
+  setup-only phases `L_DecoderRuntimeInit`, `ImageLoad`, and `LayoutTokenize`
+  from the stacked runtime breakdown. These rows remain in `foundation_proc.csv`
+  for traceability, and only the phase-duration plot aggregation filters them.
+- 2026-04-30: Fixed `phase_duration_stacked_bar.png` ordering. The stacked bar
+  now orders included phases by their first `elapsed_s_start` in
+  `foundation_proc.csv` instead of a hardcoded phase list, so `L_DecoderLoad`
+  appears before `V_Encode` when the coordinated load-before-run schedule is
+  used.
+- 2026-04-30: Further filtered `phase_duration_stacked_bar.png` to exclude load
+  phases `L_VisionLoad` and `L_DecoderLoad` in addition to
+  `L_DecoderRuntimeInit`, `ImageLoad`, and `LayoutTokenize`. The plot now focuses
+  on execution phases (`V_Encode`, embedding handoff, prefill, and decode), while
+  all load/setup rows remain in `foundation_proc.csv`.
+- 2026-04-30: Added precise phase instrumentation for the standalone llama.cpp
+  OpenCL path without modifying upstream llama.cpp. New overlay target:
+  `hybrid_bridge/opencl_phase_mtmd.cpp`, built by the existing
+  `hybrid_bridge/CMakeLists.txt` as `opencl_phase_mtmd`. It mirrors
+  `llama-mtmd-cli` single-turn InternVL execution but records
+  `foundation_phase_stats.csv` rows for `L_DecoderRuntimeInit`,
+  `L_DecoderLoad`, `ImageLoad`, `LayoutTokenize`, `T_Prefill`, `V_Encode`,
+  `ImagePrefill`, and per-token `D`. Updated `run_android_llamacpp.py` so
+  backend `opencl` automatically uses `opencl_phase_mtmd` when present, pulls
+  `foundation_phase_stats.csv`, writes canonical precise rows to
+  `foundation_proc.csv`, writes metrics to `foundation_summary.csv`, and
+  regenerates `phase_duration_stacked_bar.png` from the precise rows. Also
+  stopped pushing the local `libOpenCL.so` from the pure llama.cpp runner because
+  it broke Qualcomm system OpenCL discovery (`platform IDs not available`).
+  Latest precise OpenCL run succeeded with exit code 0 in
+  `results/log/opencl/InternVL3-1B-Instruct-Q8_0`: `V_Encode` 753 ms,
+  `ImagePrefill` 7 ms, text prefill 6 ms + 215 ms, token decode rows mostly
+  12-14 ms, prompt eval 981.44 ms / 271 tokens, token decode 382.91 ms / 29
+  runs, total llama.cpp time 2425.68 ms.
+- 2026-04-30: Corrected standalone OpenCL precise phase ordering. The first
+  `opencl_phase_mtmd` implementation followed mtmd chunk order, which allowed a
+  small text prefill chunk before `V_Encode`. Updated the overlay tool to scan
+  image chunks after `LayoutTokenize`, run all `V_Encode` phases first, copy the
+  projected embeddings, and then execute text/image prefill in chunk order using
+  the precomputed embeddings. Latest rerun exit code 0:
+  `L_DecoderRuntimeInit` 13850 ms, `L_DecoderLoad` 2827 ms, `V_Encode` 714 ms,
+  text prefill 19 ms + 214 ms, `ImagePrefill` 36 ms, per-token decode mostly
+  12-16 ms, prompt eval 269.20 ms / 271 tokens, token decode 377.38 ms / 29
+  runs, total llama.cpp time 2444.37 ms. `foundation_proc.csv` now shows
+  `V_Encode` before any `T_Prefill`.
+- 2026-04-30: Expanded
+  `docs/executorch_vision_llamacpp_decoder.md` into a detailed handoff guide for
+  the current hybrid and standalone OpenCL measurement flows. Added a current
+  implementation snapshot, file-by-file roles for `hybrid_vision_dump`,
+  `hybrid_decode`, `hybrid_embedding_file`, `opencl_phase_mtmd`,
+  `run_android_hybrid_bridge.py`, and `run_android_llamacpp.py`; documented
+  load-before-run coordination, standalone OpenCL `V_Encode`-before-prefill
+  ordering, CMake targets, host/Android build commands, canonical artifacts,
+  plot filtering rules, OpenCL loader troubleshooting, and latest matched
+  result numbers for hybrid QNN+OpenCL vs standalone OpenCL. This was done so a
+  future agent can continue from the docs without reconstructing the chat
+  history.
 
 Suggested note format:
 

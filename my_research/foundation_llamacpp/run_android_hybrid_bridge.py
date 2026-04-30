@@ -98,6 +98,7 @@ def _push_llama_runtime(
     remote_dir: str,
     llama_build_dir: Path,
     opencl_lib: Path | None,
+    push_opencl_loader: bool,
 ) -> None:
     for subdir in (llama_build_dir / "bin", llama_build_dir / "lib"):
         if subdir.exists():
@@ -108,11 +109,14 @@ def _push_llama_runtime(
         path = llama_build_dir / name
         if path.exists():
             _push(adb, path, remote_dir)
-    for pattern in ("libc++_shared.so", "libOpenCL.so"):
+    runtime_patterns = ["libc++_shared.so"]
+    if push_opencl_loader:
+        runtime_patterns.append("libOpenCL.so")
+    for pattern in runtime_patterns:
         for path in sorted(llama_build_dir.rglob(pattern)):
             if path.is_file():
                 _push(adb, path, remote_dir)
-    if opencl_lib and opencl_lib.exists():
+    if push_opencl_loader and opencl_lib and opencl_lib.exists():
         _push(adb, opencl_lib, remote_dir)
 
 
@@ -145,7 +149,102 @@ def _match_int(text: str, pattern: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def _write_png_memory_timeline(output_dir: Path, rows: list[dict[str, str]]) -> None:
+def _phase_float(row: dict[str, str], key: str) -> float:
+    value = (row.get(key) or "").strip()
+    return float(value) if value else 0.0
+
+
+def _read_phase_rows(path: Path, *, offset_s: float = 0.0) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    with path.open(encoding="utf-8") as f:
+        header: list[str] | None = None
+        for raw in f:
+            raw = raw.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if raw.startswith("row_type,"):
+                header = raw.split(",")
+                continue
+            if header is None:
+                continue
+            parts = raw.split(",")
+            if len(parts) < len(header):
+                parts.extend([""] * (len(header) - len(parts)))
+            row = {key: parts[idx] for idx, key in enumerate(header)}
+            if row.get("row_type") == "L_DecoderInit":
+                row["row_type"] = "L_DecoderRuntimeInit"
+            row["elapsed_s_start"] = f"{_phase_float(row, 'elapsed_s_start') + offset_s:.6f}"
+            row["elapsed_s_end"] = f"{_phase_float(row, 'elapsed_s_end') + offset_s:.6f}"
+            rows.append(row)
+    return rows
+
+
+def _write_phase_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    fieldnames = [
+        "row_type",
+        "elapsed_s_start",
+        "elapsed_s_end",
+        "rss_kb_start",
+        "rss_kb_end",
+        "col_a_ms",
+        "col_b_ms",
+        "total_ms",
+        "kv_pos",
+        "kv_total",
+        "kv_used_pct",
+        "kv_estimated_used_kb",
+        "kv_total_kb",
+        "kv_physical_committed_kb",
+        "token_idx",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({
+            "row_type": "# L_VisionLoad: QNN vision module load  ImageLoad: input tensor load  "
+            "V_Encode: QNN projected vision embedding  EmbeddingFileWrite: .svlmemb write  "
+            "L_DecoderRuntimeInit: llama.cpp args/OpenCL runtime init  ExternalEmbeddingRead: .svlmemb read  "
+            "L_DecoderLoad: llama.cpp model/mmproj load  "
+            "LayoutTokenize: mtmd layout  ImagePrefill: image embedding prefill  "
+            "T_Prefill: text prompt prefill  D: one generated-token decode"
+        })
+        writer.writerows(rows)
+
+
+def _phase_rows_from_artifacts(result_dir: Path) -> list[dict[str, str]]:
+    vision_rows = _read_phase_rows(result_dir / "vision_phase_stats.csv")
+    # In coordinated-load mode both processes are launched by the same remote
+    # script and use process-local clocks that are close enough for timeline
+    # plotting. Do not offset decoder phases after vision phases: that would
+    # incorrectly make loading appear after QNN encode.
+    decoder_rows = _read_phase_rows(result_dir / "decoder_phase_stats.csv")
+    return sorted(vision_rows + decoder_rows, key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end")))
+
+
+def _phase_colors() -> dict[str, str]:
+    return {
+        "L_VisionLoad": "#8e44ad",
+        "ImageLoad": "#74b9ff",
+        "V_Encode": "#00b894",
+        "EmbeddingFileWrite": "#55efc4",
+        "ExternalEmbeddingRead": "#00cec9",
+        "L_DecoderRuntimeInit": "#a29bfe",
+        "L_DecoderLoad": "#6c5ce7",
+        "LayoutTokenize": "#fdcb6e",
+        "ImagePrefill": "#0984e3",
+        "T_Prefill": "#e17055",
+        "D": "#ff7675",
+        "Decode": "#d63031",
+    }
+
+
+def _write_png_memory_timeline(
+    output_dir: Path,
+    rows: list[dict[str, str]],
+    phase_rows: list[dict[str, str]] | None = None,
+) -> None:
     try:
         import matplotlib
 
@@ -158,13 +257,60 @@ def _write_png_memory_timeline(output_dir: Path, rows: list[dict[str, str]]) -> 
         return
     xs = [float(r["elapsed_s"]) for r in usable]
     ys = [float(r["mem_available_kb"]) / 1024.0 for r in usable]
-    fig, ax = plt.subplots(figsize=(10, 5.5), dpi=160)
-    ax.plot(xs, ys, label="MemAvailable (MiB)", linewidth=2.2, color="#0984e3")
+    fig, ax = plt.subplots(figsize=(19, 8), dpi=160)
+    ax.plot(
+        xs,
+        ys,
+        label="MemAvailable (MiB)",
+        linewidth=2.4,
+        marker="o",
+        markersize=2.6,
+        color="#0984e3",
+    )
+    colors = _phase_colors()
+    phase_count: dict[str, int] = {}
+    for phase in phase_rows or []:
+        name = phase.get("row_type", "")
+        if name == "D":
+            continue
+        start = _phase_float(phase, "elapsed_s_start")
+        end = _phase_float(phase, "elapsed_s_end")
+        if end <= start:
+            continue
+        color = colors.get(name, "#636e72")
+        ax.axvspan(start, end, color=color, alpha=0.06)
+        ax.axvline(start, color=color, linestyle="--", linewidth=1.1, alpha=0.9)
+        ax.axvline(end, color=color, linestyle="--", linewidth=1.1, alpha=0.9)
+        phase_count[name] = phase_count.get(name, 0) + 1
+        label = f"{name}{phase_count[name]}" if name in {"T_Prefill"} else name
+        ax.text(
+            (start + end) / 2.0,
+            0.045,
+            label,
+            fontsize=8,
+            ha="center",
+            va="bottom",
+            color=color,
+            transform=ax.get_xaxis_transform(),
+            bbox={
+                "boxstyle": "round,pad=0.15",
+                "facecolor": "white",
+                "edgecolor": color,
+                "alpha": 0.75,
+            },
+        )
     ax.set_title(f"Android Memory Timeline: {output_dir.name}")
     ax.set_xlabel("Elapsed Time (s)")
     ax.set_ylabel("Memory (MiB)")
     ax.grid(True, linestyle=":", alpha=0.35)
-    ax.legend(loc="upper left")
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        borderaxespad=0.0,
+        fontsize=8,
+        framealpha=0.9,
+    )
+    ax.set_xlim(left=min(xs), right=max(xs))
     fig.tight_layout()
     fig.savefig(output_dir / "memory_timeline_plot.png", bbox_inches="tight")
     plt.close(fig)
@@ -221,6 +367,74 @@ def _write_png_phase_duration(output_dir: Path, perf: dict[str, float]) -> None:
     plt.close(fig)
 
 
+def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[str, str]]) -> None:
+    if not phase_rows:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    excluded_from_plot = {
+        "ImageLoad",
+        "L_DecoderLoad",
+        "L_DecoderRuntimeInit",
+        "L_VisionLoad",
+        "LayoutTokenize",
+    }
+    durations: dict[str, float] = {}
+    first_start_s: dict[str, float] = {}
+    has_decode_summary = any(row.get("row_type") == "Decode" for row in phase_rows)
+    for row in phase_rows:
+        name = row.get("row_type", "")
+        if name in excluded_from_plot:
+            continue
+        if name == "D" and has_decode_summary:
+            continue
+        normalized = "Decode" if name == "D" else name
+        start_s = _phase_float(row, "elapsed_s_start")
+        duration = max(_phase_float(row, "elapsed_s_end") - start_s, 0.0)
+        if duration > 0:
+            durations[normalized] = durations.get(normalized, 0.0) + duration
+            first_start_s[normalized] = min(first_start_s.get(normalized, start_s), start_s)
+    phases = sorted(
+        durations.items(),
+        key=lambda item: (first_start_s.get(item[0], float("inf")), item[0]),
+    )
+    if not phases:
+        return
+    total = sum(value for _, value in phases)
+    colors = _phase_colors()
+    fig, ax = plt.subplots(figsize=(6.2, 8.8), dpi=160)
+    bottom = 0.0
+    for name, value in phases:
+        color = colors.get(name, "#636e72")
+        ax.bar(["total"], [value], bottom=bottom, color=color, edgecolor="white")
+        if value / total >= 0.035:
+            ax.text(
+                0,
+                bottom + value / 2.0,
+                f"{name}\n{value:.3f}s",
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=8,
+                fontweight="bold",
+            )
+        bottom += value
+    ax.set_title(f"Precise Runtime Breakdown: {output_dir.name}")
+    ax.set_ylabel("Elapsed Time (s)")
+    ax.grid(True, axis="y", linestyle=":", alpha=0.35)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=colors.get(name, "#636e72")) for name, _ in phases]
+    labels = [f"{name}: {value:.3f}s ({value / total * 100:.1f}%)" for name, value in phases]
+    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_dir / "phase_duration_stacked_bar.png", bbox_inches="tight")
+    plt.close(fig)
+
+
 def _finalize_outputs(result_dir: Path) -> None:
     decode_log = result_dir / "hybrid_decode_stdout.txt"
     if not decode_log.exists():
@@ -262,7 +476,7 @@ def _finalize_outputs(result_dir: Path) -> None:
     if (result_dir / "foundation_exit_code.txt").exists():
         return_code = (result_dir / "foundation_exit_code.txt").read_text(encoding="utf-8").strip()
 
-    proc_rows: list[dict[str, object]] = [
+    summary_rows: list[dict[str, object]] = [
         {"metric": "backend", "value": "hybrid_qnn_vision_llamacpp_opencl", "unit": ""},
         {"metric": "model_name", "value": result_dir.name, "unit": ""},
         {"metric": "wall_time_s", "value": round(wall_s, 3), "unit": "s"},
@@ -271,8 +485,16 @@ def _finalize_outputs(result_dir: Path) -> None:
     ]
     for key, value in perf.items():
         unit = "ms" if key.endswith("_ms") else "tok/s" if key.endswith("_tok_s") else "tokens" if "tokens" in key else "runs" if "runs" in key else ""
-        proc_rows.append({"metric": key, "value": value, "unit": unit})
-    _write_csv(result_dir / "foundation_proc.csv", proc_rows, ["metric", "value", "unit"])
+        summary_rows.append({"metric": key, "value": value, "unit": unit})
+    _write_csv(result_dir / "foundation_summary.csv", summary_rows, ["metric", "value", "unit"])
+
+    phase_rows = _phase_rows_from_artifacts(result_dir)
+    if phase_rows:
+        _write_phase_csv(result_dir / "foundation_proc.csv", phase_rows)
+        plot_phase_rows = _read_phase_rows(result_dir / "foundation_proc.csv")
+    else:
+        _write_csv(result_dir / "foundation_proc.csv", summary_rows, ["metric", "value", "unit"])
+        plot_phase_rows = []
     _write_csv(
         result_dir / "vision_output_stats.csv",
         [
@@ -287,8 +509,11 @@ def _finalize_outputs(result_dir: Path) -> None:
         ],
         ["metric", "value", "unit"],
     )
-    _write_png_memory_timeline(result_dir, memory_rows)
-    _write_png_phase_duration(result_dir, perf)
+    _write_png_memory_timeline(result_dir, memory_rows, plot_phase_rows)
+    if plot_phase_rows:
+        _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
+    else:
+        _write_png_phase_duration(result_dir, perf)
 
 
 def main() -> int:
@@ -318,7 +543,12 @@ def main() -> int:
         type=Path,
         default=WORKSPACE / "third_party" / "OpenCL-ICD-Loader" / "build-android" / "libOpenCL.so",
     )
-    parser.add_argument("--soc-model", default="SM8550")
+    parser.add_argument(
+        "--push-opencl-loader",
+        action="store_true",
+        help="Push local libOpenCL.so. Disabled by default because the system Qualcomm OpenCL loader works better on the tested device.",
+    )
+    parser.add_argument("--soc-model", default="SM8750")
     parser.add_argument("--remote-root", default="/data/local/tmp/streamingvlm_hybrid_bridge")
     parser.add_argument("--results-root", type=Path, default=FOUNDATION_LLAMA / "results" / "log" / "hybrid_bridge")
     parser.add_argument("--sample-interval", type=float, default=0.05, help="Android /proc/meminfo sampling interval in seconds.")
@@ -352,7 +582,13 @@ def main() -> int:
         for local in (vision_bin, decode_bin, encoder_pte, args.model, args.mmproj, frame_bin, layout_image):
             _push(adb, local, args.remote_root)
         _push_qnn_libs(adb, args.remote_root, Path(qnn_sdk), executorch_build_dir, args.soc_model)
-        _push_llama_runtime(adb, args.remote_root, args.llama_build_dir, args.opencl_lib)
+        _push_llama_runtime(
+            adb,
+            args.remote_root,
+            args.llama_build_dir,
+            args.opencl_lib,
+            args.push_opencl_loader,
+        )
         _run(adb + ["shell", f"chmod +x {shlex.quote(args.remote_root)}/hybrid_vision_dump {shlex.quote(args.remote_root)}/hybrid_decode"])
 
     result_dir = args.results_root / args.model.stem
@@ -360,43 +596,91 @@ def main() -> int:
     prompt = shlex.quote(args.prompt)
     device_arg = f"--device {shlex.quote(args.device)}" if args.device else ""
     remote_memory_csv = f"{args.remote_root}/android_memory_timeline.csv"
-    remote_cmd = (
-        f"cd {shlex.quote(args.remote_root)} && "
-        "export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. && "
-        "rm -f android_memory_timeline.csv hybrid_vision_stdout.txt hybrid_decode_stdout.txt "
-        "vision_output_stats.csv foundation_exit_code.txt && "
-        "printf '%s\\n' 'sample_idx,elapsed_s,pid,pid_alive,vmrss_kb,vmsize_kb,vmhwm_kb,smaps_rss_kb,smaps_pss_kb,smaps_private_dirty_kb,smaps_shared_clean_kb,mem_available_kb,cached_kb,dma_heap_pool_kb,gpu_total_kb,kgsl_shmem_usage_kb' "
-        f"> {shlex.quote(remote_memory_csv)} && "
-        "( "
-        f"./hybrid_vision_dump --encoder_path={shlex.quote(encoder_pte.name)} "
-        "--image_path=frame_0000.bin --output_path=vision_embedding.svlmemb "
-        "--stats_path=vision_output_stats.csv > hybrid_vision_stdout.txt 2>&1 && "
-        f"./hybrid_decode -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} "
-        f"--image {shlex.quote(layout_image.name)} --external-embedding vision_embedding.svlmemb "
-        f"-p {prompt} -n {args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} "
-        f"-ngl {args.gpu_layers} {device_arg} > hybrid_decode_stdout.txt 2>&1; "
-        "echo $? > foundation_exit_code.txt "
-        ") & runner_pid=$!; sample_idx=0; "
-        "while kill -0 \"$runner_pid\" 2>/dev/null; do "
-        f"elapsed_s=$(awk -v i=\"$sample_idx\" 'BEGIN {{ printf \"%.3f\", i * {args.sample_interval} }}'); "
-        "mem_available=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null); "
-        "cached=$(awk '/^Cached:/ {print $2; exit}' /proc/meminfo 2>/dev/null); "
-        "dma_heap_pool=$(awk '/^DmaHeapPool:/ {print $2; exit}' /proc/meminfo 2>/dev/null); "
-        "gpu_total=$(awk '/^GpuTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null); "
-        "kgsl_shmem_usage=$(awk '/^KgslShmemUsage:/ {print $2; exit}' /proc/meminfo 2>/dev/null); "
-        f"printf '%s,%s,%s,1,0,0,0,0,0,0,0,%s,%s,%s,%s,%s\\n' \"$sample_idx\" \"$elapsed_s\" \"$runner_pid\" \"${{mem_available:-0}}\" \"${{cached:-0}}\" \"${{dma_heap_pool:-0}}\" \"${{gpu_total:-0}}\" \"${{kgsl_shmem_usage:-0}}\" >> {shlex.quote(remote_memory_csv)}; "
-        "sample_idx=$((sample_idx + 1)); "
-        f"sleep {args.sample_interval}; "
-        "done; wait \"$runner_pid\""
+    remote_script = f"{args.remote_root}/run_hybrid_bridge.sh"
+    script_text = f"""#!/system/bin/sh
+cd {shlex.quote(args.remote_root)} || exit 1
+export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.
+rm -f android_memory_timeline.csv hybrid_vision_stdout.txt hybrid_decode_stdout.txt \\
+  vision_output_stats.csv vision_phase_stats.csv decoder_phase_stats.csv \\
+  foundation_exit_code.txt vision_exit_code.txt decoder_exit_code.txt \\
+  vision_ready.flag decoder_ready.flag start_encode.flag vision_embedding.svlmemb
+printf '%s\\n' 'sample_idx,elapsed_s,pid,pid_alive,vmrss_kb,vmsize_kb,vmhwm_kb,smaps_rss_kb,smaps_pss_kb,smaps_private_dirty_kb,smaps_shared_clean_kb,mem_available_kb,cached_kb,dma_heap_pool_kb,gpu_total_kb,kgsl_shmem_usage_kb' > {shlex.quote(remote_memory_csv)}
+
+./hybrid_decode -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} \\
+  --image {shlex.quote(layout_image.name)} --external-embedding vision_embedding.svlmemb \\
+  --phase-stats-path decoder_phase_stats.csv --ready-path decoder_ready.flag \\
+  --wait-for-embedding --wait-timeout-ms 120000 \\
+  -p {prompt} -n {args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} \\
+  -ngl {args.gpu_layers} {device_arg} > hybrid_decode_stdout.txt 2>&1 &
+decoder_pid=$!
+
+./hybrid_vision_dump --encoder_path={shlex.quote(encoder_pte.name)} \\
+  --image_path=frame_0000.bin --output_path=vision_embedding.svlmemb \\
+  --stats_path=vision_output_stats.csv --phase_stats_path=vision_phase_stats.csv \\
+  --ready_path=vision_ready.flag --wait_path=start_encode.flag --wait_timeout_ms=120000 \\
+  > hybrid_vision_stdout.txt 2>&1 &
+vision_pid=$!
+
+(
+  ready_i=0
+  while [ "$ready_i" -lt 2400 ]; do
+    if [ -f decoder_ready.flag ] && [ -f vision_ready.flag ]; then
+      touch start_encode.flag
+      exit 0
+    fi
+    sleep 0.05
+    ready_i=$((ready_i + 1))
+  done
+  echo coordinator_timeout > coordinator_error.txt
+  touch start_encode.flag
+) &
+coordinator_pid=$!
+
+sample_idx=0
+while kill -0 "$decoder_pid" 2>/dev/null || kill -0 "$vision_pid" 2>/dev/null; do
+  elapsed_s=$(awk -v i="$sample_idx" 'BEGIN {{ printf "%.3f", i * {args.sample_interval} }}')
+  mem_available=$(awk '/^MemAvailable:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  cached=$(awk '/^Cached:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  dma_heap_pool=$(awk '/^DmaHeapPool:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  gpu_total=$(awk '/^GpuTotal:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  kgsl_shmem_usage=$(awk '/^KgslShmemUsage:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  printf '%s,%s,%s,1,0,0,0,0,0,0,0,%s,%s,%s,%s,%s\\n' "$sample_idx" "$elapsed_s" "$decoder_pid" "${{mem_available:-0}}" "${{cached:-0}}" "${{dma_heap_pool:-0}}" "${{gpu_total:-0}}" "${{kgsl_shmem_usage:-0}}" >> {shlex.quote(remote_memory_csv)}
+  sample_idx=$((sample_idx + 1))
+  sleep {args.sample_interval}
+done
+
+wait "$vision_pid"
+vision_rc=$?
+wait "$decoder_pid"
+decoder_rc=$?
+wait "$coordinator_pid" 2>/dev/null
+echo "$vision_rc" > vision_exit_code.txt
+echo "$decoder_rc" > decoder_exit_code.txt
+echo "$decoder_rc" > foundation_exit_code.txt
+exit "$decoder_rc"
+"""
+    with tempfile.TemporaryDirectory(prefix="streamingvlm_hybrid_script_") as tmp_script_dir:
+        script_path = Path(tmp_script_dir) / "run_hybrid_bridge.sh"
+        script_path.write_text(script_text, encoding="utf-8")
+        _push(adb, script_path, args.remote_root)
+    _run(adb + ["shell", f"chmod +x {shlex.quote(remote_script)}"])
+    run_res = subprocess.run(
+        adb + ["shell", f"sh {shlex.quote(remote_script)}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
-    run_res = subprocess.run(adb + ["shell", remote_cmd], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     (result_dir / "host_adb_output.txt").write_text(run_res.stdout, encoding="utf-8")
     for name in (
         "hybrid_vision_stdout.txt",
         "hybrid_decode_stdout.txt",
         "vision_output_stats.csv",
+        "vision_phase_stats.csv",
+        "decoder_phase_stats.csv",
         "vision_embedding.svlmemb",
         "foundation_exit_code.txt",
+        "vision_exit_code.txt",
+        "decoder_exit_code.txt",
         "android_memory_timeline.csv",
     ):
         _pull_if_exists(adb, f"{args.remote_root}/{name}", result_dir / name)

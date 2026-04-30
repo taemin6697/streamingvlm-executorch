@@ -108,14 +108,19 @@ def _remote_memory_snapshot(adb: list[str], pid: str) -> dict[str, int | str]:
 def _push_runtime_files(adb: list[str], build_dir: Path, remote_root: str) -> None:
     bin_dir = build_dir / "bin"
     lib_dirs = [build_dir / "lib", bin_dir]
-    extra_libs = [
-        Path("/workspace/streamingvlm/third_party/OpenCL-ICD-Loader/build-android/libOpenCL.so"),
-    ]
+    # Do not push the local OpenCL ICD loader by default. On the tested Qualcomm
+    # device, the system OpenCL loader discovers Adreno correctly while the local
+    # loader can make ggml_opencl report "platform IDs not available".
+    extra_libs: list[Path] = []
 
     _run(adb + ["shell", f"mkdir -p {shlex.quote(remote_root)}"])
     for path in sorted(bin_dir.iterdir()):
         if path.is_file() and path.name == "llama-mtmd-cli":
             _run(adb + ["push", str(path), f"{remote_root}/{path.name}"])
+    for path in (build_dir / "opencl_phase_mtmd", bin_dir / "opencl_phase_mtmd"):
+        if path.exists() and path.is_file():
+            _run(adb + ["push", str(path), f"{remote_root}/{path.name}"])
+            break
     for lib_dir in lib_dirs:
         if not lib_dir.exists():
             continue
@@ -129,7 +134,13 @@ def _push_runtime_files(adb: list[str], build_dir: Path, remote_root: str) -> No
     for path in extra_libs:
         if path.exists():
             _run(adb + ["push", str(path), f"{remote_root}/{path.name}"])
-    _run(adb + ["shell", f"chmod +x {shlex.quote(remote_root)}/llama-mtmd-cli"])
+    _run(
+        adb
+        + [
+            "shell",
+            f"chmod +x {shlex.quote(remote_root)}/llama-mtmd-cli {shlex.quote(remote_root)}/opencl_phase_mtmd 2>/dev/null || true",
+        ]
+    )
 
 
 def _result_dir(results_root: Path, backend: str, model_name: str) -> Path:
@@ -150,6 +161,83 @@ def _read_csv_dicts(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         return list(reader)
+
+
+def _phase_float(row: dict[str, str], key: str) -> float:
+    value = (row.get(key) or "").strip()
+    return float(value) if value else 0.0
+
+
+def _read_phase_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    with path.open(encoding="utf-8") as f:
+        header: list[str] | None = None
+        for raw in f:
+            raw = raw.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if raw.startswith("row_type,"):
+                header = raw.split(",")
+                continue
+            if header is None:
+                continue
+            parts = raw.split(",")
+            if len(parts) < len(header):
+                parts.extend([""] * (len(header) - len(parts)))
+            row = {key: parts[idx] for idx, key in enumerate(header)}
+            row["elapsed_s_start"] = f"{_phase_float(row, 'elapsed_s_start'):.6f}"
+            row["elapsed_s_end"] = f"{_phase_float(row, 'elapsed_s_end'):.6f}"
+            rows.append(row)
+    return sorted(rows, key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end")))
+
+
+def _write_phase_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    fieldnames = [
+        "row_type",
+        "elapsed_s_start",
+        "elapsed_s_end",
+        "rss_kb_start",
+        "rss_kb_end",
+        "col_a_ms",
+        "col_b_ms",
+        "total_ms",
+        "kv_pos",
+        "kv_total",
+        "kv_used_pct",
+        "kv_estimated_used_kb",
+        "kv_total_kb",
+        "kv_physical_committed_kb",
+        "token_idx",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({
+            "row_type": "# L_DecoderRuntimeInit: llama.cpp args/OpenCL runtime init  "
+            "L_DecoderLoad: llama.cpp model/mmproj load  ImageLoad: input image load  "
+            "LayoutTokenize: mtmd layout  V_Encode: OpenCL vision encode/projector  "
+            "ImagePrefill: image embedding prefill  T_Prefill: text prompt prefill  "
+            "D: one generated-token decode"
+        })
+        writer.writerows(rows)
+
+
+def _phase_colors() -> dict[str, str]:
+    return {
+        "L_DecoderRuntimeInit": "#a29bfe",
+        "L_DecoderLoad": "#6c5ce7",
+        "ImageLoad": "#74b9ff",
+        "LayoutTokenize": "#fdcb6e",
+        "V_Encode": "#00b894",
+        "ImagePrefill": "#0984e3",
+        "T_Prefill": "#e17055",
+        "EmbeddingFileWrite": "#55efc4",
+        "ExternalEmbeddingRead": "#00cec9",
+        "D": "#ff7675",
+        "Decode": "#d63031",
+    }
 
 
 def _parse_log_summary(log_text: str) -> dict[str, object]:
@@ -332,6 +420,76 @@ def _write_png_phase_duration(output_dir: Path, perf: dict[str, float]) -> Path 
     return output_png
 
 
+def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[str, str]]) -> Path | None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    excluded_from_plot = {
+        "ImageLoad",
+        "L_DecoderLoad",
+        "L_DecoderRuntimeInit",
+        "LayoutTokenize",
+    }
+    durations: dict[str, float] = {}
+    first_start_s: dict[str, float] = {}
+    has_decode_summary = any(row.get("row_type") == "Decode" for row in phase_rows)
+    for row in phase_rows:
+        name = row.get("row_type", "")
+        if name in excluded_from_plot:
+            continue
+        if name == "D" and has_decode_summary:
+            continue
+        normalized = "Decode" if name == "D" else name
+        start_s = _phase_float(row, "elapsed_s_start")
+        duration = max(_phase_float(row, "elapsed_s_end") - start_s, 0.0)
+        if duration > 0:
+            durations[normalized] = durations.get(normalized, 0.0) + duration
+            first_start_s[normalized] = min(first_start_s.get(normalized, start_s), start_s)
+    phases = sorted(
+        durations.items(),
+        key=lambda item: (first_start_s.get(item[0], float("inf")), item[0]),
+    )
+    if not phases:
+        return None
+
+    total = sum(value for _, value in phases)
+    colors = _phase_colors()
+    fig, ax = plt.subplots(figsize=(6.2, 8.8), dpi=160)
+    bottom = 0.0
+    for name, value in phases:
+        color = colors.get(name, "#636e72")
+        ax.bar(["total"], [value], bottom=bottom, color=color, edgecolor="white")
+        if value / total >= 0.035:
+            ax.text(
+                0,
+                bottom + value / 2.0,
+                f"{name}\n{value:.3f}s",
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=8,
+                fontweight="bold",
+            )
+        bottom += value
+
+    ax.set_title(f"Precise Runtime Breakdown: {output_dir.name}")
+    ax.set_ylabel("Elapsed Time (s)")
+    ax.grid(True, axis="y", linestyle=":", alpha=0.35)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=colors.get(name, "#636e72")) for name, _ in phases]
+    labels = [f"{name}: {value:.3f}s ({value / total * 100:.1f}%)" for name, value in phases]
+    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+    fig.tight_layout()
+    output_png = output_dir / "phase_duration_stacked_bar.png"
+    fig.savefig(output_png, bbox_inches="tight")
+    plt.close(fig)
+    return output_png
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run llama.cpp Android VLM smoke tests and store results in the foundation layout."
@@ -421,6 +579,7 @@ def main() -> int:
     remote_output = f"{remote_root}/foundation_output.txt"
     remote_exit_code = f"{remote_root}/foundation_exit_code.txt"
     remote_memory_csv = f"{remote_root}/android_memory_timeline.csv"
+    remote_phase_csv = f"{remote_root}/foundation_phase_stats.csv"
 
     _push_runtime_files(adb, build_dir, remote_root)
     _run(adb + ["push", str(model), remote_model])
@@ -437,8 +596,13 @@ def main() -> int:
     if selected_n_gpu_layers is None:
         selected_n_gpu_layers = 0 if args.backend == "cpu" else 99
 
+    precise_opencl_bin = build_dir / "opencl_phase_mtmd"
+    if not precise_opencl_bin.exists():
+        precise_opencl_bin = bin_dir / "opencl_phase_mtmd"
+    use_precise_phases = args.backend == "opencl" and precise_opencl_bin.exists()
+
     llm_cmd = [
-        "./llama-mtmd-cli",
+        "./opencl_phase_mtmd" if use_precise_phases else "./llama-mtmd-cli",
         "-m",
         remote_model,
         "--mmproj",
@@ -454,6 +618,8 @@ def main() -> int:
         "--n-gpu-layers",
         str(selected_n_gpu_layers),
     ]
+    if use_precise_phases:
+        llm_cmd.extend(["--phase-stats-path", remote_phase_csv])
     selected_device = args.device
     if selected_device is None:
         if args.backend == "cpu":
@@ -478,6 +644,7 @@ def main() -> int:
         + [
             f"export GGML_HEXAGON_EXPERIMENTAL=1" if args.backend == "hexagon" else ":",
             f"export GGML_HEXAGON_NDEV={args.hexagon_ndev}" if args.hexagon_ndev is not None else ":",
+            f"rm -f {shlex.quote(remote_phase_csv)}",
             f"printf '%s\\n' 'sample_idx,elapsed_s,pid,pid_alive,vmrss_kb,vmsize_kb,vmhwm_kb,smaps_rss_kb,smaps_pss_kb,smaps_private_dirty_kb,smaps_shared_clean_kb,mem_available_kb,cached_kb,dma_heap_pool_kb,gpu_total_kb,kgsl_shmem_usage_kb' > {shlex.quote(remote_memory_csv)}",
             f"( {_shell_join(llm_cmd)} > {shlex.quote(remote_output)} 2>&1; echo $? > {shlex.quote(remote_exit_code)} ) &",
         ]
@@ -522,6 +689,10 @@ def main() -> int:
         (output_dir / "foundation_exit_code.txt").write_text(exit_code_text.strip() + "\n", encoding="utf-8")
 
     _run(adb + ["pull", remote_memory_csv, str(output_dir / "android_memory_timeline.csv")])
+    phase_rows: list[dict[str, str]] = []
+    if _remote_exists(adb, remote_phase_csv):
+        _run(adb + ["pull", remote_phase_csv, str(output_dir / "foundation_phase_stats.csv")])
+        phase_rows = _read_phase_rows(output_dir / "foundation_phase_stats.csv")
     memory_rows = _read_csv_dicts(output_dir / "android_memory_timeline.csv")
     duration_s = max(
         [float(row.get("elapsed_s", "0") or 0.0) for row in memory_rows] or [0.0]
@@ -529,6 +700,8 @@ def main() -> int:
     remote_pid = next((row.get("pid", "") for row in memory_rows if row.get("pid")), "")
 
     summary = _parse_log_summary(log_text)
+    perf = _parse_perf_summary(log_text)
+    summary.update(perf)
     proc_rows = [
         {"metric": "backend", "value": f"llamacpp_{args.backend}", "unit": ""},
         {"metric": "model_name", "value": model_name, "unit": ""},
@@ -539,7 +712,11 @@ def main() -> int:
     for key, value in summary.items():
         unit = "ms" if key.endswith("_ms") else "MiB" if key.endswith("_mib") else ""
         proc_rows.append({"metric": key, "value": value, "unit": unit})
-    _write_csv(output_dir / "foundation_proc.csv", proc_rows, ["metric", "value", "unit"])
+    if phase_rows:
+        _write_csv(output_dir / "foundation_summary.csv", proc_rows, ["metric", "value", "unit"])
+        _write_phase_csv(output_dir / "foundation_proc.csv", phase_rows)
+    else:
+        _write_csv(output_dir / "foundation_proc.csv", proc_rows, ["metric", "value", "unit"])
 
     vision_rows = []
     for metric in ("image_slice_encoded_ms", "image_decoded_ms", "prompt_eval_tokens", "prompt_eval_tok_s", "decode_eval_runs", "decode_eval_tok_s", "total_time_ms"):
@@ -549,9 +726,11 @@ def main() -> int:
     if vision_rows:
         _write_csv(output_dir / "vision_output_stats.csv", vision_rows, ["metric", "value", "unit"])
 
-    perf = _parse_perf_summary(log_text)
     _write_png_memory_timeline(output_dir, memory_rows, summary)
-    _write_png_phase_duration(output_dir, perf)
+    if phase_rows:
+        _write_png_phase_duration_from_rows(output_dir, _read_phase_rows(output_dir / "foundation_proc.csv"))
+    else:
+        _write_png_phase_duration(output_dir, perf)
 
     print(f"[llamacpp] result dir: {output_dir}")
     print(f"[llamacpp] wall time: {duration_s:.3f}s")
