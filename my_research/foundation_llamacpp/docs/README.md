@@ -1,136 +1,369 @@
 # Hybrid Runtime Notes
 
 This directory collects the llama.cpp and ExecuTorch hybrid experiments for
-mobile streaming VLM research.
+mobile streaming VLM research. Use this file as the quick run guide. For build
+details and implementation internals, see
+`archive/executorch_vision_llamacpp_decoder.md`.
 
-## Main Takeaway
+## Current Recommendation
 
-For a streaming visual assistant, the most promising direction is a hybrid
-runtime:
-
-```text
-Streaming vision path:
-  ExecuTorch / QNN / Vulkan
-
-Decoder and KV-control path:
-  llama.cpp
-```
-
-ExecuTorch is better suited for mobile backend experiments and continuous vision
-execution, especially when targeting Qualcomm QNN/HTP. llama.cpp is better
-suited for decoder-side experiments because it exposes a compact, KV-centric
-LLM runtime with direct KV-memory APIs.
-
-## Runtime Terminology
-
-The difference is not just a library difference. It is a runtime architecture
-difference:
+For a mobile streaming visual assistant, use a hybrid runtime:
 
 ```text
-ExecuTorch:
-  general-purpose AOT static-graph runtime
-  max-shape planned memory
-  backend delegation through XNNPACK / Vulkan / QNN
+streaming vision path:
+  ExecuTorch QNN / Vulkan / XNNPACK
 
-llama.cpp:
-  LLM-specialized dynamic token runtime
-  runtime-managed KV cache
-  token-level prefill/decode loop
+decoder and KV-control path:
+  llama.cpp CPU / OpenCL / Vulkan / Hexagon
 ```
 
-Another concise way to describe it:
+The practical runtime boundary is projected **vision embeddings**, not KV-cache.
+Direct cross-runtime KV transfer is not practical because KV layout, RoPE
+positioning, quantization, and backend buffer ownership differ by runtime.
+
+## Models And Inputs
+
+The current main model is InternVL3 1B with Q8_0 llama.cpp weights:
 
 ```text
-AOT static graph
-vs
-runtime-managed token loop
+text GGUF:
+  llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf
+
+mmproj GGUF:
+  llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf
+
+sample image:
+  my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg
+
+QNN vision manifest:
+  my_research/foundation/results/model/qnn/internvl3_1b_qnn_1k_16a8w/manifest.json
 ```
 
-ExecuTorch can be faster for fixed-shape vision/backend execution, but large
-compiled context lengths can inflate planned activation/workspace memory.
-llama.cpp keeps long-context memory closer to KV-cache capacity, but its
-multimodal vision path and mobile accelerator control are weaker.
-
-## Why This Matters For Streaming
-
-Streaming VLMs need to process frames continuously and answer user queries with
-low latency. That creates two different requirements:
-
-- Vision encoding should use mobile accelerators efficiently, ideally QNN/HTP or
-  a well-performing Vulkan path.
-- Decoder memory should remain compact and controllable as visual context grows.
-
-ExecuTorch gives the mobile backend control. llama.cpp gives easier decoder and
-KV-cache control. A hybrid keeps both.
-
-## Key Experiment Results
-
-### SmolVLM-500M
-
-SmolVLM-500M ran successfully on Android CPU and Vulkan with llama.cpp.
+Sample images live under `my_research/foundation_llamacpp/sample_images/`.
+The current default is a center-cropped and resized Golden Gate Bridge photo from
+Wikimedia Commons. Keep benchmark sample images resized to `448 x 448`. InternVL
+dynamic tiling can turn larger images into multiple tiles; for apples-to-apples
+measurements we use one tile:
 
 ```text
-CPU:
-  image encode: 2688 ms
-  image decode/prefill: 504 ms
-  prompt eval: 23.96 tok/s
-  decode: 26.51 tok/s
-
-Vulkan:
-  image encode: 14178 ms
-  image decode/prefill: 5 ms
-  prompt eval: 5.59 tok/s
-  decode: 66.05 tok/s
+image tokens = 256
+decoder embedding dim = 896
+projected vision embedding shape = 1 x 256 x 896
 ```
 
-Vulkan improved token decode but was worse for the short VLM prefill path on the
-tested Samsung Xclipse 940 device.
-
-### OpenCL
-
-OpenCL built successfully, and the device exposed:
+The Q8_0 suffix is part of the model identity and should remain visible in result
+paths:
 
 ```text
-Samsung Xclipse 940 (OpenCL 3.0)
+InternVL3-1B-Instruct-Q8_0
 ```
 
-However llama.cpp rejected it as unsupported and fell back to CPU:
+## Common Parameters
+
+Use the unified Android runner and matched decoder settings when comparing CPU,
+OpenCL GPU, and hybrid runs:
 
 ```text
-Unsupported GPU: Samsung Xclipse 940
-no usable GPU found, --gpu-layers option will be ignored
+context length:
+  --ctx-size 32768
+
+batch size:
+  --batch-size 2048
+
+micro-batch size:
+  --ubatch-size 512
+
+new tokens:
+  --n-predict 32
+
+force generation:
+  --force-generation 64   # optional; continue until exactly 64 generated tokens
+
+prompt:
+  "Describe this image briefly."
 ```
 
-On Qualcomm Adreno devices, especially Snapdragon 8 Gen 3 / 8 Elite, OpenCL is
-worth testing because llama.cpp explicitly targets those GPUs.
+Changing `--ctx-size` changes KV-cache allocation. Changing `--n-predict`
+changes generation length and runtime, but it does not meaningfully reduce
+allocated KV memory.
 
-### InternVL3 1B
+`--force-generation N` overrides `--n-predict` for the run. GPU/OpenCL and
+Hybrid continue through EOS/EOG in the instrumented overlay binaries. CPU uses
+upstream `llama-mtmd-cli` with `--ignore-eos`, so it emits `N` tokens but the CPU
+token transcript is reconstructed by the Python runner from stdout.
 
-InternVL3 1B ran correctly on Android CPU and Vulkan with llama.cpp.
+## Result Layout
 
-Original COCO cats image:
+Unified runner results:
 
 ```text
-image size: 640 x 480
-llama.cpp image tokens: 1280
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_cpu_ctx_32768/
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768/
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768/
 ```
 
-The 1280 tokens came from InternVL dynamic high-resolution tiling:
+Important artifacts:
 
 ```text
-1280 = 5 tiles * 256 tokens
+foundation_output.txt
+  Canonical stdout log.
+
+foundation_token_io.txt
+  Prompt/response token text with special tokens and image placeholder tokens.
+  Use this when you need a compact input/output transcript like the ExecuTorch
+  foundation runner output.
+
+foundation_exit_code.txt
+  Process exit code.
+
+foundation_proc.csv
+  Canonical phase rows or summary rows, depending on backend/tooling.
+
+foundation_summary.csv
+  Run-level summary metrics when precise phase rows are available.
+
+foundation_phase_stats.csv
+  Raw standalone OpenCL precise phase CSV emitted on device.
+
+vision_phase_stats.csv / decoder_phase_stats.csv
+  Raw hybrid phase CSVs emitted by the two bridge processes.
+
+android_memory_timeline.csv
+  Android memory samples. Use MemAvailable for memory plots.
+
+memory_timeline_plot.png
+  MemAvailable timeline.
+
+phase_duration_stacked_bar.png
+  Runtime phase breakdown.
 ```
 
-After resizing the input image to `448 x 448`, llama.cpp used the expected
-single-tile count:
+## Run CPU
+
+Use CPU for a simple correctness baseline. This path uses upstream
+`llama-mtmd-cli` through the unified Android runner.
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor cpu \
+  --llama-build-dir llama.cpp/build-android-cpu-noomp \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+  --prompt "Describe this image briefly." \
+  --n-predict 32 \
+  --force-generation 64 \
+  --threads 4 \
+  --ctx-size 32768 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --temperature 0.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log
+```
+
+Expected output directory:
 
 ```text
-image tokens: 256
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_cpu_ctx_32768/
 ```
 
-CPU total latency dropped from `59.7 s` to `13.7 s`. Vulkan total latency dropped
-from `253.8 s` to `62.3 s`, but Vulkan remained slower than CPU for
-vision/prompt prefill on the tested device.
+## Run OpenCL GPU
+
+Use OpenCL for the standalone llama.cpp GPU baseline on Qualcomm Adreno devices.
+When `opencl_phase_mtmd` exists in the build directory, the runner automatically
+uses it instead of upstream `llama-mtmd-cli` to produce precise phase rows.
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor gpu \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+  --prompt "What is this image?" \
+  --n-predict 32 \
+  --force-generation 64 \
+  --threads 4 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --ctx-size 32768 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --temperature 0.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log
+```
+
+Expected output directory:
+
+```text
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768/
+```
+
+Important OpenCL note:
+
+```text
+Do not push the local OpenCL ICD loader (`libOpenCL.so`) to the device by
+default.
+```
+
+On the tested Qualcomm device, the Android system OpenCL loader discovers Adreno
+correctly. Pushing the local ICD loader caused:
+
+```text
+ggml_opencl: platform IDs not available
+invalid device: GPUOpenCL
+```
+
+The unified runner avoids pushing that local loader unless
+`--push-opencl-loader` is explicitly set.
+
+## Run Hybrid QNN Vision + OpenCL Decoder
+
+Use the hybrid bridge for the main streaming-system experiment:
+
+```text
+ExecuTorch QNN:
+  vision encoder + projector
+
+llama.cpp OpenCL:
+  layout tokenize + image/text prefill + token decode
+```
+
+Typical run:
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --manifest my_research/foundation/results/model/qnn/internvl3_1b_qnn_1k_16a8w/manifest.json \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+  --prompt "Describe this image briefly." \
+  --n-predict 32 \
+  --force-generation 64 \
+  --ctx-size 32768 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --soc-model SM8750 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log
+```
+
+Expected output directory:
+
+```text
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768/
+```
+
+The unified runner caches only model-like files (`--model`, `--mmproj`, and the
+hybrid QNN `.pte`) on device. If they already exist under `--remote-root`, it
+skips pushing them; pass `--model-push` to force re-push. Runtime binaries,
+shared libraries, scripts, and input images are always pushed so rebuilds are
+reflected immediately. In hybrid mode, the runner starts the QNN vision process
+and llama.cpp decoder process together, waits until both are loaded, then starts
+QNN `V_Encode`.
+
+## Optional Backends
+
+Older Vulkan and Hexagon command templates are kept in
+`archive/executorch_vision_llamacpp_decoder.md` for historical reference. The
+active unified runner currently exposes only the comparison modes needed for the
+main experiment:
+
+```text
+--processor cpu
+--processor gpu      # OpenCL GPU
+--processor hybrid   # ExecuTorch QNN vision + llama.cpp OpenCL decoder
+```
+
+## Phase Names
+
+Precise OpenCL and hybrid runs use these phase names:
+
+```text
+L_DecoderRuntimeInit
+  llama.cpp argument parsing and OpenCL runtime/device/kernel setup.
+
+L_DecoderLoad
+  llama.cpp model/context/mmproj load.
+
+L_VisionLoad
+  ExecuTorch/QNN vision module load. Hybrid only.
+
+ImageLoad
+  Input image/tensor load.
+
+LayoutTokenize
+  mtmd_tokenize() text/image layout construction.
+
+V_Encode
+  Vision encoder + projector.
+  OpenCL: llama.cpp OpenCL vision path.
+  Hybrid: ExecuTorch QNN vision_encoder_pte.
+
+EmbeddingFileWrite
+  Write `.svlmemb`. Hybrid only.
+
+ExternalEmbeddingRead
+  Read `.svlmemb`. Hybrid only.
+
+ImagePrefill
+  Feed projected image embeddings into llama.cpp context/KV.
+
+T_Prefill
+  Text chunk prefill.
+
+D
+  One generated-token llama_decode() call.
+```
+
+`phase_duration_stacked_bar.png` filters load/setup phases so the figure focuses
+on execution. The full trace remains in `foundation_proc.csv`.
+
+## Current Matched Results
+
+Latest standalone OpenCL precise run:
+
+```text
+result:
+  my_research/foundation_llamacpp/results/log/opencl/InternVL3-1B-Instruct-Q8_0/
+
+V_Encode             = 714 ms
+ImagePrefill         = 36 ms
+T_Prefill            = 19 ms + 214 ms
+token decode         = mostly 12-16 ms/token
+prompt eval          = 269.20 ms / 271 tokens
+token decode total   = 377.38 ms / 29 runs
+llama.cpp total      = 2444.37 ms
+```
+
+Latest hybrid QNN vision + OpenCL decoder run:
+
+```text
+result:
+  my_research/foundation_llamacpp/results/log/hybrid_bridge_opencl/InternVL3-1B-Instruct-Q8_0/
+
+V_Encode / QNN vision = 369 ms
+ImagePrefill          = 57 ms
+T_Prefill             = 10 ms + 210 ms
+token decode          = mostly 12-15 ms/token
+prompt eval           = 276.44 ms / 271 tokens
+token decode total    = 410.27 ms / 31 runs
+llama.cpp total       = 2225.85 ms
+```
+
+Interpretation:
+
+```text
+Compare OpenCL V_Encode against hybrid QNN V_Encode.
+Compare ImagePrefill/T_Prefill against decoder-side prefill behavior.
+Do not compare QNN vision time against llama.cpp prompt eval directly.
+```
 
 ## Memory Summary
 
@@ -140,101 +373,41 @@ llama.cpp reports memory roughly as:
 self = model + context + compute
 ```
 
-For these runs, `context` is mostly resident KV-cache memory.
+For InternVL3 1B Q8_0 matched runs:
 
 ```text
-SmolVLM CPU:
-  model 414 MiB, KV 320 MiB, compute 116 MiB, self 851 MiB
-
-SmolVLM Vulkan:
-  model 366 MiB, KV 320 MiB, compute 98 MiB, self 785 MiB
-
-InternVL3 1B CPU:
-  model 638 MiB, KV 384 MiB, compute 299 MiB, self 1322 MiB
-
-InternVL3 1B Vulkan:
-  model 500 MiB, KV 384 MiB, compute 297 MiB, self 1182 MiB
+OpenCL model buffer = about 500 MiB
+OpenCL KV buffer    = 384 MiB at ctx 32768
+OpenCL compute buf  = about 298 MiB for decoder
 ```
 
-The KV-cache is resident in runtime memory. On CPU it is host DRAM. On Vulkan it
-is GPU-visible memory, which is still unified DRAM on mobile SoCs.
+The KV-cache is resident runtime memory. On mobile SoCs, GPU-visible memory is
+still unified DRAM, so OpenCL/Vulkan allocations affect system memory pressure.
 
-Changing `-n` changes maximum generated tokens and therefore time/energy. It
-does not significantly reduce allocated KV memory. To reduce KV memory in
-llama.cpp, change context length with `-c`, for example:
+## Build Documentation
 
-```bash
--c 2048
-```
-
-## ExecuTorch vs llama.cpp Memory Behavior
-
-ExecuTorch 16K artifacts can consume much more memory than llama.cpp because
-ExecuTorch stores an AOT max-shape graph memory plan:
+This README intentionally focuses on running experiments. For CMake configure,
+target descriptions, QNN library pushing, troubleshooting, and implementation
+details, read:
 
 ```text
-weights/constants
-+ KV cache
-+ planned activation arena
-+ XNNPACK/Vulkan/QNN delegate workspace
-+ packed/copied backend buffers
-+ method-specific planned memory
+my_research/foundation_llamacpp/docs/archive/executorch_vision_llamacpp_decoder.md
 ```
-
-llama.cpp is more compact for decoder memory because it is an LLM-specialized
-runtime:
-
-```text
-weights
-+ KV cache
-+ reusable compute buffer
-```
-
-This is why a 16K ExecuTorch artifact can use several GB while llama.cpp with a
-large context can stay closer to KV-cache capacity.
 
 ## Document Index
 
-- `executorch_vision_llamacpp_decoder.md`:
-  Feasibility note for feeding ExecuTorch vision embeddings into llama.cpp's
-  decoder path.
-- `llamacpp_android_cpu_vlm_smoke.md`:
-  SmolVLM-500M Android CPU smoke test.
-- `llamacpp_android_vulkan_vlm_smoke.md`:
-  SmolVLM-500M Android Vulkan smoke test.
-- `llamacpp_android_opencl_vlm_attempt.md`:
-  Android OpenCL build and unsupported Xclipse fallback.
-- `llamacpp_android_internvl3_1b_smoke.md`:
-  InternVL3 1B CPU/Vulkan tests, including the `448 x 448` resize follow-up.
-- `llamacpp_android_memory_summary.md`:
-  Backend memory breakdown for the llama.cpp Android VLM runs.
-- `aot_static_graph_vs_runtime_token_loop.md`:
-  Discussion note on ExecuTorch AOT memory growth, llama.cpp runtime token
-  execution, and why the split matters for streaming VLMs.
-
-## Current Recommendation
-
-Use ExecuTorch as the primary runtime for mobile vision/backend experiments:
-
-```text
-vision encoder:
-  ExecuTorch QNN / Vulkan / XNNPACK
-```
-
-Use llama.cpp as the decoder/KV-control prototype:
-
-```text
-decoder:
-  llama.cpp CPU / Vulkan / OpenCL where supported
-  runtime-managed KV-cache experiments
-```
-
-The long-term streaming design should validate an embedding boundary rather than
-a KV-cache boundary:
-
-```text
-ExecuTorch vision embeddings -> llama.cpp decoder prefill
-```
-
-Direct cross-runtime KV-cache transfer is not practical because KV layout,
-position handling, quantization, and backend ownership are runtime-specific.
+- `for_cursor_llm_llamacpp.md`: Append-only development log for future agents.
+- `archive/executorch_vision_llamacpp_decoder.md`: Detailed hybrid bridge and
+  standalone OpenCL precise measurement guide.
+- `archive/llamacpp_android_cpu_vlm_smoke.md`: SmolVLM-500M Android CPU smoke
+  test.
+- `archive/llamacpp_android_vulkan_vlm_smoke.md`: SmolVLM-500M Android Vulkan smoke
+  test.
+- `archive/llamacpp_android_opencl_vlm_attempt.md`: Android OpenCL build and
+  unsupported Xclipse fallback.
+- `archive/llamacpp_android_internvl3_1b_smoke.md`: InternVL3 1B CPU/Vulkan
+  tests and the `448 x 448` resize follow-up.
+- `archive/llamacpp_android_memory_summary.md`: Backend memory breakdown for
+  earlier llama.cpp Android VLM runs.
+- `archive/aot_static_graph_vs_runtime_token_loop.md`: ExecuTorch AOT memory
+  growth vs llama.cpp runtime token execution.

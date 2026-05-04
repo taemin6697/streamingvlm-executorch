@@ -300,6 +300,127 @@ follow_up:
   result numbers for hybrid QNN+OpenCL vs standalone OpenCL. This was done so a
   future agent can continue from the docs without reconstructing the chat
   history.
+- 2026-05-04: Reworked `docs/README.md` as the quick run guide for
+  `foundation_llamacpp`. It now documents model/input paths, matched comparison
+  parameters, result directory layout, CPU/OpenCL/Hybrid run commands, optional
+  Vulkan/Hexagon command templates, phase names, latest matched OpenCL vs hybrid
+  numbers, memory interpretation, and points readers to
+  `docs/archive/executorch_vision_llamacpp_decoder.md` for build and
+  implementation details.
+- 2026-05-04: Archived older long-form notes under `docs/archive/`, leaving only
+  `docs/README.md` and this development log in the `docs/` root. Updated the
+  README document index and build-detail references to use the new archive paths.
+- 2026-05-04: Unified Android CPU/OpenCL/Hybrid execution into
+  `run_android_hybrid_bridge.py`. The script now exposes `--processor
+  cpu|gpu|hybrid` and shares one flow for argument parsing, runtime file push,
+  model caching, remote script execution, artifact pull, summary CSV generation,
+  `foundation_proc.csv`, `memory_timeline_plot.png`, and
+  `phase_duration_stacked_bar.png`. Processor-specific logic is limited to the
+  command/artifact details: CPU uses `llama-mtmd-cli`, GPU uses
+  `opencl_phase_mtmd` when present, and hybrid uses `hybrid_vision_dump` plus
+  `hybrid_decode`. Removed the old `run_android_llamacpp.py` entry point so new
+  CPU/GPU/Hybrid experiments use a single runner file.
+- 2026-05-04: Added model push caching to the unified runner. Large model-like
+  files (`--model`, `--mmproj`, and hybrid `vision_encoder_qnn.pte`) are pushed
+  only when missing under `--remote-root`; `--model-push` / `--model_push`
+  forces re-push. Runtime binaries, shared libraries, scripts, and input images
+  are still pushed every run. The runner also keeps avoiding local
+  `libOpenCL.so` by default unless `--push-opencl-loader` is set.
+- 2026-05-04: Updated result naming to include the processor suffix directly
+  under the results root. Initial names were
+  `InternVL3-1B-Instruct-Q8_0_cpu`, `InternVL3-1B-Instruct-Q8_0_opencl`, and
+  `InternVL3-1B-Instruct-Q8_0_hybrid`; later naming also appends
+  `_ctx_<ctx_size>`. Verified 1B smoke tests for all three processors on Android
+  with `--ctx-size 32768 --batch-size 2048 --ubatch-size 512`: CPU, GPU/OpenCL,
+  and hybrid returned exit code 0 and generated the expected summary, memory
+  timeline, and phase duration artifacts.
+- 2026-05-04: Ran full unified-runner backend validation on connected Android
+  device `R3KYC01FW1P` using InternVL3-1B Q8_0, sample cats image,
+  `--n-predict 32 --ctx-size 32768 --batch-size 2048 --ubatch-size 512`.
+  First CPU run used `--force-push --model-push` against
+  `/data/local/tmp/streamingvlm_unified_full`, verifying real model/mmproj push.
+  GPU/OpenCL and Hybrid reruns reused the same remote root and verified
+  `[push-cache] keep remote model` for model/mmproj while runtime binaries/libs
+  were pushed every run. All processors returned exit code 0 and produced
+  `foundation_output.txt`, `foundation_summary.csv`, `foundation_proc.csv`,
+  `android_memory_timeline.csv`, `memory_timeline_plot.png`, and
+  `phase_duration_stacked_bar.png`. Key timings from `foundation_summary.csv`:
+  CPU image encode 4880.0 ms, prompt eval 6110.56 ms, decode 362.59 ms, total
+  6684.88 ms; OpenCL image encode 709.0 ms, prompt eval 267.45 ms, decode
+  374.93 ms, total 2307.73 ms; Hybrid QNN vision encode 375.0 ms, prompt eval
+  276.37 ms, decode 400.99 ms, total 2184.4 ms.
+- 2026-05-04: Fixed an Android memory timeline alignment bug in
+  `run_android_hybrid_bridge.py`. The remote memory sampler previously computed
+  `elapsed_s` as `sample_idx * sample_interval`; because each `/proc` sampling
+  iteration takes non-trivial shell time on Android, the memory timeline was
+  compressed (for example OpenCL phase rows reached ~18 s while memory samples
+  ended around ~7.45 s), causing phase overlays to bunch at the right edge of
+  `memory_timeline_plot.png`. The sampler now records elapsed time from
+  `/proc/uptime`, so memory samples use real device wall time. Regenerated CPU,
+  OpenCL, and Hybrid full 1B results; corrected memory ranges are CPU 0.01-7.29
+  s, OpenCL 0.01-18.31 s, Hybrid 0.00-11.92 s, all exit code 0.
+- 2026-05-04: Normalized CPU fallback phase plotting. CPU uses upstream
+  `llama-mtmd-cli`, which does not emit precise `foundation_phase_stats.csv`, so
+  the runner previously fell back to a different `Runtime Breakdown` chart based
+  on load/prompt/decode summary metrics. Added synthetic standalone phase rows
+  from available llama.cpp summary timers (`V_Encode` from
+  `image_slice_encoded_ms`, `ImagePrefill` from `image_decoded_ms`,
+  `T_Prefill` from `prompt_eval_time_ms - image_decoded_ms`, and `Decode` from
+  `decode_eval_time_ms`) so CPU `phase_duration_stacked_bar.png` uses the same
+  `Precise Runtime Breakdown` visual style and `foundation_proc.csv` schema as
+  OpenCL/Hybrid. Treat CPU synthetic rows as approximate because they are not
+  emitted by internal exclusive C++ phase timers.
+- 2026-05-04: Fixed CPU memory timeline after adding synthetic CPU phase rows.
+  The synthetic rows are duration-only and not aligned to real wall-clock memory
+  samples, so overlaying them on `memory_timeline_plot.png` produced misleading
+  phase spans/labels. Updated `run_android_hybrid_bridge.py` so synthetic CPU
+  rows are used for `phase_duration_stacked_bar.png` and `foundation_proc.csv`
+  only; CPU `memory_timeline_plot.png` now stays as a pure `MemAvailable`
+  timeline without synthetic phase overlays.
+- 2026-05-04: Fixed stale local artifact handling during result pulls. If a
+  previous run produced `foundation_phase_stats.csv` but a later pure CPU run
+  does not, the old local file must not be reused. `_pull_outputs()` now removes
+  each expected local artifact before attempting `adb pull`, preventing stale
+  phase CSVs from contaminating regenerated plots. Also confirmed that pure CPU
+  results have no `ggml_opencl` log lines and no `foundation_phase_stats.csv`.
+  Keep `opencl_phase_mtmd` restricted to `--processor gpu`; using the OpenCL
+  overlay binary for CPU initializes the OpenCL backend and is not a clean CPU
+  baseline.
+- 2026-05-04: Added `memory_usage_summary.txt` generation to
+  `run_android_hybrid_bridge.py`. The metric is computed from
+  `android_memory_timeline.csv` as
+  `MemAvailable(first sample) - min(MemAvailable)` and reported in KiB/MiB with
+  the start/min sample indices and elapsed timestamps. Generated summaries for
+  the current InternVL3-1B Q8_0 results: CPU 827092 KiB / 807.707 MiB, OpenCL
+  2150444 KiB / 2100.043 MiB, Hybrid 2990840 KiB / 2920.742 MiB.
+- 2026-05-04: Added a new benchmark sample image under
+  `my_research/foundation_llamacpp/sample_images/`. Downloaded a Golden Gate
+  Bridge photo from Wikimedia Commons, center-cropped it to square, resized it
+  to `448 x 448`, and saved it as
+  `sample_images/golden_gate_bridge_448.jpg`. Updated
+  `run_android_hybrid_bridge.py` default `--image` and `docs/README.md` CPU,
+  OpenCL, and Hybrid command examples to use the new `sample_images/` path.
+- 2026-05-04: Added forced generation and special-token I/O transcripts to the
+  unified llama.cpp runner. New `run_android_hybrid_bridge.py` argument:
+  `--force-generation N` / `--force_generation N`. For GPU/OpenCL
+  `opencl_phase_mtmd` and Hybrid `hybrid_decode`, this sets `n_predict=N` and
+  the C++ generation loop continues through EOS/EOG instead of breaking early.
+  For pure CPU, the runner passes upstream `llama-mtmd-cli --ignore-eos`; CPU
+  remains a clean CPU baseline and does not use the OpenCL overlay binary.
+- 2026-05-04: Added `foundation_token_io.txt` output. GPU/OpenCL and Hybrid emit
+  this directly from the instrumented C++ tools via `--token-io-path`, rendering
+  the mtmd tokenized prompt with special tokens and `<IMG_CONTEXT>` placeholders
+  plus generated token pieces with special tokens enabled. Pure CPU uses a
+  Python fallback that reconstructs the prompt with 256 image context tokens and
+  extracts generated text from `foundation_output.txt`. Verified short
+  `--force-generation 8` runs for GPU/OpenCL, Hybrid, and CPU. GPU/Hybrid phase
+  CSVs showed exactly 8 `D` rows and `foundation_token_io.txt` was pulled.
+- 2026-05-04: Updated unified result directory naming to include context length.
+  `run_android_hybrid_bridge.py` now writes results as
+  `<model>_<processor>_ctx_<ctx_size>`, for example
+  `InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768`. Renamed the current CPU,
+  OpenCL, and Hybrid result folders from the old names to the new
+  `_ctx_32768` names and updated `docs/README.md` expected output paths.
 
 Suggested note format:
 

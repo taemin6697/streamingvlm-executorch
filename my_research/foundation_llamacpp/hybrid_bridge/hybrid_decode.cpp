@@ -23,8 +23,10 @@ namespace {
 struct custom_args {
   std::string embedding_path;
   std::string phase_stats_path = "decoder_phase_stats.csv";
+  std::string token_io_path;
   std::string ready_path;
   bool wait_for_embedding = false;
+  bool force_generation = false;
   int wait_timeout_ms = 120000;
   std::vector<std::string> passthrough;
 };
@@ -50,6 +52,13 @@ custom_args strip_custom_args(int argc, char** argv) {
       out.phase_stats_path = argv[++i];
     } else if (arg.rfind("--phase-stats-path=", 0) == 0) {
       out.phase_stats_path = arg.substr(std::string("--phase-stats-path=").size());
+    } else if (arg == "--token-io-path") {
+      if (i + 1 >= argc) {
+        die("missing value for --token-io-path");
+      }
+      out.token_io_path = argv[++i];
+    } else if (arg.rfind("--token-io-path=", 0) == 0) {
+      out.token_io_path = arg.substr(std::string("--token-io-path=").size());
     } else if (arg == "--ready-path") {
       if (i + 1 >= argc) {
         die("missing value for --ready-path");
@@ -59,6 +68,8 @@ custom_args strip_custom_args(int argc, char** argv) {
       out.ready_path = arg.substr(std::string("--ready-path=").size());
     } else if (arg == "--wait-for-embedding") {
       out.wait_for_embedding = true;
+    } else if (arg == "--force-generation") {
+      out.force_generation = true;
     } else if (arg == "--wait-timeout-ms") {
       if (i + 1 >= argc) {
         die("missing value for --wait-timeout-ms");
@@ -186,12 +197,34 @@ std::string chat_add_and_format(decode_context& ctx, common_chat_msg& msg) {
   return formatted;
 }
 
+std::string render_chunks_with_special_tokens(decode_context& ctx, mtmd::input_chunks& chunks) {
+  std::string rendered;
+  const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+  for (size_t i = 0; i < n_chunks; ++i) {
+    const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
+    const auto chunk_type = mtmd_input_chunk_get_type(chunk);
+    if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+      size_t n_tokens = 0;
+      const llama_token* tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
+      llama_tokens token_vec(tokens, tokens + n_tokens);
+      rendered += common_detokenize(ctx.vocab, token_vec, true);
+    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+      const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+      for (size_t j = 0; j < n_tokens; ++j) {
+        rendered += "<IMG_CONTEXT>";
+      }
+    }
+  }
+  return rendered;
+}
+
 int eval_with_external_embedding(
     decode_context& ctx,
     const std::string& prompt,
     const std::vector<std::string>& image_paths,
     streamingvlm::hybrid_bridge::EmbeddingFile& embedding,
-    phase_recorder& phases) {
+    phase_recorder& phases,
+    std::string* input_special_text) {
   if (prompt.empty()) {
     die("prompt is required");
   }
@@ -234,6 +267,9 @@ int eval_with_external_embedding(
   }
   const long layout_end_ms = ggml_time_ms();
   phases.row("LayoutTokenize", layout_start_ms, layout_end_ms);
+  if (input_special_text != nullptr) {
+    *input_special_text = render_chunks_with_special_tokens(ctx, chunks);
+  }
 
   bool used_external_embedding = false;
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
@@ -290,18 +326,21 @@ int eval_with_external_embedding(
   return 0;
 }
 
-int generate_response(decode_context& ctx, int n_predict, phase_recorder& phases) {
+std::string generate_response(decode_context& ctx, int n_predict, bool force_generation, phase_recorder& phases) {
   llama_tokens generated_tokens;
+  std::string generated_text;
   for (int i = 0; i < n_predict; ++i) {
     llama_token token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
     generated_tokens.push_back(token_id);
     common_sampler_accept(ctx.smpl, token_id, true);
-    if (llama_vocab_is_eog(ctx.vocab, token_id)) {
+    const std::string piece = common_token_to_piece(ctx.lctx, token_id, true);
+    generated_text += piece;
+    LOG("%s", piece.c_str());
+    fflush(stdout);
+    if (llama_vocab_is_eog(ctx.vocab, token_id) && !force_generation) {
       LOG("\n");
       break;
     }
-    LOG("%s", common_token_to_piece(ctx.lctx, token_id).c_str());
-    fflush(stdout);
 
     common_batch_clear(ctx.batch);
     common_batch_add(ctx.batch, token_id, ctx.n_past++, {0}, true);
@@ -312,7 +351,7 @@ int generate_response(decode_context& ctx, int n_predict, phase_recorder& phases
     const long token_decode_end_ms = ggml_time_ms();
     phases.row("D", token_decode_start_ms, token_decode_end_ms, i);
   }
-  return 0;
+  return generated_text;
 }
 
 void show_usage(int, char** argv) {
@@ -373,11 +412,13 @@ int main(int argc, char** argv) {
   const long embedding_read_end_ms = ggml_time_ms();
   phases.row("ExternalEmbeddingRead", embedding_read_start_ms, embedding_read_end_ms);
 
-  if (eval_with_external_embedding(ctx, params.prompt, params.image, embedding, phases) != 0) {
+  std::string input_special_text;
+  if (eval_with_external_embedding(ctx, params.prompt, params.image, embedding, phases, &input_special_text) != 0) {
     return 1;
   }
   int n_predict = params.n_predict < 0 ? INT32_MAX : params.n_predict;
-  generate_response(ctx, n_predict, phases);
+  const std::string generated_text = generate_response(ctx, n_predict, custom.force_generation, phases);
+  write_text_file(custom.token_io_path, input_special_text + generated_text + "\n");
   LOG("\n\n");
   llama_perf_context_print(ctx.lctx);
   return 0;

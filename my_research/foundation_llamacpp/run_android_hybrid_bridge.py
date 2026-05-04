@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -73,6 +74,41 @@ def _push(adb: list[str], local: Path, remote_dir: str) -> None:
     _run(adb + ["push", str(local), f"{remote_dir}/{local.name}"])
 
 
+def _remote_exists(adb: list[str], remote_path: str) -> bool:
+    result = subprocess.run(
+        adb + ["shell", f"test -f {shlex.quote(remote_path)}"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def _remote_read_text(adb: list[str], remote_path: str) -> str | None:
+    result = subprocess.run(
+        adb + ["shell", f"cat {shlex.quote(remote_path)}"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _push_model_cached(adb: list[str], local: Path, remote_dir: str, *, force: bool) -> None:
+    remote = f"{remote_dir}/{local.name}"
+    if not force and _remote_exists(adb, remote):
+        print(f"[push-cache] keep remote model: {remote}")
+        return
+    _push(adb, local, remote_dir)
+
+
 def _push_qnn_libs(adb: list[str], remote_dir: str, qnn_sdk: Path, executorch_build_dir: Path, soc_model: str) -> None:
     qnn_lib_dir = qnn_sdk / "lib" / "aarch64-android"
     if qnn_lib_dir.exists():
@@ -103,9 +139,11 @@ def _push_llama_runtime(
     for subdir in (llama_build_dir / "bin", llama_build_dir / "lib"):
         if subdir.exists():
             for path in sorted(subdir.iterdir()):
-                if path.is_file() and (path.suffix == ".so" or path.name in {"hybrid_decode", "llama-mtmd-cli"}):
+                if path.name == "libOpenCL.so" and not push_opencl_loader:
+                    continue
+                if path.is_file() and (path.suffix == ".so" or path.name in {"hybrid_decode", "llama-mtmd-cli", "opencl_phase_mtmd"}):
                     _push(adb, path, remote_dir)
-    for name in ("hybrid_decode",):
+    for name in ("hybrid_decode", "opencl_phase_mtmd"):
         path = llama_build_dir / name
         if path.exists():
             _push(adb, path, remote_dir)
@@ -139,6 +177,43 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str])
         writer.writerows(rows)
 
 
+def _write_memory_usage_txt(output_dir: Path, rows: list[dict[str, str]]) -> None:
+    usable: list[tuple[int, float, int]] = []
+    for idx, row in enumerate(rows):
+        raw_mem = (row.get("mem_available_kb") or "").strip()
+        if not raw_mem:
+            continue
+        try:
+            mem_available_kb = int(float(raw_mem))
+            elapsed_s = float(row.get("elapsed_s") or 0.0)
+        except ValueError:
+            continue
+        usable.append((idx, elapsed_s, mem_available_kb))
+    if not usable:
+        return
+
+    start_idx, start_elapsed_s, start_kb = usable[0]
+    min_idx, min_elapsed_s, min_kb = min(usable, key=lambda item: item[2])
+    used_kb = max(start_kb - min_kb, 0)
+    text = "\n".join(
+        [
+            "memory_usage_method: MemAvailable_start_kb - MemAvailable_min_kb",
+            f"start_sample_idx: {start_idx}",
+            f"start_elapsed_s: {start_elapsed_s:.3f}",
+            f"start_mem_available_kb: {start_kb}",
+            f"start_mem_available_mib: {start_kb / 1024.0:.3f}",
+            f"min_sample_idx: {min_idx}",
+            f"min_elapsed_s: {min_elapsed_s:.3f}",
+            f"min_mem_available_kb: {min_kb}",
+            f"min_mem_available_mib: {min_kb / 1024.0:.3f}",
+            f"actual_memory_used_kb: {used_kb}",
+            f"actual_memory_used_mib: {used_kb / 1024.0:.3f}",
+            "",
+        ]
+    )
+    (output_dir / "memory_usage_summary.txt").write_text(text, encoding="utf-8")
+
+
 def _match_float(text: str, pattern: str) -> float:
     match = re.search(pattern, text)
     return float(match.group(1)) if match else 0.0
@@ -147,6 +222,69 @@ def _match_float(text: str, pattern: str) -> float:
 def _match_int(text: str, pattern: str) -> int:
     match = re.search(pattern, text)
     return int(match.group(1)) if match else 0
+
+
+def _parse_log_summary(log_text: str) -> dict[str, object]:
+    summary: dict[str, object] = {}
+    for key, pattern in [
+        ("image_slice_encoded_ms", r"image slice encoded in ([0-9.]+) ms"),
+        ("image_decoded_ms", r"image decoded(?: \(batch \d+/\d+\))? in ([0-9.]+) ms"),
+        ("model_buffer_mib", r"model buffer size =\s+([0-9.]+) MiB"),
+        ("context_buffer_mib", r"KV buffer size =\s+([0-9.]+) MiB"),
+        ("compute_buffer_mib", r"compute buffer size =\s+([0-9.]+) MiB"),
+        ("load_time_ms", r"llama_perf_context_print:\s+load time =\s+([0-9.]+) ms"),
+        ("prompt_eval_time_ms", r"llama_perf_context_print:\s+prompt eval time =\s+([0-9.]+) ms"),
+        ("decode_eval_time_ms", r"llama_perf_context_print:\s+eval time =\s+([0-9.]+) ms"),
+        ("total_time_ms", r"llama_perf_context_print:\s+total time =\s+([0-9.]+) ms"),
+    ]:
+        matches = re.findall(pattern, log_text)
+        if matches:
+            summary[key] = float(matches[-1])
+    prompt_tokens = _match_int(log_text, r"prompt eval time =\s+[0-9.]+ ms /\s+([0-9]+) tokens")
+    decode_runs = _match_int(log_text, r"eval time =\s+[0-9.]+ ms /\s+([0-9]+) runs")
+    if prompt_tokens:
+        summary["prompt_eval_tokens"] = prompt_tokens
+    if decode_runs:
+        summary["decode_eval_runs"] = decode_runs
+    if summary.get("prompt_eval_time_ms") and prompt_tokens:
+        summary["prompt_eval_tok_s"] = prompt_tokens / float(summary["prompt_eval_time_ms"]) * 1000.0
+    if summary.get("decode_eval_time_ms") and decode_runs:
+        summary["decode_eval_tok_s"] = decode_runs / float(summary["decode_eval_time_ms"]) * 1000.0
+    return summary
+
+
+def _extract_generated_text_from_log(log_text: str) -> str:
+    lines = log_text.splitlines()
+    start_idx = -1
+    for idx, line in enumerate(lines):
+        if line.startswith("image decoded"):
+            start_idx = idx + 1
+    if start_idx < 0:
+        return ""
+    out_lines: list[str] = []
+    for line in lines[start_idx:]:
+        if line.startswith("llama_perf_context_print:"):
+            break
+        if not line.strip() and not out_lines:
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).strip()
+
+
+def _write_fallback_token_io_txt(result_dir: Path, prompt: str, log_text: str, image_tokens: int = 256) -> None:
+    token_io = result_dir / "foundation_token_io.txt"
+    if token_io.exists():
+        return
+    generated = _extract_generated_text_from_log(log_text)
+    image_context = "<IMG_CONTEXT>" * image_tokens
+    text = (
+        "<|im_start|>user:\n"
+        f"Frame1: <img>{image_context}</img>\n"
+        f"{prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        f"{generated}\n"
+    )
+    token_io.write_text(text, encoding="utf-8")
 
 
 def _phase_float(row: dict[str, str], key: str) -> float:
@@ -221,6 +359,50 @@ def _phase_rows_from_artifacts(result_dir: Path) -> list[dict[str, str]]:
     # incorrectly make loading appear after QNN encode.
     decoder_rows = _read_phase_rows(result_dir / "decoder_phase_stats.csv")
     return sorted(vision_rows + decoder_rows, key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end")))
+
+
+def _make_phase_row(name: str, start_s: float, duration_ms: float) -> dict[str, str]:
+    end_s = start_s + max(duration_ms, 0.0) / 1000.0
+    return {
+        "row_type": name,
+        "elapsed_s_start": f"{start_s:.6f}",
+        "elapsed_s_end": f"{end_s:.6f}",
+        "rss_kb_start": "",
+        "rss_kb_end": "",
+        "col_a_ms": f"{duration_ms:.3f}",
+        "col_b_ms": "",
+        "total_ms": f"{duration_ms:.3f}",
+        "kv_pos": "",
+        "kv_total": "",
+        "kv_used_pct": "",
+        "kv_estimated_used_kb": "",
+        "kv_total_kb": "",
+        "kv_physical_committed_kb": "",
+        "token_idx": "0",
+    }
+
+
+def _synthetic_standalone_phase_rows(summary: dict[str, object]) -> list[dict[str, str]]:
+    """Build comparable phase rows when upstream llama-mtmd-cli lacks timers."""
+    image_encode_ms = float(summary.get("image_slice_encoded_ms", 0.0) or 0.0)
+    image_prefill_ms = float(summary.get("image_decoded_ms", 0.0) or 0.0)
+    prompt_eval_ms = float(summary.get("prompt_eval_time_ms", 0.0) or 0.0)
+    text_prefill_ms = max(prompt_eval_ms - image_prefill_ms, 0.0)
+    decode_ms = float(summary.get("decode_eval_time_ms", 0.0) or 0.0)
+    phases = [
+        ("V_Encode", image_encode_ms),
+        ("T_Prefill", text_prefill_ms),
+        ("ImagePrefill", image_prefill_ms),
+        ("Decode", decode_ms),
+    ]
+    rows: list[dict[str, str]] = []
+    cursor_s = 0.0
+    for name, duration_ms in phases:
+        if duration_ms <= 0:
+            continue
+        rows.append(_make_phase_row(name, cursor_s, duration_ms))
+        cursor_s += duration_ms / 1000.0
+    return rows
 
 
 def _phase_colors() -> dict[str, str]:
@@ -435,7 +617,7 @@ def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[
     plt.close(fig)
 
 
-def _finalize_outputs(result_dir: Path) -> None:
+def _finalize_hybrid_outputs(result_dir: Path) -> None:
     decode_log = result_dir / "hybrid_decode_stdout.txt"
     if not decode_log.exists():
         decode_log = result_dir / "hybrid_decode_opencl_stdout.txt"
@@ -509,6 +691,7 @@ def _finalize_outputs(result_dir: Path) -> None:
         ],
         ["metric", "value", "unit"],
     )
+    _write_memory_usage_txt(result_dir, memory_rows)
     _write_png_memory_timeline(result_dir, memory_rows, plot_phase_rows)
     if plot_phase_rows:
         _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
@@ -516,101 +699,175 @@ def _finalize_outputs(result_dir: Path) -> None:
         _write_png_phase_duration(result_dir, perf)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run split-process ExecuTorch-QNN vision + llama.cpp decoder bridge on Android.")
-    parser.add_argument("--serial", default=None)
-    parser.add_argument("--manifest", type=Path, required=True, help="Foundation QNN manifest with vision_encoder_pte.")
-    parser.add_argument("--vision-build-dir", type=Path, required=True, help="CMake build dir containing hybrid_vision_dump.")
-    parser.add_argument(
-        "--executorch-build-dir",
-        type=Path,
-        default=WORKSPACE / "executorch" / "build-android-unified",
-        help="ExecuTorch Android build dir containing QNN runtime libraries.",
-    )
-    parser.add_argument("--llama-build-dir", type=Path, required=True, help="CMake build dir containing hybrid_decode and llama libs.")
-    parser.add_argument("--model", type=Path, required=True, help="Text GGUF model.")
-    parser.add_argument("--mmproj", type=Path, required=True, help="llama.cpp mmproj GGUF, used only for token layout.")
-    parser.add_argument("--image", type=Path, default=FOUNDATION_LLAMA / "sample_coco_cats_448.jpg")
-    parser.add_argument("--prompt", default="Describe this image.")
-    parser.add_argument("--n-predict", type=int, default=32)
-    parser.add_argument("--ctx-size", type=int, default=32768)
-    parser.add_argument("--batch-size", type=int, default=2048)
-    parser.add_argument("--ubatch-size", type=int, default=512)
-    parser.add_argument("--gpu-layers", type=int, default=99)
-    parser.add_argument("--device", default=None, help="llama.cpp device, e.g. Adreno(TM) 750.")
-    parser.add_argument(
-        "--opencl-lib",
-        type=Path,
-        default=WORKSPACE / "third_party" / "OpenCL-ICD-Loader" / "build-android" / "libOpenCL.so",
-    )
-    parser.add_argument(
-        "--push-opencl-loader",
-        action="store_true",
-        help="Push local libOpenCL.so. Disabled by default because the system Qualcomm OpenCL loader works better on the tested device.",
-    )
-    parser.add_argument("--soc-model", default="SM8750")
-    parser.add_argument("--remote-root", default="/data/local/tmp/streamingvlm_hybrid_bridge")
-    parser.add_argument("--results-root", type=Path, default=FOUNDATION_LLAMA / "results" / "log" / "hybrid_bridge")
-    parser.add_argument("--sample-interval", type=float, default=0.05, help="Android /proc/meminfo sampling interval in seconds.")
-    parser.add_argument("--force-push", action="store_true")
-    args = parser.parse_args()
+def _finalize_standalone_outputs(result_dir: Path, *, processor: str, return_code: str, prompt: str = "Describe this image briefly.") -> None:
+    output_path = result_dir / "foundation_output.txt"
+    if not output_path.exists():
+        return
+    log_text = output_path.read_text(encoding="utf-8", errors="replace")
+    _write_fallback_token_io_txt(result_dir, prompt, log_text)
+    summary = _parse_log_summary(log_text)
+    memory_rows = []
+    memory_path = result_dir / "android_memory_timeline.csv"
+    if memory_path.exists():
+        memory_rows = _read_csv_dicts(memory_path)
+    wall_s = max([float(row.get("elapsed_s", "0") or 0) for row in memory_rows] or [0.0])
 
-    qnn_sdk = os.environ.get("QNN_SDK_ROOT")
-    if not qnn_sdk:
-        raise SystemExit("QNN_SDK_ROOT is required for the ExecuTorch QNN vision process.")
-
-    adb = _adb(args.serial)
-    if args.force_push:
-        _run(adb + ["shell", "rm", "-rf", args.remote_root])
-    _run(adb + ["shell", "mkdir", "-p", args.remote_root])
-
-    manifest = _load_manifest(args.manifest)
-    encoder_pte = Path(manifest["paths"]["vision_encoder_pte"])
-    executorch_build_dir = args.executorch_build_dir
-
-    vision_bin = args.vision_build_dir / "hybrid_vision_dump"
-    if not vision_bin.exists():
-        vision_bin = args.vision_build_dir / "bin" / "hybrid_vision_dump"
-    decode_bin = args.llama_build_dir / "hybrid_decode"
-    if not decode_bin.exists():
-        decode_bin = args.llama_build_dir / "bin" / "hybrid_decode"
-    if not vision_bin.exists() or not decode_bin.exists():
-        raise SystemExit("Missing hybrid_vision_dump or hybrid_decode. Build hybrid_bridge first.")
-
-    with tempfile.TemporaryDirectory(prefix="streamingvlm_hybrid_") as tmp:
-        frame_bin, layout_image = _prepare_inputs(args.image, Path(tmp))
-        for local in (vision_bin, decode_bin, encoder_pte, args.model, args.mmproj, frame_bin, layout_image):
-            _push(adb, local, args.remote_root)
-        _push_qnn_libs(adb, args.remote_root, Path(qnn_sdk), executorch_build_dir, args.soc_model)
-        _push_llama_runtime(
-            adb,
-            args.remote_root,
-            args.llama_build_dir,
-            args.opencl_lib,
-            args.push_opencl_loader,
+    summary_rows: list[dict[str, object]] = [
+        {"metric": "backend", "value": "llamacpp_cpu" if processor == "cpu" else "llamacpp_opencl", "unit": ""},
+        {"metric": "model_name", "value": result_dir.name, "unit": ""},
+        {"metric": "wall_time_s", "value": round(wall_s, 3), "unit": "s"},
+        {"metric": "return_code", "value": return_code, "unit": ""},
+    ]
+    for key, value in summary.items():
+        unit = (
+            "ms" if key.endswith("_ms")
+            else "MiB" if key.endswith("_mib")
+            else "tok/s" if key.endswith("_tok_s")
+            else "tokens" if "tokens" in key
+            else "runs" if "runs" in key
+            else ""
         )
-        _run(adb + ["shell", f"chmod +x {shlex.quote(args.remote_root)}/hybrid_vision_dump {shlex.quote(args.remote_root)}/hybrid_decode"])
+        summary_rows.append({"metric": key, "value": value, "unit": unit})
+    _write_csv(result_dir / "foundation_summary.csv", summary_rows, ["metric", "value", "unit"])
 
-    result_dir = args.results_root / args.model.stem
-    result_dir.mkdir(parents=True, exist_ok=True)
+    phase_rows = _read_phase_rows(result_dir / "foundation_phase_stats.csv")
+    phase_rows_are_synthetic = False
+    if not phase_rows:
+        phase_rows = _synthetic_standalone_phase_rows(summary)
+        phase_rows_are_synthetic = bool(phase_rows)
+    if phase_rows:
+        _write_phase_csv(result_dir / "foundation_proc.csv", phase_rows)
+        plot_phase_rows = _read_phase_rows(result_dir / "foundation_proc.csv")
+    else:
+        _write_csv(result_dir / "foundation_proc.csv", summary_rows, ["metric", "value", "unit"])
+        plot_phase_rows = []
+    # Synthetic CPU rows are summary-derived durations, not wall-clock aligned
+    # timestamps. Do not overlay them on memory timelines.
+    memory_phase_rows = [] if phase_rows_are_synthetic else plot_phase_rows
+    _write_memory_usage_txt(result_dir, memory_rows)
+    _write_png_memory_timeline(result_dir, memory_rows, memory_phase_rows)
+    if plot_phase_rows:
+        _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
+    else:
+        perf = {key: float(value) for key, value in summary.items() if key.endswith("_ms") and isinstance(value, (int, float))}
+        _write_png_phase_duration(result_dir, perf)
+
+
+def _result_model_name(model: Path, processor: str, ctx_size: int) -> str:
+    suffix = "opencl" if processor == "gpu" else processor
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}"
+
+
+def _find_executable(build_dir: Path, name: str) -> Path:
+    for path in (build_dir / name, build_dir / "bin" / name):
+        if path.exists():
+            return path
+    return build_dir / name
+
+
+def _memory_csv_header() -> str:
+    return (
+        "sample_idx,elapsed_s,pid,pid_alive,vmrss_kb,vmsize_kb,vmhwm_kb,"
+        "smaps_rss_kb,smaps_pss_kb,smaps_private_dirty_kb,smaps_shared_clean_kb,"
+        "mem_available_kb,cached_kb,dma_heap_pool_kb,gpu_total_kb,kgsl_shmem_usage_kb"
+    )
+
+
+def _memory_sampling_shell(remote_memory_csv: str, sample_interval: float, live_condition: str, pid_expr: str) -> str:
+    return f"""sample_idx=0
+start_uptime=$(awk '{{print $1; exit}}' /proc/uptime 2>/dev/null)
+while {live_condition}; do
+  elapsed_s=$(awk -v start="${{start_uptime:-0}}" '{{ printf "%.3f", $1 - start }}' /proc/uptime 2>/dev/null)
+  sample_pid={pid_expr}
+  status_file=/proc/"$sample_pid"/status
+  smaps_file=/proc/"$sample_pid"/smaps_rollup
+  vmrss=$(awk '/^VmRSS:/ {{print $2; exit}}' "$status_file" 2>/dev/null)
+  vmsize=$(awk '/^VmSize:/ {{print $2; exit}}' "$status_file" 2>/dev/null)
+  vmhwm=$(awk '/^VmHWM:/ {{print $2; exit}}' "$status_file" 2>/dev/null)
+  smaps_rss=$(awk '/^Rss:/ {{print $2; exit}}' "$smaps_file" 2>/dev/null)
+  smaps_pss=$(awk '/^Pss:/ {{print $2; exit}}' "$smaps_file" 2>/dev/null)
+  smaps_private_dirty=$(awk '/^Private_Dirty:/ {{print $2; exit}}' "$smaps_file" 2>/dev/null)
+  smaps_shared_clean=$(awk '/^Shared_Clean:/ {{print $2; exit}}' "$smaps_file" 2>/dev/null)
+  mem_available=$(awk '/^MemAvailable:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  cached=$(awk '/^Cached:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  dma_heap_pool=$(awk '/^DmaHeapPool:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  gpu_total=$(awk '/^GpuTotal:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  kgsl_shmem_usage=$(awk '/^KgslShmemUsage:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  printf '%s,%s,%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\\n' "$sample_idx" "$elapsed_s" "$sample_pid" "${{vmrss:-0}}" "${{vmsize:-0}}" "${{vmhwm:-0}}" "${{smaps_rss:-0}}" "${{smaps_pss:-0}}" "${{smaps_private_dirty:-0}}" "${{smaps_shared_clean:-0}}" "${{mem_available:-0}}" "${{cached:-0}}" "${{dma_heap_pool:-0}}" "${{gpu_total:-0}}" "${{kgsl_shmem_usage:-0}}" >> {shlex.quote(remote_memory_csv)}
+  sample_idx=$((sample_idx + 1))
+  sleep {sample_interval}
+done"""
+
+
+def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: bool) -> list[str]:
+    selected_gpu_layers = 0 if args.processor == "cpu" else args.gpu_layers
+    selected_device = args.device
+    if selected_device is None and args.processor == "cpu":
+        selected_device = "none"
+    n_predict = args.force_generation or args.n_predict
+    cmd = [
+        "./opencl_phase_mtmd" if use_precise_phases else "./llama-mtmd-cli",
+        "-m",
+        args.model.name,
+        "--mmproj",
+        args.mmproj.name,
+        "--image",
+        args.image.name,
+        "-p",
+        args.prompt,
+        "-n",
+        str(n_predict),
+        "-t",
+        str(args.threads),
+        "--n-gpu-layers",
+        str(selected_gpu_layers),
+        "--ctx-size",
+        str(args.ctx_size),
+        "--batch-size",
+        str(args.batch_size),
+        "--ubatch-size",
+        str(args.ubatch_size),
+        "--temp",
+        str(args.temperature),
+    ]
+    if use_precise_phases:
+        cmd.extend(["--phase-stats-path", "foundation_phase_stats.csv"])
+        cmd.extend(["--token-io-path", "foundation_token_io.txt"])
+        if args.force_generation:
+            cmd.append("--force-generation")
+    elif args.force_generation:
+        cmd.append("--ignore-eos")
+    if selected_device:
+        cmd.extend(["--device", selected_device])
+    return cmd
+
+
+def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, layout_image: Path) -> str:
     prompt = shlex.quote(args.prompt)
     device_arg = f"--device {shlex.quote(args.device)}" if args.device else ""
     remote_memory_csv = f"{args.remote_root}/android_memory_timeline.csv"
-    remote_script = f"{args.remote_root}/run_hybrid_bridge.sh"
-    script_text = f"""#!/system/bin/sh
+    memory_loop = _memory_sampling_shell(
+        remote_memory_csv,
+        args.sample_interval,
+        'kill -0 "$decoder_pid" 2>/dev/null || kill -0 "$vision_pid" 2>/dev/null',
+        '"$decoder_pid"',
+    )
+    return f"""#!/system/bin/sh
 cd {shlex.quote(args.remote_root)} || exit 1
 export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.
 rm -f android_memory_timeline.csv hybrid_vision_stdout.txt hybrid_decode_stdout.txt \\
   vision_output_stats.csv vision_phase_stats.csv decoder_phase_stats.csv \\
+  foundation_token_io.txt \\
   foundation_exit_code.txt vision_exit_code.txt decoder_exit_code.txt \\
   vision_ready.flag decoder_ready.flag start_encode.flag vision_embedding.svlmemb
-printf '%s\\n' 'sample_idx,elapsed_s,pid,pid_alive,vmrss_kb,vmsize_kb,vmhwm_kb,smaps_rss_kb,smaps_pss_kb,smaps_private_dirty_kb,smaps_shared_clean_kb,mem_available_kb,cached_kb,dma_heap_pool_kb,gpu_total_kb,kgsl_shmem_usage_kb' > {shlex.quote(remote_memory_csv)}
+printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
 ./hybrid_decode -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} \\
   --image {shlex.quote(layout_image.name)} --external-embedding vision_embedding.svlmemb \\
   --phase-stats-path decoder_phase_stats.csv --ready-path decoder_ready.flag \\
   --wait-for-embedding --wait-timeout-ms 120000 \\
-  -p {prompt} -n {args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} \\
+  --token-io-path foundation_token_io.txt {('--force-generation' if args.force_generation else '')} \\
+  -p {prompt} -n {args.force_generation or args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} \\
   -ngl {args.gpu_layers} {device_arg} > hybrid_decode_stdout.txt 2>&1 &
 decoder_pid=$!
 
@@ -636,18 +893,7 @@ vision_pid=$!
 ) &
 coordinator_pid=$!
 
-sample_idx=0
-while kill -0 "$decoder_pid" 2>/dev/null || kill -0 "$vision_pid" 2>/dev/null; do
-  elapsed_s=$(awk -v i="$sample_idx" 'BEGIN {{ printf "%.3f", i * {args.sample_interval} }}')
-  mem_available=$(awk '/^MemAvailable:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
-  cached=$(awk '/^Cached:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
-  dma_heap_pool=$(awk '/^DmaHeapPool:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
-  gpu_total=$(awk '/^GpuTotal:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
-  kgsl_shmem_usage=$(awk '/^KgslShmemUsage:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
-  printf '%s,%s,%s,1,0,0,0,0,0,0,0,%s,%s,%s,%s,%s\\n' "$sample_idx" "$elapsed_s" "$decoder_pid" "${{mem_available:-0}}" "${{cached:-0}}" "${{dma_heap_pool:-0}}" "${{gpu_total:-0}}" "${{kgsl_shmem_usage:-0}}" >> {shlex.quote(remote_memory_csv)}
-  sample_idx=$((sample_idx + 1))
-  sleep {args.sample_interval}
-done
+{memory_loop}
 
 wait "$vision_pid"
 vision_rc=$?
@@ -659,37 +905,211 @@ echo "$decoder_rc" > decoder_exit_code.txt
 echo "$decoder_rc" > foundation_exit_code.txt
 exit "$decoder_rc"
 """
-    with tempfile.TemporaryDirectory(prefix="streamingvlm_hybrid_script_") as tmp_script_dir:
-        script_path = Path(tmp_script_dir) / "run_hybrid_bridge.sh"
+
+
+def _build_standalone_remote_script(args: argparse.Namespace, *, use_precise_phases: bool) -> str:
+    remote_memory_csv = f"{args.remote_root}/android_memory_timeline.csv"
+    llm_cmd = _build_standalone_command(args, use_precise_phases=use_precise_phases)
+    memory_loop = _memory_sampling_shell(
+        remote_memory_csv,
+        args.sample_interval,
+        'kill -0 "$runner_pid" 2>/dev/null',
+        '"$runner_pid"',
+    )
+    return f"""#!/system/bin/sh
+cd {shlex.quote(args.remote_root)} || exit 1
+export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.
+rm -f foundation_output.txt foundation_exit_code.txt android_memory_timeline.csv foundation_phase_stats.csv foundation_token_io.txt
+printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
+
+( {_shell_join(llm_cmd)} > foundation_output.txt 2>&1; echo $? > foundation_exit_code.txt ) &
+runner_pid=$!
+
+{memory_loop}
+
+wait "$runner_pid"
+runner_wait_rc=$?
+exit_code=$(cat foundation_exit_code.txt 2>/dev/null)
+exit "${{exit_code:-$runner_wait_rc}}"
+"""
+
+
+def _write_and_run_remote_script(adb: list[str], remote_root: str, script_text: str) -> subprocess.CompletedProcess[str]:
+    remote_script = f"{remote_root}/run_android_processor.sh"
+    with tempfile.TemporaryDirectory(prefix="streamingvlm_android_script_") as tmp_script_dir:
+        script_path = Path(tmp_script_dir) / "run_android_processor.sh"
         script_path.write_text(script_text, encoding="utf-8")
-        _push(adb, script_path, args.remote_root)
+        _push(adb, script_path, remote_root)
     _run(adb + ["shell", f"chmod +x {shlex.quote(remote_script)}"])
-    run_res = subprocess.run(
+    return subprocess.run(
         adb + ["shell", f"sh {shlex.quote(remote_script)}"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
+
+
+def _pull_outputs(adb: list[str], remote_root: str, result_dir: Path, names: tuple[str, ...]) -> None:
+    for name in names:
+        local = result_dir / name
+        local.unlink(missing_ok=True)
+        _pull_if_exists(adb, f"{remote_root}/{name}", local)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run unified llama.cpp / hybrid Android VLM processors.")
+    parser.add_argument("--processor", choices=("cpu", "gpu", "hybrid"), required=True)
+    parser.add_argument("--serial", default=None)
+    parser.add_argument("--manifest", type=Path, default=None, help="Foundation QNN manifest with vision_encoder_pte. Required for --processor hybrid.")
+    parser.add_argument("--vision-build-dir", type=Path, default=None, help="CMake build dir containing hybrid_vision_dump. Defaults to --llama-build-dir.")
+    parser.add_argument(
+        "--executorch-build-dir",
+        type=Path,
+        default=WORKSPACE / "executorch" / "build-android-unified",
+        help="ExecuTorch Android build dir containing QNN runtime libraries.",
+    )
+    parser.add_argument("--llama-build-dir", "--build-dir", dest="llama_build_dir", type=Path, required=True, help="Android build dir containing llama.cpp and overlay binaries.")
+    parser.add_argument("--model", type=Path, required=True, help="Text GGUF model.")
+    parser.add_argument("--mmproj", type=Path, required=True, help="llama.cpp mmproj GGUF.")
+    parser.add_argument("--image", type=Path, default=FOUNDATION_LLAMA / "sample_images" / "golden_gate_bridge_448.jpg")
+    parser.add_argument("--prompt", default="Describe this image briefly.")
+    parser.add_argument("--n-predict", "--max-new-tokens", dest="n_predict", type=int, default=32)
+    parser.add_argument(
+        "--force-generation",
+        "--force_generation",
+        dest="force_generation",
+        type=int,
+        default=None,
+        help="Generate exactly this many tokens by continuing through EOS/EOG where supported.",
+    )
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--ctx-size", type=int, default=32768)
+    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--ubatch-size", type=int, default=512)
+    parser.add_argument("--gpu-layers", "--n-gpu-layers", dest="gpu_layers", type=int, default=99)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--device", default=None, help="llama.cpp device, e.g. GPUOpenCL.")
+    parser.add_argument(
+        "--opencl-lib",
+        type=Path,
+        default=WORKSPACE / "third_party" / "OpenCL-ICD-Loader" / "build-android" / "libOpenCL.so",
+    )
+    parser.add_argument(
+        "--push-opencl-loader",
+        action="store_true",
+        help="Push local libOpenCL.so. Disabled by default because the system Qualcomm OpenCL loader works better on the tested device.",
+    )
+    parser.add_argument("--soc-model", default="SM8750")
+    parser.add_argument("--remote-root", "--device-workdir", dest="remote_root", default="/data/local/tmp/streamingvlm_vlm")
+    parser.add_argument("--results-root", type=Path, default=FOUNDATION_LLAMA / "results" / "log")
+    parser.add_argument("--sample-interval", type=float, default=0.05, help="Android /proc/meminfo sampling interval in seconds.")
+    parser.add_argument("--force-push", action="store_true", help="Clear the remote workdir before pushing.")
+    parser.add_argument("--model-push", "--model_push", dest="model_push", action="store_true", help="Force pushing model files even if they already exist on device.")
+    args = parser.parse_args()
+
+    args.remote_root = args.remote_root.rstrip("/")
+    args.model = args.model.resolve()
+    args.mmproj = args.mmproj.resolve()
+    args.image = args.image.resolve()
+    args.llama_build_dir = args.llama_build_dir.resolve()
+    if args.vision_build_dir is None:
+        args.vision_build_dir = args.llama_build_dir
+    else:
+        args.vision_build_dir = args.vision_build_dir.resolve()
+
+    for required in (args.llama_build_dir, args.model, args.mmproj, args.image):
+        if not required.exists():
+            raise SystemExit(f"Missing required path: {required}")
+    if args.processor == "hybrid" and args.manifest is None:
+        raise SystemExit("--manifest is required when --processor hybrid.")
+
+    qnn_sdk = os.environ.get("QNN_SDK_ROOT")
+    if args.processor == "hybrid" and not qnn_sdk:
+        raise SystemExit("QNN_SDK_ROOT is required when --processor hybrid.")
+
+    adb = _adb(args.serial)
+    if args.force_push:
+        _run(adb + ["shell", "rm", "-rf", args.remote_root])
+    _run(adb + ["shell", "mkdir", "-p", args.remote_root])
+
+    result_dir = args.results_root / _result_model_name(args.model, args.processor, args.ctx_size)
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    _push_llama_runtime(
+        adb,
+        args.remote_root,
+        args.llama_build_dir,
+        args.opencl_lib,
+        args.push_opencl_loader,
+    )
+    _push_model_cached(adb, args.model, args.remote_root, force=args.model_push)
+    _push_model_cached(adb, args.mmproj, args.remote_root, force=args.model_push)
+    _push(adb, args.image, args.remote_root)
+
+    encoder_pte: Path | None = None
+    with tempfile.TemporaryDirectory(prefix="streamingvlm_android_inputs_") as tmp:
+        layout_image = args.image
+        if args.processor == "hybrid":
+            manifest = _load_manifest(args.manifest.resolve())
+            encoder_pte = Path(manifest["paths"]["vision_encoder_pte"])
+            vision_bin = _find_executable(args.vision_build_dir, "hybrid_vision_dump")
+            decode_bin = _find_executable(args.llama_build_dir, "hybrid_decode")
+            if not vision_bin.exists() or not decode_bin.exists():
+                raise SystemExit("Missing hybrid_vision_dump or hybrid_decode. Build hybrid_bridge first.")
+            frame_bin, layout_image = _prepare_inputs(args.image, Path(tmp))
+            _push(adb, vision_bin, args.remote_root)
+            _push(adb, decode_bin, args.remote_root)
+            _push_model_cached(adb, encoder_pte, args.remote_root, force=args.model_push)
+            _push(adb, frame_bin, args.remote_root)
+            if layout_image.resolve() != args.image.resolve():
+                _push(adb, layout_image, args.remote_root)
+            _push_qnn_libs(adb, args.remote_root, Path(qnn_sdk), args.executorch_build_dir, args.soc_model)
+            _run(adb + ["shell", f"chmod +x {shlex.quote(args.remote_root)}/hybrid_vision_dump {shlex.quote(args.remote_root)}/hybrid_decode"])
+            script_text = _build_hybrid_remote_script(args, encoder_pte=encoder_pte, layout_image=layout_image)
+            pull_names = (
+                "hybrid_vision_stdout.txt",
+                "hybrid_decode_stdout.txt",
+                "vision_output_stats.csv",
+                "vision_phase_stats.csv",
+                "decoder_phase_stats.csv",
+                "foundation_token_io.txt",
+                "vision_embedding.svlmemb",
+                "foundation_exit_code.txt",
+                "vision_exit_code.txt",
+                "decoder_exit_code.txt",
+                "android_memory_timeline.csv",
+            )
+        else:
+            llama_cli = _find_executable(args.llama_build_dir, "llama-mtmd-cli")
+            use_precise_phases = args.processor == "gpu" and _find_executable(args.llama_build_dir, "opencl_phase_mtmd").exists()
+            if not use_precise_phases and not llama_cli.exists():
+                raise SystemExit("Missing llama-mtmd-cli. Build llama.cpp first.")
+            chmod_targets = "llama-mtmd-cli"
+            if use_precise_phases:
+                chmod_targets += " opencl_phase_mtmd"
+            _run(adb + ["shell", f"cd {shlex.quote(args.remote_root)} && chmod +x {chmod_targets} 2>/dev/null || true"])
+            script_text = _build_standalone_remote_script(args, use_precise_phases=use_precise_phases)
+            pull_names = (
+                "foundation_output.txt",
+                "foundation_exit_code.txt",
+                "foundation_phase_stats.csv",
+                "foundation_token_io.txt",
+                "android_memory_timeline.csv",
+            )
+
+        run_res = _write_and_run_remote_script(adb, args.remote_root, script_text)
+
     (result_dir / "host_adb_output.txt").write_text(run_res.stdout, encoding="utf-8")
-    for name in (
-        "hybrid_vision_stdout.txt",
-        "hybrid_decode_stdout.txt",
-        "vision_output_stats.csv",
-        "vision_phase_stats.csv",
-        "decoder_phase_stats.csv",
-        "vision_embedding.svlmemb",
-        "foundation_exit_code.txt",
-        "vision_exit_code.txt",
-        "decoder_exit_code.txt",
-        "android_memory_timeline.csv",
-    ):
-        _pull_if_exists(adb, f"{args.remote_root}/{name}", result_dir / name)
+    _pull_outputs(adb, args.remote_root, result_dir, pull_names)
     if not (result_dir / "foundation_exit_code.txt").exists():
         (result_dir / "foundation_exit_code.txt").write_text(str(run_res.returncode), encoding="utf-8")
-    _finalize_outputs(result_dir)
-    # Keep the result directory aligned with the other foundation runners:
-    # foundation_output.txt is the canonical decoder stdout.
-    (result_dir / "hybrid_decode_stdout.txt").unlink(missing_ok=True)
+    return_code = (result_dir / "foundation_exit_code.txt").read_text(encoding="utf-8").strip()
+
+    if args.processor == "hybrid":
+        _finalize_hybrid_outputs(result_dir)
+        (result_dir / "hybrid_decode_stdout.txt").unlink(missing_ok=True)
+    else:
+        _finalize_standalone_outputs(result_dir, processor=args.processor, return_code=return_code, prompt=args.prompt)
     return run_res.returncode
 
 
