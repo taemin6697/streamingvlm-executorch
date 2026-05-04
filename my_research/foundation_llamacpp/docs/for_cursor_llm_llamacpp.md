@@ -421,6 +421,44 @@ follow_up:
   `InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768`. Renamed the current CPU,
   OpenCL, and Hybrid result folders from the old names to the new
   `_ctx_32768` names and updated `docs/README.md` expected output paths.
+- 2026-05-04: Improved system-wide memory usage measurement with a pre-run
+  baseline window. `run_android_hybrid_bridge.py` now samples `MemAvailable`
+  for `--baseline-window` seconds before launching the backend process
+  (default `5.0`), writes those samples to `android_memory_timeline.csv` with
+  negative `elapsed_s` values, and computes `memory_usage_summary.txt` as
+  `baseline_avg_mem_available_kb - runtime_min_mem_available_kb`. The summary
+  still includes legacy start-minus-runtime-min fields for comparison. This is
+  the preferred metric when the goal is "how much did system-wide available
+  memory actually drop during the run?" Existing results created before this
+  patch do not contain baseline samples and should be regenerated for the new
+  metric.
+- 2026-05-04: Updated the three active `docs/README.md` run templates (CPU,
+  OpenCL GPU, Hybrid) to pass `--baseline-window 5.0` explicitly. The runner
+  already defaults to 5 seconds, but keeping the argument in the copy/paste
+  commands makes the baseline memory policy obvious and prevents future command
+  drift.
+- 2026-05-04: `run_android_hybrid_bridge.py` accepts `--cache-type-k` /
+  `--cache-type-v` (upstream llama.cpp names) and forwards them to GPU
+  `opencl_phase_mtmd`, Hybrid `hybrid_decode`, and CPU `llama-mtmd-cli`.
+  Optional helper `_cache_type_shell_suffix` appends them to the remote hybrid
+  shell script. OpenCL GPU section in `docs/README.md` documents `q8_0` for 8-bit
+  KV and points to `llama_kv_cache` lines in `foundation_output.txt`.
+- 2026-05-04: `run_android_hybrid_bridge.py` accepts optional `--fit on|off` and
+  forwards `--fit ...` to standalone GPU/CPU (`opencl_phase_mtmd` /
+  `llama-mtmd-cli`) and Hybrid `hybrid_decode` (`_fit_shell_suffix`). Default is
+  to omit the flag (binary default). Use `--fit off` when `common_fit_params`
+  triggers OpenCL `SET_ROWS` on KV views (abort during init).
+- 2026-05-04: OpenCL GPU command block in `docs/README.md` includes `--fit off`
+  after q8 KV flags, plus a sentence on using it when OpenCL init aborts during
+  `common_fit_params`.
+- 2026-05-04: Added `scripts/run_opencl_ctx_sweep.sh`: loops ctx sizes
+  512..32768 with README-aligned OpenCL 8B command; scales `--batch-size` /
+  `--ubatch-size` down when `ctx < 2048`; collects failures and exits non-zero.
+- 2026-05-04: `run_android_hybrid_bridge.py` forwards llama.cpp RoPE/YaRN flags:
+  `--rope-scaling`, `--rope-scale`, `--rope-freq-base`, `--rope-freq-scale`,
+  `--yarn-orig-ctx`, `--yarn-ext-factor`, `--yarn-attn-factor`, `--yarn-beta-slow`,
+  `--yarn-beta-fast` to GPU/CPU binaries and Hybrid `hybrid_decode`
+  (`_rope_shell_suffix`). README OpenCL section documents HF YaRN mapping example.
 
 Suggested note format:
 

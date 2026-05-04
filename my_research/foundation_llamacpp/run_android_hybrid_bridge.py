@@ -178,7 +178,7 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str])
 
 
 def _write_memory_usage_txt(output_dir: Path, rows: list[dict[str, str]]) -> None:
-    usable: list[tuple[int, float, int]] = []
+    usable: list[tuple[int, float, int, int]] = []
     for idx, row in enumerate(rows):
         raw_mem = (row.get("mem_available_kb") or "").strip()
         if not raw_mem:
@@ -186,28 +186,56 @@ def _write_memory_usage_txt(output_dir: Path, rows: list[dict[str, str]]) -> Non
         try:
             mem_available_kb = int(float(raw_mem))
             elapsed_s = float(row.get("elapsed_s") or 0.0)
+            pid_alive = int(float(row.get("pid_alive") or 0))
         except ValueError:
             continue
-        usable.append((idx, elapsed_s, mem_available_kb))
+        usable.append((idx, elapsed_s, mem_available_kb, pid_alive))
     if not usable:
         return
 
-    start_idx, start_elapsed_s, start_kb = usable[0]
-    min_idx, min_elapsed_s, min_kb = min(usable, key=lambda item: item[2])
-    used_kb = max(start_kb - min_kb, 0)
+    start_idx, start_elapsed_s, start_kb, _ = usable[0]
+    baseline = [item for item in usable if item[3] == 0]
+    runtime = [item for item in usable if item[3] == 1] or [item for item in usable if item[1] >= 0.0] or usable
+    min_idx, min_elapsed_s, min_kb, _ = min(runtime, key=lambda item: item[2])
+    used_from_start_kb = max(start_kb - min_kb, 0)
+    if baseline:
+        baseline_avg_kb = sum(item[2] for item in baseline) / len(baseline)
+        baseline_min_idx, baseline_min_elapsed_s, baseline_min_kb, _ = min(baseline, key=lambda item: item[2])
+        baseline_max_idx, baseline_max_elapsed_s, baseline_max_kb, _ = max(baseline, key=lambda item: item[2])
+    else:
+        baseline_avg_kb = float(start_kb)
+        baseline_min_idx, baseline_min_elapsed_s, baseline_min_kb = start_idx, start_elapsed_s, start_kb
+        baseline_max_idx, baseline_max_elapsed_s, baseline_max_kb = start_idx, start_elapsed_s, start_kb
+    used_from_baseline_avg_kb = max(baseline_avg_kb - min_kb, 0.0)
+    used_from_baseline_max_kb = max(float(baseline_max_kb - min_kb), 0.0)
     text = "\n".join(
         [
-            "memory_usage_method: MemAvailable_start_kb - MemAvailable_min_kb",
+            "memory_usage_method: baseline_avg_mem_available_kb - runtime_min_mem_available_kb",
+            f"baseline_sample_count: {len(baseline)}",
+            f"baseline_avg_mem_available_kb: {baseline_avg_kb:.3f}",
+            f"baseline_avg_mem_available_mib: {baseline_avg_kb / 1024.0:.3f}",
+            f"baseline_min_sample_idx: {baseline_min_idx}",
+            f"baseline_min_elapsed_s: {baseline_min_elapsed_s:.3f}",
+            f"baseline_min_mem_available_kb: {baseline_min_kb}",
+            f"baseline_min_mem_available_mib: {baseline_min_kb / 1024.0:.3f}",
+            f"baseline_max_sample_idx: {baseline_max_idx}",
+            f"baseline_max_elapsed_s: {baseline_max_elapsed_s:.3f}",
+            f"baseline_max_mem_available_kb: {baseline_max_kb}",
+            f"baseline_max_mem_available_mib: {baseline_max_kb / 1024.0:.3f}",
             f"start_sample_idx: {start_idx}",
             f"start_elapsed_s: {start_elapsed_s:.3f}",
             f"start_mem_available_kb: {start_kb}",
             f"start_mem_available_mib: {start_kb / 1024.0:.3f}",
-            f"min_sample_idx: {min_idx}",
-            f"min_elapsed_s: {min_elapsed_s:.3f}",
-            f"min_mem_available_kb: {min_kb}",
-            f"min_mem_available_mib: {min_kb / 1024.0:.3f}",
-            f"actual_memory_used_kb: {used_kb}",
-            f"actual_memory_used_mib: {used_kb / 1024.0:.3f}",
+            f"runtime_min_sample_idx: {min_idx}",
+            f"runtime_min_elapsed_s: {min_elapsed_s:.3f}",
+            f"runtime_min_mem_available_kb: {min_kb}",
+            f"runtime_min_mem_available_mib: {min_kb / 1024.0:.3f}",
+            f"actual_memory_used_from_baseline_avg_kb: {used_from_baseline_avg_kb:.3f}",
+            f"actual_memory_used_from_baseline_avg_mib: {used_from_baseline_avg_kb / 1024.0:.3f}",
+            f"actual_memory_used_from_baseline_max_kb: {used_from_baseline_max_kb:.3f}",
+            f"actual_memory_used_from_baseline_max_mib: {used_from_baseline_max_kb / 1024.0:.3f}",
+            f"legacy_start_minus_runtime_min_kb: {used_from_start_kb}",
+            f"legacy_start_minus_runtime_min_mib: {used_from_start_kb / 1024.0:.3f}",
             "",
         ]
     )
@@ -773,6 +801,29 @@ def _memory_csv_header() -> str:
     )
 
 
+def _baseline_sampling_shell(remote_memory_csv: str, sample_interval: float, baseline_window_s: float) -> str:
+    if baseline_window_s <= 0:
+        return ":"
+    return f"""baseline_start_uptime=$(awk '{{print $1; exit}}' /proc/uptime 2>/dev/null)
+baseline_idx=0
+while true; do
+  now_uptime=$(awk '{{print $1; exit}}' /proc/uptime 2>/dev/null)
+  elapsed_s=$(awk -v now="${{now_uptime:-0}}" -v start="${{baseline_start_uptime:-0}}" -v window="{baseline_window_s}" 'BEGIN {{ e = now - start - window; if (e > 0) e = 0; printf "%.3f", e }}')
+  mem_available=$(awk '/^MemAvailable:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  cached=$(awk '/^Cached:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  dma_heap_pool=$(awk '/^DmaHeapPool:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  gpu_total=$(awk '/^GpuTotal:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  kgsl_shmem_usage=$(awk '/^KgslShmemUsage:/ {{print $2; exit}}' /proc/meminfo 2>/dev/null)
+  printf '%s,%s,0,0,0,0,0,0,0,0,0,%s,%s,%s,%s,%s\\n' "$baseline_idx" "$elapsed_s" "${{mem_available:-0}}" "${{cached:-0}}" "${{dma_heap_pool:-0}}" "${{gpu_total:-0}}" "${{kgsl_shmem_usage:-0}}" >> {shlex.quote(remote_memory_csv)}
+  done_flag=$(awk -v now="${{now_uptime:-0}}" -v start="${{baseline_start_uptime:-0}}" -v window="{baseline_window_s}" 'BEGIN {{ print ((now - start) >= window) ? 1 : 0 }}')
+  if [ "$done_flag" = "1" ]; then
+    break
+  fi
+  baseline_idx=$((baseline_idx + 1))
+  sleep {sample_interval}
+done"""
+
+
 def _memory_sampling_shell(remote_memory_csv: str, sample_interval: float, live_condition: str, pid_expr: str) -> str:
     return f"""sample_idx=0
 start_uptime=$(awk '{{print $1; exit}}' /proc/uptime 2>/dev/null)
@@ -797,6 +848,53 @@ while {live_condition}; do
   sample_idx=$((sample_idx + 1))
   sleep {sample_interval}
 done"""
+
+
+def _extend_llama_rope_cli(cmd: list[str], args: argparse.Namespace) -> None:
+    """Passthrough llama.cpp RoPE / YaRN flags (common_params)."""
+    rs = getattr(args, "rope_scaling", None)
+    if rs:
+        cmd.extend(["--rope-scaling", rs])
+    if getattr(args, "rope_scale", None) is not None:
+        cmd.extend(["--rope-scale", str(args.rope_scale)])
+    if getattr(args, "rope_freq_base", None) is not None:
+        cmd.extend(["--rope-freq-base", str(args.rope_freq_base)])
+    if getattr(args, "rope_freq_scale", None) is not None:
+        cmd.extend(["--rope-freq-scale", str(args.rope_freq_scale)])
+    if getattr(args, "yarn_orig_ctx", None) is not None:
+        cmd.extend(["--yarn-orig-ctx", str(args.yarn_orig_ctx)])
+    if getattr(args, "yarn_ext_factor", None) is not None:
+        cmd.extend(["--yarn-ext-factor", str(args.yarn_ext_factor)])
+    if getattr(args, "yarn_attn_factor", None) is not None:
+        cmd.extend(["--yarn-attn-factor", str(args.yarn_attn_factor)])
+    if getattr(args, "yarn_beta_slow", None) is not None:
+        cmd.extend(["--yarn-beta-slow", str(args.yarn_beta_slow)])
+    if getattr(args, "yarn_beta_fast", None) is not None:
+        cmd.extend(["--yarn-beta-fast", str(args.yarn_beta_fast)])
+
+
+def _rope_shell_suffix(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    rs = getattr(args, "rope_scaling", None)
+    if rs:
+        parts.append(f"--rope-scaling {shlex.quote(rs)}")
+    if getattr(args, "rope_scale", None) is not None:
+        parts.append(f"--rope-scale {shlex.quote(str(args.rope_scale))}")
+    if getattr(args, "rope_freq_base", None) is not None:
+        parts.append(f"--rope-freq-base {shlex.quote(str(args.rope_freq_base))}")
+    if getattr(args, "rope_freq_scale", None) is not None:
+        parts.append(f"--rope-freq-scale {shlex.quote(str(args.rope_freq_scale))}")
+    if getattr(args, "yarn_orig_ctx", None) is not None:
+        parts.append(f"--yarn-orig-ctx {shlex.quote(str(args.yarn_orig_ctx))}")
+    if getattr(args, "yarn_ext_factor", None) is not None:
+        parts.append(f"--yarn-ext-factor {shlex.quote(str(args.yarn_ext_factor))}")
+    if getattr(args, "yarn_attn_factor", None) is not None:
+        parts.append(f"--yarn-attn-factor {shlex.quote(str(args.yarn_attn_factor))}")
+    if getattr(args, "yarn_beta_slow", None) is not None:
+        parts.append(f"--yarn-beta-slow {shlex.quote(str(args.yarn_beta_slow))}")
+    if getattr(args, "yarn_beta_fast", None) is not None:
+        parts.append(f"--yarn-beta-fast {shlex.quote(str(args.yarn_beta_fast))}")
+    return (" " + " ".join(parts)) if parts else ""
 
 
 def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: bool) -> list[str]:
@@ -839,19 +937,45 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
         cmd.append("--ignore-eos")
     if selected_device:
         cmd.extend(["--device", selected_device])
+    if getattr(args, "cache_type_k", None):
+        cmd.extend(["--cache-type-k", args.cache_type_k])
+    if getattr(args, "cache_type_v", None):
+        cmd.extend(["--cache-type-v", args.cache_type_v])
+    if getattr(args, "fit", None) is not None:
+        cmd.extend(["--fit", args.fit])
+    _extend_llama_rope_cli(cmd, args)
     return cmd
+
+
+def _cache_type_shell_suffix(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    if getattr(args, "cache_type_k", None):
+        parts.append(f"--cache-type-k {shlex.quote(args.cache_type_k)}")
+    if getattr(args, "cache_type_v", None):
+        parts.append(f"--cache-type-v {shlex.quote(args.cache_type_v)}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _fit_shell_suffix(args: argparse.Namespace) -> str:
+    if getattr(args, "fit", None) is None:
+        return ""
+    return f" --fit {args.fit}"
 
 
 def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, layout_image: Path) -> str:
     prompt = shlex.quote(args.prompt)
     device_arg = f"--device {shlex.quote(args.device)}" if args.device else ""
     remote_memory_csv = f"{args.remote_root}/android_memory_timeline.csv"
+    baseline_loop = _baseline_sampling_shell(remote_memory_csv, args.sample_interval, args.baseline_window)
     memory_loop = _memory_sampling_shell(
         remote_memory_csv,
         args.sample_interval,
         'kill -0 "$decoder_pid" 2>/dev/null || kill -0 "$vision_pid" 2>/dev/null',
         '"$decoder_pid"',
     )
+    cache_suffix = _cache_type_shell_suffix(args)
+    fit_suffix = _fit_shell_suffix(args)
+    rope_suffix = _rope_shell_suffix(args)
     return f"""#!/system/bin/sh
 cd {shlex.quote(args.remote_root)} || exit 1
 export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.
@@ -862,13 +986,15 @@ rm -f android_memory_timeline.csv hybrid_vision_stdout.txt hybrid_decode_stdout.
   vision_ready.flag decoder_ready.flag start_encode.flag vision_embedding.svlmemb
 printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
+{baseline_loop}
+
 ./hybrid_decode -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} \\
   --image {shlex.quote(layout_image.name)} --external-embedding vision_embedding.svlmemb \\
   --phase-stats-path decoder_phase_stats.csv --ready-path decoder_ready.flag \\
   --wait-for-embedding --wait-timeout-ms 120000 \\
   --token-io-path foundation_token_io.txt {('--force-generation' if args.force_generation else '')} \\
   -p {prompt} -n {args.force_generation or args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} \\
-  -ngl {args.gpu_layers} {device_arg} > hybrid_decode_stdout.txt 2>&1 &
+  -ngl {args.gpu_layers} {device_arg}{cache_suffix}{fit_suffix}{rope_suffix} > hybrid_decode_stdout.txt 2>&1 &
 decoder_pid=$!
 
 ./hybrid_vision_dump --encoder_path={shlex.quote(encoder_pte.name)} \\
@@ -910,6 +1036,7 @@ exit "$decoder_rc"
 def _build_standalone_remote_script(args: argparse.Namespace, *, use_precise_phases: bool) -> str:
     remote_memory_csv = f"{args.remote_root}/android_memory_timeline.csv"
     llm_cmd = _build_standalone_command(args, use_precise_phases=use_precise_phases)
+    baseline_loop = _baseline_sampling_shell(remote_memory_csv, args.sample_interval, args.baseline_window)
     memory_loop = _memory_sampling_shell(
         remote_memory_csv,
         args.sample_interval,
@@ -921,6 +1048,8 @@ cd {shlex.quote(args.remote_root)} || exit 1
 export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.
 rm -f foundation_output.txt foundation_exit_code.txt android_memory_timeline.csv foundation_phase_stats.csv foundation_token_io.txt
 printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
+
+{baseline_loop}
 
 ( {_shell_join(llm_cmd)} > foundation_output.txt 2>&1; echo $? > foundation_exit_code.txt ) &
 runner_pid=$!
@@ -990,6 +1119,99 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--device", default=None, help="llama.cpp device, e.g. GPUOpenCL.")
     parser.add_argument(
+        "--cache-type-k",
+        "--cache_type_k",
+        dest="cache_type_k",
+        default=None,
+        metavar="TYPE",
+        help="KV-cache dtype for K (llama.cpp --cache-type-k), e.g. q8_0. GPU/Hybrid: opencl_phase_mtmd / hybrid_decode; CPU: llama-mtmd-cli.",
+    )
+    parser.add_argument(
+        "--cache-type-v",
+        "--cache_type_v",
+        dest="cache_type_v",
+        default=None,
+        metavar="TYPE",
+        help="KV-cache dtype for V (llama.cpp --cache-type-v), e.g. q8_0.",
+    )
+    parser.add_argument(
+        "--fit",
+        choices=("on", "off"),
+        default=None,
+        help="llama.cpp memory fit (passthrough --fit). Omit by default; use off to skip common_fit_params (OpenCL SET_ROWS abort workaround).",
+    )
+    parser.add_argument(
+        "--rope-scaling",
+        choices=("none", "linear", "yarn"),
+        default=None,
+        dest="rope_scaling",
+        help="llama.cpp --rope-scaling (HF rope_scaling.rope_type yarn -> yarn).",
+    )
+    parser.add_argument(
+        "--rope-scale",
+        type=float,
+        default=None,
+        dest="rope_scale",
+        metavar="N",
+        help="llama.cpp --rope-scale (HF YaRN factor maps here when extending context).",
+    )
+    parser.add_argument(
+        "--rope-freq-base",
+        type=float,
+        default=None,
+        dest="rope_freq_base",
+        metavar="N",
+        help="llama.cpp --rope-freq-base.",
+    )
+    parser.add_argument(
+        "--rope-freq-scale",
+        type=float,
+        default=None,
+        dest="rope_freq_scale",
+        metavar="N",
+        help="llama.cpp --rope-freq-scale.",
+    )
+    parser.add_argument(
+        "--yarn-orig-ctx",
+        type=int,
+        default=None,
+        dest="yarn_orig_ctx",
+        metavar="N",
+        help="llama.cpp --yarn-orig-ctx (HF original_max_position_embeddings).",
+    )
+    parser.add_argument(
+        "--yarn-ext-factor",
+        type=float,
+        default=None,
+        dest="yarn_ext_factor",
+        metavar="N",
+        help="llama.cpp --yarn-ext-factor.",
+    )
+    parser.add_argument(
+        "--yarn-attn-factor",
+        type=float,
+        default=None,
+        dest="yarn_attn_factor",
+        metavar="N",
+        help="llama.cpp --yarn-attn-factor.",
+    )
+    parser.add_argument(
+        "--yarn-beta-slow",
+        type=float,
+        default=None,
+        dest="yarn_beta_slow",
+        metavar="N",
+        help="llama.cpp --yarn-beta-slow.",
+    )
+    parser.add_argument(
+        "--yarn-beta-fast",
+        type=float,
+        default=None,
+        dest="yarn_beta_fast",
+        metavar="N",
+        help="llama.cpp --yarn-beta-fast.",
+    )
+    parser.add_argument(
         "--opencl-lib",
         type=Path,
         default=WORKSPACE / "third_party" / "OpenCL-ICD-Loader" / "build-android" / "libOpenCL.so",
@@ -1003,11 +1225,20 @@ def main() -> int:
     parser.add_argument("--remote-root", "--device-workdir", dest="remote_root", default="/data/local/tmp/streamingvlm_vlm")
     parser.add_argument("--results-root", type=Path, default=FOUNDATION_LLAMA / "results" / "log")
     parser.add_argument("--sample-interval", type=float, default=0.05, help="Android /proc/meminfo sampling interval in seconds.")
+    parser.add_argument(
+        "--baseline-window",
+        "--baseline_window",
+        dest="baseline_window",
+        type=float,
+        default=5.0,
+        help="Seconds of pre-run MemAvailable samples to average for memory_usage_summary.txt.",
+    )
     parser.add_argument("--force-push", action="store_true", help="Clear the remote workdir before pushing.")
     parser.add_argument("--model-push", "--model_push", dest="model_push", action="store_true", help="Force pushing model files even if they already exist on device.")
     args = parser.parse_args()
 
     args.remote_root = args.remote_root.rstrip("/")
+    args.baseline_window = max(args.baseline_window, 0.0)
     args.model = args.model.resolve()
     args.mmproj = args.mmproj.resolve()
     args.image = args.image.resolve()
