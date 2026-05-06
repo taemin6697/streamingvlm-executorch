@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -40,6 +41,94 @@ def _normalize_qnn_quant(name: str | None, *, component: str) -> str:
             f"Supported modes: {supported}"
         )
     return key
+
+
+def _ensure_project_qnn_models_registered() -> None:
+    """Register project-only QNN model variants without editing ExecuTorch files."""
+
+    def _register_internvl3_variant_qnn(
+        model_name: str,
+        *,
+        repo_id: str,
+        config_filename: str,
+        config_cls_name: str,
+    ) -> None:
+        from executorch.examples.models.internvl3 import (
+            convert_weights as convert_internvl3_weights,
+        )
+        from executorch.examples.qualcomm.oss_scripts import llama as qnn_llama
+        from executorch.examples.qualcomm.oss_scripts.llama import LLMModelConfig
+        from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
+            DECODER_MODEL_VERSION,
+            VISION_ENCODER,
+        )
+        from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config import (
+            InternVL3Encoder,
+        )
+        from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
+            LlamaModelWithoutEmbedding,
+        )
+        from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
+            InternVL3_1B_QuantRecipe,
+        )
+        from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import (
+            IMG_TOKEN,
+            VLM_SPECIAL_TOKENS,
+        )
+
+        if model_name in qnn_llama.SUPPORTED_LLM_MODELS:
+            return
+
+        DECODER_MODEL_VERSION[model_name] = "internvl3"
+        qnn_llama.LLM_VARIANT_ARCHS[model_name] = LlamaModelWithoutEmbedding
+        VLM_SPECIAL_TOKENS[model_name] = {
+            IMG_TOKEN: "<IMG_CONTEXT>",
+            "fake_wrap_start": "<img>",
+            "fake_wrap_end": "</img>",
+        }
+
+        params_path = str(
+            Path(__file__).resolve().parents[1]
+            / "models"
+            / "internvl3"
+            / config_filename
+        )
+
+        rid = repo_id
+        ppath = params_path
+
+        @dataclass(init=False, frozen=True)
+        class _InternVL3QNNVariant(LLMModelConfig):
+            repo_id: str = rid
+            params_path: str = ppath
+            convert_weights = convert_internvl3_weights
+            decoder_model_version = "internvl3"
+            transform_weight = False
+            instruct_model = True
+            num_sharding = 1
+            masked_softmax = True
+            seq_mse_candidates = 0
+            r1 = False
+            r2 = False
+            r3 = False
+            quant_recipe = InternVL3_1B_QuantRecipe
+
+        _InternVL3QNNVariant.__name__ = config_cls_name
+        setattr(_InternVL3QNNVariant, VISION_ENCODER, InternVL3Encoder)
+        qnn_llama.SUPPORTED_LLM_MODELS[model_name] = _InternVL3QNNVariant()
+
+    _register_internvl3_variant_qnn(
+        "internvl3_8b",
+        repo_id="OpenGVLab/InternVL3-8B-hf",
+        config_filename="8b_config.json",
+        config_cls_name="InternVL3_8B",
+    )
+    _register_internvl3_variant_qnn(
+        "internvl3_2b",
+        repo_id="OpenGVLab/InternVL3-2B-hf",
+        config_filename="2b_config.json",
+        config_cls_name="InternVL3_2B",
+    )
 
 
 def _qnn_quant_dtype(name: str):
@@ -286,6 +375,8 @@ def export_qnn(args: argparse.Namespace) -> int:
     from executorch.examples.qualcomm.oss_scripts.llama import decoder_constants
     from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import TokenizerWrapper
     from executorch.examples.qualcomm.oss_scripts.llama.llama import compile as qnn_compile
+
+    _ensure_project_qnn_models_registered()
 
     audio_encoder = decoder_constants.AUDIO_ENCODER
     text_encoder = decoder_constants.TEXT_ENCODER

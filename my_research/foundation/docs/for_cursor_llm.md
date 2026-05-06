@@ -10,8 +10,9 @@ ExecuTorch should remain a clean upstream dependency.
 
 - Do not add project-specific code directly under `executorch/` unless there is no practical
   alternative.
-- Put project-specific Python, C++, scripts, docs, and model adapters under
-  `my_research/foundation/`.
+- Keep the narrative implementation log in `hybrid_docs/for_cursor_llm.md`.
+- Put raw run outputs, memory summaries, total runtime, and per-stage timing captures collected
+  from Python-driven runs under `my_research/foundation_llamacpp/`.
 - If an upstream ExecuTorch or Qualcomm file must be changed, prefer tracking that change as a
   small patch rather than copying an entire directory.
 
@@ -2555,3 +2556,408 @@ When modifying implementation:
 - Keep `docs/mobile_backend_flow.md` aligned with actual commands.
 - Keep `README.md` short and point to the detailed docs.
 - Prefer adding adapters under `my_research/foundation` over patching `executorch/`.
+
+## Vulkan Matrix Artifact Label Override
+
+Context:
+
+- User wanted to use `my_research/foundation/scripts/export_internvl3_matrix.sh`
+  for the Vulkan InternVL3 1B 512-to-16k export series matching the manual
+  `fp32 + 8da4w + --vulkan-force-fp16` command, without KV-cache quantization.
+- The script already accepted Vulkan dtype/quant/extra args through environment
+  variables, but its artifact naming suffix was fixed to `VULKAN_DECODER_QUANT`.
+
+Change:
+
+- Added `VULKAN_ARTIFACT_LABEL` to
+  `my_research/foundation/scripts/export_internvl3_matrix.sh`.
+- When set, Vulkan artifact roots are named:
+  `internvl3_vulkan_<model_size>_<length>_<VULKAN_ARTIFACT_LABEL>`.
+
+Example:
+
+```bash
+EXPORT_MODELS=internvl3_1b \
+VULKAN_DTYPE=fp32 \
+VULKAN_DECODER_QUANT=8da4w \
+VULKAN_ARTIFACT_LABEL=fp32_8da4w_qmode_forcefp16_decoder_only \
+VULKAN_EXTRA_ARGS="--vulkan-force-fp16" \
+my_research/foundation/scripts/export_internvl3_matrix.sh vulkan
+```
+
+Notes:
+
+- No ExecuTorch source was modified.
+- KV-cache quantization is intentionally omitted by not passing
+  `--quantize_kv_cache`.
+
+## QNN-Only Runner Rebuild Duplicate Custom Ops Fix
+
+Context:
+
+- User requested rebuilding the legacy QNN-only runner through
+  `my_research/foundation/scripts/build_backend_and_runner.sh qnn`, which uses
+  `executorch/build-android`.
+- Full QNN backend rebuild succeeded, but the foundation runner initially failed
+  at link time.
+
+Issue:
+
+- Linker error:
+  `duplicate symbol: torch::executor::native::fallback_out(...)`
+- Cause:
+  - QNN-only build did not expose `custom_ops` as a CMake target through
+    `find_package(executorch)`.
+  - Foundation CMake created a local `custom_ops` target from
+    `extension/llm/custom_ops/op_fallback.cpp`.
+  - The QNN runner link line also pulled another `libcustom_ops.a`, so
+    `op_fallback.cpp` was linked twice.
+
+Fix:
+
+- Updated `my_research/foundation/CMakeLists.txt` so the local fallback
+  `custom_ops` target is created only when XNNPACK or Vulkan targets are
+  present. QNN-only runner builds no longer create the duplicate local
+  `custom_ops`.
+- Cleaned the generated runner build dir:
+  `/workspace/streamingvlm/executorch/build-android/foundation`
+- Rebuilt with:
+  `SKIP_ET_BUILD=1 JOBS=36 my_research/foundation/scripts/build_backend_and_runner.sh qnn`
+- Result:
+  `executorch/build-android/foundation/xnnpack_qnn_runner` built successfully.
+
+## QNN Forced Generation Semantics Fix
+
+Context:
+
+- QNN image runs failed when `--force_generate_token 128` was used, especially
+  on 512/1k artifacts.
+- The failure was a C++ abort:
+  `sequence length exceeded - please increase the seq_len value`.
+
+Issue:
+
+- Foundation QNN path incorrectly mapped `force_generate_token` to
+  `GenerationConfig.seq_len`.
+- Qualcomm QNN multimodal runner interprets `seq_len` as the total context/KV
+  length, not the number of new decode tokens.
+- With image prompts, the prompt already occupies about 276 tokens, so
+  `--force_generate_token 128` incorrectly became `seq_len=128` and failed
+  before prefill.
+- Qualcomm QNN `TokenGenerator` also stopped on EOS unconditionally, so simply
+  setting a target context length was not sufficient for forced generation.
+
+Fix:
+
+- `my_research/foundation/runner/qnn_backend.cpp`
+  - Keeps `GenerationConfig.seq_len` as the artifact/context limit.
+  - Passes `force_generate_token` through `GenerationConfig.max_new_tokens`.
+  - Sets `GenerationConfig.ignore_eos=true` only when forced generation is
+    requested.
+- `my_research/foundation/runner/foundation_qnn_multimodal_runner.cpp`
+  - Computes the effective context limit from `config.seq_len` and the compiled
+    `context_len_`.
+  - After prefill, maps forced new-token count to a QNN target context position:
+    `decode_seq_len = cur_pos_ + max_new_tokens`.
+  - Checks that prompt tokens plus forced tokens fit inside the artifact context.
+  - Calls `token_generator_->set_ignore_eos(force_generate)`.
+- `executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.{h,cpp}`
+  - Added a minimal `set_ignore_eos(bool)` switch.
+  - EOS stopping is skipped when forced generation is active.
+  - This is a small upstream-source patch because the Qualcomm token generator
+    had no project-local hook for EOS control.
+
+Verification:
+
+- Rebuilt both runners:
+  - `SKIP_ET_BUILD=1 JOBS=36 my_research/foundation/scripts/build_backend_and_runner.sh qnn`
+  - `SKIP_ET_BUILD=1 JOBS=36 my_research/foundation/scripts/build_backend_and_runner.sh unified`
+- Ran QNN 512 16a8w with image input and:
+  `--force_generate_token 128 --save_log --force_push`
+- Result:
+  - Exit code 0.
+  - No `sequence length exceeded` abort.
+  - Prompt tokens: 276.
+  - Generated token loop count: 127, matching the Qualcomm flow where prefill
+    produces the first generated token and the token generator loop produces the
+    remaining forced tokens.
+
+## Runtime Phase Plot Artifacts
+
+Context:
+
+- User wanted one runtime stacked bar chart PNG for XNNPACK and another for
+  Vulkan, using the existing run logs under
+  `my_research/foundation/results/log/{xnnpack,vulkan}` and only sequence
+  lengths up to 8k.
+
+Change:
+
+- Added `my_research/foundation/debug/0430/plot_backend_runtime_by_seq.py`.
+- Generated:
+  - `my_research/foundation/debug/0430/backend_runtime_by_seq.csv`
+  - `my_research/foundation/debug/0430/xnnpack_runtime_by_seq.png`
+  - `my_research/foundation/debug/0430/vulkan_runtime_by_seq.png`
+
+Notes:
+
+- Runtime phases are read from each run's `foundation_proc.csv`.
+- The script matches actual artifact directories flexibly, so current Vulkan
+  logs named `internvl3_vulkan_1b_<seq>_fp32_8da4w` are included.
+- Sequence lengths above 8k are intentionally skipped.
+- Initial script run failed with `No matching runtime logs found.` because the
+  default workspace root inference was one directory too shallow; fixed by
+  walking parent directories until `my_research/foundation/results/log` exists.
+- No ExecuTorch source was modified.
+
+## Memory Plot Backend Split
+
+Context:
+
+- User wanted memory plots under `my_research/foundation/debug/0430` similar
+  to `backend_memory_by_seq.png`, with separate XNNPACK and Vulkan PNGs.
+
+Change:
+
+- Updated `my_research/foundation/debug/0430/plot_backend_memory_by_seq.py`:
+  - Workspace root is inferred by walking parents until
+    `my_research/foundation/results/log` exists.
+  - Artifact matching now accepts suffixes beyond `_fp16`, so current Vulkan
+    logs named `internvl3_vulkan_1b_<seq>_fp32_8da4w` are included.
+  - In addition to the combined plot, it now writes:
+    `xnnpack_memory_by_seq.png` and `vulkan_memory_by_seq.png`.
+- Regenerated:
+  - `my_research/foundation/debug/0430/backend_memory_by_seq.csv`
+  - `my_research/foundation/debug/0430/backend_memory_by_seq.png`
+  - `my_research/foundation/debug/0430/xnnpack_memory_by_seq.png`
+  - `my_research/foundation/debug/0430/vulkan_memory_by_seq.png`
+
+Notes:
+
+- Metric remains `mem_available_kb` with `max_minus_min`, reported as MiB.
+- Sequence lengths above 8k are skipped.
+- No ExecuTorch source was modified.
+
+## QNN Included In Debug Plots
+
+Context:
+
+- User wanted the existing debug runtime and memory plots to include the QNN
+  logs under `my_research/foundation/results/log/qnn` as well.
+
+Change:
+
+- Updated `my_research/foundation/debug/0430/plot_backend_runtime_by_seq.py`
+  to include QNN when `--backend all` is used.
+- Updated `my_research/foundation/debug/0430/plot_backend_memory_by_seq.py`
+  to include QNN in the combined memory plot and emit a separate QNN memory
+  PNG.
+- Regenerated:
+  - `my_research/foundation/debug/0430/backend_runtime_by_seq.csv`
+  - `my_research/foundation/debug/0430/backend_memory_by_seq.csv`
+  - `my_research/foundation/debug/0430/qnn_runtime_by_seq.png`
+  - `my_research/foundation/debug/0430/qnn_memory_by_seq.png`
+  - Existing XNNPACK/Vulkan runtime and memory PNGs.
+
+Notes:
+
+- QNN artifact names use `internvl3_1b_qnn_<seq>_16a8w`, unlike XNNPACK and
+  Vulkan which use `internvl3_<backend>_1b_<seq>_<suffix>`.
+- QNN has an aggregate `Decode` row and zero-duration `D` callback rows; runtime
+  plotting now uses summed `D` rows when available, otherwise falls back to the
+  aggregate `Decode` row. This avoids double-counting XNNPACK/Vulkan decode.
+- Sequence lengths above 8k are skipped.
+- No ExecuTorch source was modified.
+
+## Backend Decode Throughput Plot
+
+Context:
+
+- User wanted a single graph showing how many tokens per second each backend
+  processes, with all backends combined.
+
+Change:
+
+- Added `my_research/foundation/debug/0430/plot_backend_decode_throughput_by_seq.py`.
+- Generated:
+  - `my_research/foundation/debug/0430/backend_decode_throughput_by_seq.csv`
+  - `my_research/foundation/debug/0430/backend_decode_throughput_by_seq.png`
+
+Notes:
+
+- Throughput is computed as `decode_tokens / (decode_ms / 1000)`, using
+  `backend_runtime_by_seq.csv`.
+- QNN logs currently contain 13 decode callback tokens, while XNNPACK/Vulkan
+  logs contain 127 decode callback tokens, so the plot reflects each run's
+  recorded decode token count.
+- No ExecuTorch source was modified.
+
+## Prefill Throughput And Vision Time Plots
+
+Context:
+
+- User asked to also graph prefill token processing speed and vision encoder
+  time, not just decode throughput.
+
+Change:
+
+- Updated `my_research/foundation/debug/0430/plot_backend_runtime_by_seq.py`
+  to record `prefill_tokens` from the `T_Prefill` row's `kv_pos`.
+- Updated
+  `my_research/foundation/debug/0430/plot_backend_decode_throughput_by_seq.py`
+  to emit three combined-backend plots from `backend_runtime_by_seq.csv`:
+  - `backend_decode_throughput_by_seq.png`
+  - `backend_prefill_throughput_by_seq.png`
+  - `backend_vision_encode_time_by_seq.png`
+- Regenerated:
+  - `my_research/foundation/debug/0430/backend_runtime_by_seq.csv`
+  - `my_research/foundation/debug/0430/backend_decode_throughput_by_seq.csv`
+  - The three PNGs listed above.
+
+Notes:
+
+- Prefill throughput is computed as
+  `prefill_tokens / (prefill_ms / 1000)`.
+- Vision encoder time is plotted in seconds from `vision_ms`.
+- Current logs show XNNPACK/Vulkan prefill tokens as 283 and QNN as 276.
+- No ExecuTorch source was modified.
+
+## Project-Local QNN InternVL3 8B / 2B Registration
+
+Context:
+
+- QNN export with `--decoder_model internvl3_8b` failed before export with:
+  `Unsupported decoder_model for QNN: internvl3_8b`.
+- Same for `internvl3_2b`: upstream Qualcomm `SUPPORTED_LLM_MODELS` only listed
+  `internvl3_1b` among InternVL3 variants.
+
+Change:
+
+- `my_research/foundation/exporters/qnn.py` registers missing variants at QNN
+  export startup (`_ensure_project_qnn_models_registered`) without editing
+  upstream ExecuTorch sources.
+- For each of `internvl3_8b` and `internvl3_2b` (if not already present):
+  - `SUPPORTED_LLM_MODELS[name]`
+  - `DECODER_MODEL_VERSION[name] = "internvl3"`
+  - `LLM_VARIANT_ARCHS[name] = LlamaModelWithoutEmbedding`
+  - `tokenizer.VLM_SPECIAL_TOKENS[name]` (`<img>`, `</img>`, `<IMG_CONTEXT>`)
+  - params paths:
+    `my_research/foundation/models/internvl3/8b_config.json`,
+    `my_research/foundation/models/internvl3/2b_config.json`
+
+Validation:
+
+- `python3 -m py_compile my_research/foundation/exporters/qnn.py`
+- Smoke: `_ensure_project_qnn_models_registered()` then assert
+  `"internvl3_2b" in SUPPORTED_LLM_MODELS`.
+
+## foundation_llamacpp: OpenCL ctx sweep script (InternVL3-2B)
+
+Context:
+
+- Single shell sweep for Android OpenCL baseline across multiple `--ctx-size`
+  values.
+
+Change:
+
+- `my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh` targets
+  **InternVL3-2B-Instruct** (`InternVL3-2B-Instruct-Q4_K_M.gguf` +
+  `mmproj-InternVL3-2B-Instruct-Q8_0.gguf` under
+  `llama.cpp/models/InternVL3-2B-Instruct-GGUF/`).
+- `CTX_SIZES=(512 1024 2048 4096 8192 16384 32768)` with batch rule
+  `min(ctx,2048)` and ubatch `min(batch,512)` unchanged from prior sweep style.
+
+Notes:
+
+- Requires GGUF files present locally and adb + hybrid OpenCL build per
+  `foundation_llamacpp/docs/README.md`.
+
+## foundation: MemAvail summary from android_memory_timeline + QNN seq plot
+
+- `my_research/foundation/host/android_timeline_memory_summary.py` writes
+  `memory_usage_summary.txt` compatible with llama/OpenCL parsers: Llama pre-run
+  baseline is `pid_alive==0` and `elapsed_s<=0`; QNN `postrun` rows
+  (`pid_alive==0`, elapsed>0) are excluded from baseline. With **no** baseline,
+  usage is **first `mem_available_kb` minus global min `mem_available_kb`** on the timeline.
+- `run_android_hybrid_bridge.py` now calls `write_memory_usage_summary_from_rows`
+  from that module (no behavior change intended).
+- `my_research/foundation/scripts/plot_qnn_memory_vs_seq.py` overwrites summaries from
+  `android_memory_timeline.csv` when present (unless `--no-write-summary`), then plots
+  **`actual_memory_used_from_baseline_avg_mib`** vs parsed seq_len from folder names like
+  `*_qnn_512_*` / `*_qnn_2k_*`.
+
+Example:
+
+```bash
+PYTHONPATH=/workspace/streamingvlm \
+python3 my_research/foundation/scripts/plot_qnn_memory_vs_seq.py \
+  --parent my_research/foundation/results/log/qnn/16a8w \
+  -o my_research/foundation/results/log/qnn/16a8w/internvl3_1b_qnn_16a8w_memory_vs_seq.png
+```
+
+## foundation: QNN phase time vs seq (V_Encode / Prefill / Decode)
+
+- `my_research/foundation/scripts/plot_qnn_phase_time_vs_seq.py` scans the same
+  `--parent` / `--glob` run folders as the memory plot; reads each
+  `foundation_proc.csv` and plots three stacked subplots (seconds vs categorical
+  seq label): **V_Encode**, **T_Prefill**, **Decode**. Decode aggregation matches
+  `debug/0430/plot_backend_runtime_by_seq.py`: sum per-token `D` rows when
+  non-zero; otherwise use the aggregate `Decode` row.
+
+Example (InternVL3-1B 16a8w sweep):
+
+```bash
+PYTHONPATH=/workspace/streamingvlm \
+python3 my_research/foundation/scripts/plot_qnn_phase_time_vs_seq.py \
+  --parent my_research/foundation/results/log/qnn/InternVL3-1B \
+  -o my_research/foundation/results/log/qnn/InternVL3-1B/internvl3_1b_qnn_16a8w_phase_time_vs_seq.png
+```
+
+## for_meetting: OpenCL-only bundle plots (2B / 8B dated folders)
+
+- `for_meetting/plot_internvl3_opencl_vs_qnn_meeting.py` default mode plots 1B
+  OpenCL + QNN + CPU under `for_meetting/` roots.
+- For folders whose **direct children** are `*_opencl_ctx_<n>` runs only (e.g.
+  `for_meetting/2026-05-06/8B/InternVL3-8B`), pass **`--opencl-bundle DIR`** (repeatable).
+  Writes four PNGs inside each DIR: `meeting_memory_vs_seq_opencl.png`,
+  `meeting_v_encode_vs_seq_opencl.png`, `meeting_prefill_vs_seq_opencl.png`,
+  `meeting_decode_vs_seq_opencl.png`.
+
+```bash
+cd /workspace/streamingvlm && PYTHONPATH=. \
+python3 for_meetting/plot_internvl3_opencl_vs_qnn_meeting.py \
+  --opencl-bundle for_meetting/2026-05-06/8B/InternVL3-8B \
+  --opencl-bundle for_meetting/2026-05-06/2B/InternVL3-2B
+```
+
+## for_meetting: stacked bar runtime phases (2026-05-06 bundles)
+
+- `for_meetting/plot_meeting_phase_stacked_bars.py` builds **three-phase stacked
+  bars** (Vision encode · Prefill · Decode) vs sequence length; **Loading is excluded**
+  from the chart and from the total label above each bar. Prefers `stats.csv` if present,
+  else `foundation_phase_stats.csv`, else `foundation_proc.csv` per run folder.
+- **Prefill** merges QNN `EmbeddingAndMerging` + `T_Prefill`; llama/OpenCL/CPU merges
+  `ImagePrefill` + `T_Prefill`. Decode = sum `D` or aggregate `Decode`. Loading still parsed
+  from QNN `L` / hybrid `L_*` (+ layout/embed file rows) but not plotted.
+- Writes **`runtime_phase_stacked_bar.png`** inside each `--bundle` directory.
+
+```bash
+python3 for_meetting/plot_meeting_phase_stacked_bars.py \
+  --bundle for_meetting/2026-05-06/1B/qnn/InternVL3-1B \
+  --bundle for_meetting/2026-05-06/1B/opencl/InternVL3-1B \
+  --bundle for_meetting/2026-05-06/2B/InternVL3-2B \
+  --bundle for_meetting/2026-05-06/1B/cpu/InternVL3-1B \
+  --bundle for_meetting/2026-05-06/8B/InternVL3-8B
+```
+
+## foundation: run_internvl3_backend_matrix.sh QNN mode
+
+- `my_research/foundation/scripts/run_internvl3_backend_matrix.sh qnn` runs a
+  fixed list of **InternVL3-1B QNN** manifests under
+  `results/model/qnn/internvl3_1b_hybrid_16p_{512,1k,2k,4k,8k,16k}_16a4w/`.
+- Override dirs with `QNN_ARTIFACT_DIRS="..."`, tree with `BUILD_PATH`, device
+  with `DEVICE`, SoC with `SOC_MODEL`, artifact root with `QNN_ARTIFACT_BASE`.
+- **`mobile_backend_flow.md` §5.4** documents copy-paste `cli run` blocks (with
+  `PYTHONPATH`, bundled `QNN_SDK_ROOT` example path, `--force_push`), plus the
+  **`internvl3_1b_qnn_*_16a8w`** batch example via `QNN_ARTIFACT_DIRS` +
+  `FORCE_GENERATE_TOKEN`.

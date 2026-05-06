@@ -87,8 +87,11 @@ export ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-/opt/android-ndk-r26c}
 For QNN:
 
 ```bash
-export QNN_SDK_ROOT=/path/to/qnn_sdk
+# Prefer the QAIRT tree shipped with this repo’s Qualcomm SDK layout (adjust if your version differs).
+export QNN_SDK_ROOT=/workspace/streamingvlm/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724
 ```
+
+If that directory does not exist on your machine, point `QNN_SDK_ROOT` at your local QAIRT/QNN SDK install instead.
 
 Check the foundation CLI:
 
@@ -178,7 +181,7 @@ cd /workspace/streamingvlm
 
 python -m my_research.foundation.cli export \
   --backend xnnpack \
-  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/xnnpack/internvl3_xnnpack_1b_8k_fp16_test \
+  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/xnnpack/internvl3_xnnpack_1b_8k_fp32 \
   --decoder_model internvl3_1b \
   --model_path /workspace/streamingvlm/my_research/foundation/results/model/hf/InternVL3-1B-hf \
   --checkpoint /workspace/streamingvlm/my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth \
@@ -204,7 +207,7 @@ cd /workspace/streamingvlm
 PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
 python -m my_research.foundation.cli export \
   --backend vulkan \
-  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_8k_fp16_4kv \
+  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/vulkan/internvl3_vulkan_1b_8k_fp16_ \
   --decoder_model internvl3_1b \
   --model_path /workspace/streamingvlm/my_research/foundation/results/model/hf/InternVL3-1B-hf \
   --checkpoint /workspace/streamingvlm/my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth \
@@ -261,8 +264,8 @@ cd /workspace/streamingvlm
 PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
 python -m my_research.foundation.cli export \
   --backend qnn \
-  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_1b_qnn_512_16a16w \
-  --decoder_model internvl3_1b \
+  --artifact_root /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_8b_qnn_512_8a4w \
+  --decoder_model internvl3_8b \
   -b executorch/build-android-unified \
   -s R3KYC01FW1P \
   -m SM8750 \
@@ -271,10 +274,9 @@ python -m my_research.foundation.cli export \
   --max_seq_len 512 \
   --max_context_len 512 \
   --dtype fp32 \
-  --vision_quant 16a16w \
-  --decoder_quant 16a16w \
-  --embedding_quant 16a16w \
-  --qnn_kv_quant 8 \
+  --vision_quant 8a4w \
+  --decoder_quant 8a4w \
+  --embedding_quant 8a4w \
   --prompts "Can you describe this image?" \
   --image_path "http://images.cocodataset.org/val2017/000000039769.jpg"
 ```
@@ -486,19 +488,82 @@ runs should now work after the Vulkan-friendly GELU overlay fix.
 
 ### 5.4 Run QNN
 
+QNN runs require **`QNN_SDK_ROOT`** (see §2) and the Android ExecuTorch tree **`-b`** / launcher **`-m`**
+(SoC model string, same role as export). The helper script
+`my_research/foundation/scripts/run_internvl3_backend_matrix.sh` wraps the same
+`python -m my_research.foundation.cli run ...` invocation used below and passes
+**`-b "${BUILD_PATH}"`**, **`-s "${DEVICE}"`**, **`-m "${SOC_MODEL}"`**, plus
+**`--force_push`** on every step so device-side caches stay fresh.
+
+**Environment defaults** (override as needed): `DEVICE=R3KYC01FW1P`,
+`BUILD_PATH=$ROOT_DIR/executorch/build-android-unified`,
+`SOC_MODEL=SM8750`, `FORCE_GENERATE_TOKEN=128`,
+`IMAGE` / `QUESTION` for COCO cat URL and the short caption prompt.
+
+Single artifact (example: InternVL3-1B QNN `16a8w`, 16k manifest paths):
+
 ```bash
+cd /workspace/streamingvlm
+
+export PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch
+export QNN_SDK_ROOT=/workspace/streamingvlm/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724
+export DEVICE=R3KYC01FW1P
+
 python -m my_research.foundation.cli run \
-  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_1b_qnn_2k_16a8w/manifest.json \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_1b_qnn_512_16a8w/manifest.json \
   --runner_binary /workspace/streamingvlm/executorch/build-android-unified/foundation/xnnpack_qnn_runner \
-  -b executorch/build-android-unified \
-  -s R3KYC01FW1P \
+  -b /workspace/streamingvlm/executorch/build-android-unified \
+  -s "${DEVICE}" \
   -m SM8750 \
   --image http://images.cocodataset.org/val2017/000000039769.jpg \
   --questions "Describe this image briefly using around 10 words." \
   --force_generate_token 128 \
   --temperature 0.0 \
+  --force_push \
   --save_log
 ```
+
+Single artifact (example: InternVL3-8B QNN `8a4w`, 512 ctx):
+
+```bash
+cd /workspace/streamingvlm
+
+export PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch
+export QNN_SDK_ROOT=/workspace/streamingvlm/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724
+export DEVICE=R3KYC01FW1P
+
+python -m my_research.foundation.cli run \
+  --manifest /workspace/streamingvlm/my_research/foundation/results/model/qnn/internvl3_8b_qnn_512_8a4w/manifest.json \
+  --runner_binary /workspace/streamingvlm/executorch/build-android-unified/foundation/xnnpack_qnn_runner \
+  -b /workspace/streamingvlm/executorch/build-android-unified \
+  -s "${DEVICE}" \
+  -m SM8750 \
+  --image http://images.cocodataset.org/val2017/000000039769.jpg \
+  --questions "Describe this image briefly using around 10 words." \
+  --force_generate_token 64 \
+  --temperature 0.0 \
+  --force_push \
+  --save_log
+```
+
+**Batch QNN inference** (same flags as `run_internvl3_backend_matrix.sh` mode `qnn`).
+Default artifact list there is `internvl3_1b_hybrid_16p_*_16a4w`; for the
+`internvl3_1b_qnn_*_16a8w` folders set **`QNN_ARTIFACT_DIRS`**:
+
+```bash
+cd /workspace/streamingvlm
+
+export PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch
+export QNN_SDK_ROOT=/workspace/streamingvlm/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724
+export DEVICE=R3KYC01FW1P
+
+FORCE_GENERATE_TOKEN=64 \
+QNN_ARTIFACT_DIRS="internvl3_1b_qnn_512_16a8w internvl3_1b_qnn_1k_16a8w internvl3_1b_qnn_2k_16a8w internvl3_1b_qnn_4k_16a8w internvl3_1b_qnn_8k_16a8w internvl3_1b_qnn_16k_16a8w" \
+my_research/foundation/scripts/run_internvl3_backend_matrix.sh qnn
+```
+
+Omit **`--force_push`** on manual `cli run` commands when you trust the device cache;
+the matrix script keeps **`--force_push`** enabled for repeatable pulls.
 
 For video input, replace `--image` with `--video /workspace/streamingvlm/sample.mp4`.
 

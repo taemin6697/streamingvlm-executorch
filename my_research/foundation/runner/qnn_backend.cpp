@@ -256,14 +256,12 @@ executorch::runtime::Error run_batch_qnn(
   auto expected_dtype = input_meta_result->scalar_type();
 
   const bool force_generate = config.force_generate_token > 0;
-  const int generation_len =
-      force_generate ? config.force_generate_token : config.seq_len;
   executorch::extension::llm::GenerationConfig gen_config{
       /*echo=*/false,
       /*ignore_eos=*/force_generate,
-      /*max_new_tokens=*/-1,
+      /*max_new_tokens=*/force_generate ? config.force_generate_token : -1,
       /*warming=*/false,
-      /*seq_len=*/generation_len,
+      /*seq_len=*/config.seq_len,
       /*temperature=*/static_cast<float>(config.temperature),
       /*num_bos=*/0,
       /*num_eos=*/0};

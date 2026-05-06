@@ -1,0 +1,26 @@
+memory_usage_method: baseline_avg_mem_available_kb - runtime_min_mem_available_kb
+baseline_sample_count: 33
+baseline_avg_mem_available_kb: 8699309.091
+baseline_avg_mem_available_mib: 8495.419
+baseline_min_sample_idx: 31
+baseline_min_elapsed_s: -0.090
+baseline_min_mem_available_kb: 8695464
+baseline_min_mem_available_mib: 8491.664
+baseline_max_sample_idx: 0
+baseline_max_elapsed_s: -4.990
+baseline_max_mem_available_kb: 8725108
+baseline_max_mem_available_mib: 8520.613
+start_sample_idx: 0
+start_elapsed_s: -4.990
+start_mem_available_kb: 8725108
+start_mem_available_mib: 8520.613
+runtime_min_sample_idx: 297
+runtime_min_elapsed_s: 36.460
+runtime_min_mem_available_kb: 2867640
+runtime_min_mem_available_mib: 2800.430
+actual_memory_used_from_baseline_avg_kb: 5831669.091
+actual_memory_used_from_baseline_avg_mib: 5694.989
+actual_memory_used_from_baseline_max_kb: 5857468.000
+actual_memory_used_from_baseline_max_mib: 5720.184
+legacy_start_minus_runtime_min_kb: 5857468
+legacy_start_minus_runtime_min_mib: 5720.184

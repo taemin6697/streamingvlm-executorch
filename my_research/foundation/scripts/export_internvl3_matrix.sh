@@ -48,6 +48,8 @@ Vulkan overrides:
   VULKAN_EMBEDDING_QUANT   Default: fp16
   VULKAN_DECODER_INPUT_MODE Default: embeddings
   VULKAN_USE_SDPA_WITH_KV_CACHE If 0/false, pass --no-use_sdpa_with_kv_cache. Default: 1
+  VULKAN_ARTIFACT_LABEL     Override artifact quant/tag suffix after length.
+                            Default: $VULKAN_DECODER_QUANT
   VULKAN_EXTRA_ARGS        Extra args appended to each Vulkan export command
 EOF
 }
@@ -124,6 +126,7 @@ VULKAN_DECODER_QUANT="${VULKAN_DECODER_QUANT:-fp16}"
 VULKAN_EMBEDDING_QUANT="${VULKAN_EMBEDDING_QUANT:-fp16}"
 VULKAN_DECODER_INPUT_MODE="${VULKAN_DECODER_INPUT_MODE:-embeddings}"
 VULKAN_USE_SDPA_WITH_KV_CACHE="${VULKAN_USE_SDPA_WITH_KV_CACHE:-1}"
+VULKAN_ARTIFACT_LABEL="${VULKAN_ARTIFACT_LABEL:-${VULKAN_DECODER_QUANT}}"
 read -r -a VULKAN_EXTRA_ARGS_ARRAY <<< "${VULKAN_EXTRA_ARGS:-}"
 
 length_tag() {
@@ -298,7 +301,7 @@ run_vulkan_export() {
   local artifact_root
   model_size="$(model_size_tag "${decoder_model}")"
   tag="$(length_tag "${length}")"
-  artifact_root="${VULKAN_ARTIFACT_BASE}/internvl3_vulkan_${model_size}_${tag}_${VULKAN_DECODER_QUANT}"
+  artifact_root="${VULKAN_ARTIFACT_BASE}/internvl3_vulkan_${model_size}_${tag}_${VULKAN_ARTIFACT_LABEL}"
 
   maybe_skip_existing "${artifact_root}" && return 0
 

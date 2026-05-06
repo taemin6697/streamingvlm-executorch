@@ -469,9 +469,14 @@ Error ProfiledQNNMultimodalRunner<T>::generate(
   int num_prompt_tokens = embedding_merger_->get_total_tokens();
   mark_end(last_generate_timings_.embedding_and_merging);
 
+  const int32_t context_limit = config.seq_len > 0
+      ? std::min<int32_t>(config.seq_len, context_len_)
+      : context_len_;
+  const bool force_generate = config.ignore_eos && config.max_new_tokens > 0;
+
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
   ET_CHECK_MSG(
-      cur_pos_ + num_prompt_tokens < seq_len,
+      cur_pos_ + num_prompt_tokens < context_limit,
       "sequence length exceeded - please increase the seq_len value");
 
   if (token_callback && config.echo) {
@@ -513,11 +518,21 @@ Error ProfiledQNNMultimodalRunner<T>::generate(
     callback_token_idx += 1;
   };
 
+  int32_t decode_seq_len = context_limit;
+  if (force_generate) {
+    ET_CHECK_MSG(
+        cur_pos_ + config.max_new_tokens <= context_limit,
+        "forced generation exceeds sequence length: prompt tokens + forced "
+        "tokens must be <= seq_len");
+    decode_seq_len = static_cast<int32_t>(cur_pos_ + config.max_new_tokens);
+  }
+  token_generator_->set_ignore_eos(force_generate);
+
   mark_start(last_generate_timings_.decode);
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
       prompt_tokens,
       cur_pos_,
-      seq_len,
+      decode_seq_len,
       profiled_token_callback,
       dump_logits,
       nullptr));
@@ -528,8 +543,8 @@ Error ProfiledQNNMultimodalRunner<T>::generate(
       "RSS after finishing text generation: %f MiB (0 if unsupported)",
       get_rss_bytes() / 1024.0 / 1024.0);
   cur_pos_ += num_generated_tokens;
-  if (cur_pos_ == seq_len) {
-    ET_LOG(Info, "Sequence length (%i tokens) reached!", seq_len);
+  if (cur_pos_ == decode_seq_len) {
+    ET_LOG(Info, "Sequence length (%i tokens) reached!", decode_seq_len);
   }
 
   stats_.num_prompt_tokens = num_prompt_tokens;

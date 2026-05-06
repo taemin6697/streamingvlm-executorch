@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import shlex
 from pathlib import Path
@@ -273,11 +274,18 @@ class _AdbWorkspace:
 
     def execute(self, command: str) -> str:
         full_cmd = f"cd {self.device_workspace} && {command}"
-        return subprocess.check_output(
-            self.adb + ["shell", full_cmd],
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
+        try:
+            return subprocess.check_output(
+                self.adb + ["shell", full_cmd],
+                text=True,
+                stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError as e:
+            # Device stderr is merged into stdout; print it so failures are diagnosable.
+            out = (e.output or "").strip()
+            if out:
+                print(out, file=sys.stderr)
+            raise
 
 
 def _run_unified_xnnpack(

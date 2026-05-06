@@ -15,6 +15,10 @@ from pathlib import Path
 
 import numpy as np
 
+from my_research.foundation.host.android_timeline_memory_summary import (
+    write_memory_usage_summary_from_rows,
+)
+
 WORKSPACE = Path(__file__).resolve().parents[2]
 FOUNDATION_LLAMA = Path(__file__).resolve().parent
 
@@ -178,68 +182,7 @@ def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str])
 
 
 def _write_memory_usage_txt(output_dir: Path, rows: list[dict[str, str]]) -> None:
-    usable: list[tuple[int, float, int, int]] = []
-    for idx, row in enumerate(rows):
-        raw_mem = (row.get("mem_available_kb") or "").strip()
-        if not raw_mem:
-            continue
-        try:
-            mem_available_kb = int(float(raw_mem))
-            elapsed_s = float(row.get("elapsed_s") or 0.0)
-            pid_alive = int(float(row.get("pid_alive") or 0))
-        except ValueError:
-            continue
-        usable.append((idx, elapsed_s, mem_available_kb, pid_alive))
-    if not usable:
-        return
-
-    start_idx, start_elapsed_s, start_kb, _ = usable[0]
-    baseline = [item for item in usable if item[3] == 0]
-    runtime = [item for item in usable if item[3] == 1] or [item for item in usable if item[1] >= 0.0] or usable
-    min_idx, min_elapsed_s, min_kb, _ = min(runtime, key=lambda item: item[2])
-    used_from_start_kb = max(start_kb - min_kb, 0)
-    if baseline:
-        baseline_avg_kb = sum(item[2] for item in baseline) / len(baseline)
-        baseline_min_idx, baseline_min_elapsed_s, baseline_min_kb, _ = min(baseline, key=lambda item: item[2])
-        baseline_max_idx, baseline_max_elapsed_s, baseline_max_kb, _ = max(baseline, key=lambda item: item[2])
-    else:
-        baseline_avg_kb = float(start_kb)
-        baseline_min_idx, baseline_min_elapsed_s, baseline_min_kb = start_idx, start_elapsed_s, start_kb
-        baseline_max_idx, baseline_max_elapsed_s, baseline_max_kb = start_idx, start_elapsed_s, start_kb
-    used_from_baseline_avg_kb = max(baseline_avg_kb - min_kb, 0.0)
-    used_from_baseline_max_kb = max(float(baseline_max_kb - min_kb), 0.0)
-    text = "\n".join(
-        [
-            "memory_usage_method: baseline_avg_mem_available_kb - runtime_min_mem_available_kb",
-            f"baseline_sample_count: {len(baseline)}",
-            f"baseline_avg_mem_available_kb: {baseline_avg_kb:.3f}",
-            f"baseline_avg_mem_available_mib: {baseline_avg_kb / 1024.0:.3f}",
-            f"baseline_min_sample_idx: {baseline_min_idx}",
-            f"baseline_min_elapsed_s: {baseline_min_elapsed_s:.3f}",
-            f"baseline_min_mem_available_kb: {baseline_min_kb}",
-            f"baseline_min_mem_available_mib: {baseline_min_kb / 1024.0:.3f}",
-            f"baseline_max_sample_idx: {baseline_max_idx}",
-            f"baseline_max_elapsed_s: {baseline_max_elapsed_s:.3f}",
-            f"baseline_max_mem_available_kb: {baseline_max_kb}",
-            f"baseline_max_mem_available_mib: {baseline_max_kb / 1024.0:.3f}",
-            f"start_sample_idx: {start_idx}",
-            f"start_elapsed_s: {start_elapsed_s:.3f}",
-            f"start_mem_available_kb: {start_kb}",
-            f"start_mem_available_mib: {start_kb / 1024.0:.3f}",
-            f"runtime_min_sample_idx: {min_idx}",
-            f"runtime_min_elapsed_s: {min_elapsed_s:.3f}",
-            f"runtime_min_mem_available_kb: {min_kb}",
-            f"runtime_min_mem_available_mib: {min_kb / 1024.0:.3f}",
-            f"actual_memory_used_from_baseline_avg_kb: {used_from_baseline_avg_kb:.3f}",
-            f"actual_memory_used_from_baseline_avg_mib: {used_from_baseline_avg_kb / 1024.0:.3f}",
-            f"actual_memory_used_from_baseline_max_kb: {used_from_baseline_max_kb:.3f}",
-            f"actual_memory_used_from_baseline_max_mib: {used_from_baseline_max_kb / 1024.0:.3f}",
-            f"legacy_start_minus_runtime_min_kb: {used_from_start_kb}",
-            f"legacy_start_minus_runtime_min_mib: {used_from_start_kb / 1024.0:.3f}",
-            "",
-        ]
-    )
-    (output_dir / "memory_usage_summary.txt").write_text(text, encoding="utf-8")
+    write_memory_usage_summary_from_rows(output_dir, rows)
 
 
 def _match_float(text: str, pattern: str) -> float:

@@ -187,8 +187,8 @@ uses it instead of upstream `llama-mtmd-cli` to produce precise phase rows.
 python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --processor gpu \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
-  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
-  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --model llama.cpp/models/InternVL3-14B-Instruct-GGUF/InternVL3-14B-Instruct-Q4_K_M.gguf \
+  --mmproj llama.cpp/models/InternVL3-14B-Instruct-GGUF/mmproj-InternVL3-14B-Instruct-Q8_0.gguf \
   --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
   --prompt "Describe this image briefly." \
   --n-predict 32 \
@@ -196,7 +196,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --threads 4 \
   --gpu-layers 99 \
   --device GPUOpenCL \
-  --ctx-size 32768 \
+  --ctx-size 512 \
   --batch-size 2048 \
   --ubatch-size 512 \
   --temperature 0.0 \
@@ -207,15 +207,36 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --results-root my_research/foundation_llamacpp/results/log
 ```
 
-HF `config.json`에 `rope_scaling: { "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768 }` 가 있으면 runner에 예시처럼 넘길 수 있습니다 (GGUF에 이미 같은 메타가 있으면 생략 가능).
+HF에서 `rope_scaling: { "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768 }` 인 체크포인트를 그대로 반영해 실행하는 예입니다. **롱컨텍스트 상한(약 128k)** 을 쓰려면 `--ctx-size 131072`처럼 올리면 되고, 메모리가 빠듯하면 `32768`로 두고 아래 RoPE 플래그만 맞춰도 됩니다.
 
 ```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor gpu \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+  --prompt "Describe this image briefly." \
+  --n-predict 32 \
+  --force-generation 64 \
+  --threads 4 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --ctx-size 131072 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --temperature 0.0 \
   --rope-scaling yarn \
   --rope-scale 4.0 \
   --yarn-orig-ctx 32768 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --baseline-window 5.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log
 ```
 
-기타 `--rope-freq-base`, `--rope-freq-scale`, `--yarn-ext-factor`, `--yarn-attn-factor`, `--yarn-beta-slow`, `--yarn-beta-fast` 도 upstream `llama-mtmd-cli` / `opencl_phase_mtmd` / `hybrid_decode`로 그대로 전달됩니다.
+GGUF 메타에 동일한 RoPE 설정이 이미 들어 있으면 위 `--rope-scaling` / `--rope-scale` / `--yarn-orig-ctx` 는 생략해도 됩니다. 추가로 조정할 때만 `--rope-freq-base`, `--rope-freq-scale`, `--yarn-ext-factor`, `--yarn-attn-factor`, `--yarn-beta-slow`, `--yarn-beta-fast` 를 붙이면 됩니다.
 
 KV-cache를 8비트로 쓰려면 `--cache-type-k q8_0 --cache-type-v q8_0`처럼 지정하면 됩니다 (upstream llama.cpp `common_params`와 동일한 플래그명으로 그대로 전달됩니다). 결과 로그의 `llama_kv_cache` 줄에서 `K (q8_0)`, `V (q8_0)`로 표시되는지 확인하면 됩니다. 디바이스·백엔드 조합에 따라 해당 타입이 거부되면 로드 시 에러가 날 수 있습니다. OpenCL에서 초기화 단계(`common_fit_params`)가 `SET_ROWS` 등으로 abort 할 때는 `--fit off`로 자동 메모리 맞춤을 끄고 다시 시도하면 됩니다 (runner가 `opencl_phase_mtmd`에 그대로 넘깁니다).
 

@@ -133,7 +133,7 @@ endif()
 
 if(TARGET qnn_executorch_backend)
   target_compile_definitions(xnnpack_qnn_runner PRIVATE FOUNDATION_ENABLE_QNN=1)
-  if(NOT TARGET custom_ops)
+  if(NOT TARGET custom_ops AND (TARGET xnnpack_backend OR TARGET vulkan_backend))
     add_library(
       custom_ops
       ${EXECUTORCH_ROOT}/extension/llm/custom_ops/op_fallback.cpp

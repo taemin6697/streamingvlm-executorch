@@ -452,13 +452,31 @@ follow_up:
   after q8 KV flags, plus a sentence on using it when OpenCL init aborts during
   `common_fit_params`.
 - 2026-05-04: Added `scripts/run_opencl_ctx_sweep.sh`: loops ctx sizes
-  512..32768 with README-aligned OpenCL 8B command; scales `--batch-size` /
-  `--ubatch-size` down when `ctx < 2048`; collects failures and exits non-zero.
+  512..32768; scales `--batch-size` / `--ubatch-size` when `ctx < 2048`; collects
+  failures and exits non-zero.
+- 2026-05-06: `run_opencl_ctx_sweep.sh` defaults to **InternVL3-1B Q8_0** (+ mmproj
+  Q8_0). Override with `MODEL=` / `MMPROJ=`; refresh truncated device GGUF with
+  `MODEL_PUSH=1` (optional `FORCE_PUSH=1`, wipes `remote-root` **each** runner
+  invocation — heavy on full sweeps).
+- 2026-05-06: Same script supports **`PROCESSOR=gpu`** (default OpenCL),
+  **`PROCESSOR=cpu`** (`llama-mtmd-cli`, default build
+  `LLAMA_BUILD_CPU=$ROOT/llama.cpp/build-android-cpu-noomp`), or
+  **`PROCESSOR=both`** (GPU sweep then CPU). Separate default remote dirs:
+  `REMOTE_ROOT_GPU`, `REMOTE_ROOT_CPU`.
 - 2026-05-04: `run_android_hybrid_bridge.py` forwards llama.cpp RoPE/YaRN flags:
   `--rope-scaling`, `--rope-scale`, `--rope-freq-base`, `--rope-freq-scale`,
   `--yarn-orig-ctx`, `--yarn-ext-factor`, `--yarn-attn-factor`, `--yarn-beta-slow`,
   `--yarn-beta-fast` to GPU/CPU binaries and Hybrid `hybrid_decode`
   (`_rope_shell_suffix`). README OpenCL section documents HF YaRN mapping example.
+- 2026-05-05: `scripts/plot_opencl_ctx_memory_series.py`: default `--plot-style usage`
+  (single Y: system `actual_memory_used_from_baseline_avg_mib` plus GPUOpenCL **self**
+  MiB from `common_memory_breakdown_print` in each run’s `foundation_output.txt`). X axis is
+  **categorical** (tick labels `512`, `1024`, … at equal spacing; not a numeric ctx scale).
+  `--plot-style dual`: twin Y + KV from log; `--plot-style avail-min`: min MemAvailable.
+  Plain Y ticks via `ScalarFormatter(useOffset=False)`.
+- Canvas (Cursor IDE):
+  `~/.cursor/projects/workspace-streamingvlm/canvases/internvl3-8b-opencl-memavailable-vs-ctx.canvas.tsx`
+  — single `LineChart` matching default PNG (system memory usage only).
 
 Suggested note format:
 
