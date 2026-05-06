@@ -477,6 +477,17 @@ follow_up:
 - Canvas (Cursor IDE):
   `~/.cursor/projects/workspace-streamingvlm/canvases/internvl3-8b-opencl-memavailable-vs-ctx.canvas.tsx`
   — single `LineChart` matching default PNG (system memory usage only).
+- 2026-05-06: **Nested `llama.cpp/` git**: cherry-picked upstream draft PR
+  [#21313](https://github.com/ggml-org/llama.cpp/pull/21313) as commit `cd6a04a01`
+  (`opencl: flash attention optimizations … quantized KV cache`). Adds OpenCL FA prepass
+  kernels (`flash_attn_pre_f16.cl`) and `ggml_cl_flash_attn_prepare_quantized_tensor`:
+  Q4_0/Q8_0 KV dequant to fp16 temp buffers before FA (warns perf may be poor).
+  **Rebuild** the Android OpenCL hybrid binaries after pulling this tree; the StreamingVLM
+  repo ignores `llama.cpp/` — replicate this cherry-pick locally or merge upstream once landed.
+  Android Adreno may still fail (PR [#21501](https://github.com/ggml-org/llama.cpp/issues/21501)).
+- 2026-05-06: `run_opencl_ctx_sweep.sh` env **`CACHE_TYPE_K`** / **`CACHE_TYPE_V`**
+  (default `f16`) forwarded to `--cache-type-k` / `--cache-type-v`. Reference file snapshot:
+  `my_research/foundation_llamacpp/kv_code/`.
 
 Suggested note format:
 

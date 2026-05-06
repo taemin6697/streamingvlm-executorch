@@ -29,6 +29,11 @@
 #   MODEL_PUSH=1 ./my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh
 # Full remote workdir reset (heavy): FORCE_PUSH=1 MODEL_PUSH=1 ./my_research/.../run_opencl_ctx_sweep.sh
 #
+# KV cache dtype (passed through as llama.cpp --cache-type-k / --cache-type-v).
+# Default f16 (baseline). For quantized KV experiments rebuild llama.cpp with OpenCL FA patch;
+# see `foundation_llamacpp/docs/for_cursor_llm_llamacpp.md` (PR #21313 cherry-pick). Example:
+#   CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 PROCESSOR=gpu ./my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh
+#
 # Requires: adb device, Android binaries pushed per README.
 
 set -uo pipefail
@@ -50,6 +55,8 @@ LLAMA_BUILD_CPU="${LLAMA_BUILD_CPU:-${REPO_ROOT}/llama.cpp/build-android-cpu-noo
 REMOTE_ROOT_GPU="${REMOTE_ROOT_GPU:-/data/local/tmp/streamingvlm_unified}"
 REMOTE_ROOT_CPU="${REMOTE_ROOT_CPU:-/data/local/tmp/streamingvlm_cpu_vlm}"
 THREADS="${THREADS:-4}"
+CACHE_TYPE_K="${CACHE_TYPE_K:-f16}"
+CACHE_TYPE_V="${CACHE_TYPE_V:-f16}"
 
 runner_py="${REPO_ROOT}/my_research/foundation_llamacpp/run_android_hybrid_bridge.py"
 
@@ -92,8 +99,8 @@ run_one() {
       --batch-size "${batch}" \
       --ubatch-size "${ubatch}" \
       --temperature 0.0 \
-      --cache-type-k f16 \
-      --cache-type-v f16 \
+      --cache-type-k "${CACHE_TYPE_K}" \
+      --cache-type-v "${CACHE_TYPE_V}" \
       --baseline-window 5.0 \
       --remote-root "${remote_root}" \
       --results-root "${REPO_ROOT}/my_research/foundation_llamacpp/results/log" \
@@ -113,8 +120,8 @@ run_one() {
       --batch-size "${batch}" \
       --ubatch-size "${ubatch}" \
       --temperature 0.0 \
-      --cache-type-k f16 \
-      --cache-type-v f16 \
+      --cache-type-k "${CACHE_TYPE_K}" \
+      --cache-type-v "${CACHE_TYPE_V}" \
       --baseline-window 5.0 \
       --remote-root "${remote_root}" \
       --results-root "${REPO_ROOT}/my_research/foundation_llamacpp/results/log" \

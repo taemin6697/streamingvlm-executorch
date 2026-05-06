@@ -2,6 +2,8 @@ Source: https://github.com/ggml-org/llama.cpp/pull/21313 (Draft)
 Fetched PR head ref: refs/pull/21313/head
 Commit: 48d85b9af5833abe378052b9c5e139c9c818e773
 
+Cherry-picked onto workspace nested llama.cpp master as cd6a04a01 (rebuild hybrid Android OpenCL after pulling).
+
 Files (paths relative to llama.cpp repo root):
   ggml/src/ggml-opencl/CMakeLists.txt
   ggml/src/ggml-opencl/ggml-opencl.cpp
