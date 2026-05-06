@@ -4413,14 +4413,32 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return false;
                 }
 
-                const bool is_f32_f32 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
-                                        v->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
-                const bool is_f16_f16 = q->type == GGML_TYPE_F16 && k->type == GGML_TYPE_F16 &&
-                                        v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
-                const bool is_f32_f16 = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 &&
-                                        v->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+                // Quantized KV (e.g. q8 cache): graphs still use dst type F32; effective K/V dtypes for kernels
+                // match ggml_cl_flash_attn (CPU cannot execute FA on GPU-buffer quant tensors without copies).
+                if (ggml_is_quantized(k->type) || ggml_is_quantized(v->type)) {
+                    if (!ggml_is_quantized(k->type) || !ggml_is_quantized(v->type) || k->type != v->type) {
+                        return false;
+                    }
+                }
 
-                return is_f32_f32 || is_f16_f16 || is_f32_f16;
+                const ggml_type k_logical_type = ggml_is_quantized(k->type)
+                    ? (q->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32)
+                    : k->type;
+                const ggml_type v_logical_type = ggml_is_quantized(v->type)
+                    ? (q->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32)
+                    : v->type;
+
+                const bool is_f32_f32 = q->type == GGML_TYPE_F32 && k_logical_type == GGML_TYPE_F32 &&
+                                        v_logical_type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                const bool is_f16_f16 = q->type == GGML_TYPE_F16 && k_logical_type == GGML_TYPE_F16 &&
+                                        v_logical_type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
+                const bool is_f32_f16 = q->type == GGML_TYPE_F32 && k_logical_type == GGML_TYPE_F16 &&
+                                        v_logical_type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+                // F16 Q with F16-linearized quant KV: dst is still F32 from ggml_flash_attn_ext; OpenCL runs f16 FA into F32 buffer.
+                const bool is_f16_f16_out_f32 = q->type == GGML_TYPE_F16 && k_logical_type == GGML_TYPE_F16 &&
+                                                v_logical_type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
+
+                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_f16_f16_out_f32;
             }
         default:
             return false;
@@ -9508,6 +9526,107 @@ static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, NULL, dst);
 }
 
+struct ggml_cl_flash_attn_temp_buffer {
+    cl_mem data = nullptr;
+
+    ~ggml_cl_flash_attn_temp_buffer() {
+        if (data != nullptr) {
+            CL_CHECK(clReleaseMemObject(data));
+            data = nullptr;
+        }
+    }
+};
+
+static bool ggml_cl_flash_attn_prepare_quantized_tensor(
+        ggml_backend_opencl_context *         backend_ctx,
+        const ggml_tensor *                   tensor,
+        ggml_type                             target_type,
+        ggml_cl_flash_attn_temp_buffer &      temp,
+        cl_mem &                              data_device,
+        cl_ulong &                            offset,
+        cl_ulong &                            nb1,
+        cl_ulong &                            nb2,
+        cl_ulong &                            nb3) {
+    if (!ggml_is_quantized(tensor->type)) {
+        return false;
+    }
+
+    ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+    GGML_ASSERT(extra);
+    GGML_ASSERT(extra->data_device);
+
+    const int64_t n = ggml_nelements(tensor);
+    const size_t nbytes = ggml_nbytes(tensor);
+
+    sync_with_other_backends(backend_ctx);
+    std::vector<uint8_t> host_raw(nbytes);
+    CL_CHECK(clEnqueueReadBuffer(
+        backend_ctx->queue,
+        extra->data_device,
+        CL_TRUE,
+        extra->offset + tensor->view_offs,
+        nbytes,
+        host_raw.data(),
+        0,
+        NULL,
+        NULL));
+
+    const uint8_t * packed_quant = host_raw.data();
+    std::vector<uint8_t> host_packed;
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    if (!ggml_is_contiguous_0(tensor)) {
+        const int64_t ne1 = tensor->ne[1];
+        const int64_t ne2 = tensor->ne[2];
+        const int64_t ne3 = tensor->ne[3];
+        host_packed.resize(row_bytes * (size_t)(ne1 * ne2 * ne3));
+        uint8_t * dst = host_packed.data();
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    const size_t row_off = (size_t)(i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3]);
+                    GGML_ASSERT(row_off + row_bytes <= host_raw.size());
+                    memcpy(dst, host_raw.data() + row_off, row_bytes);
+                    dst += row_bytes;
+                }
+            }
+        }
+        packed_quant = host_packed.data();
+    }
+
+    std::vector<float> host_f32(n);
+    ggml_get_type_traits(tensor->type)->to_float(packed_quant, host_f32.data(), n);
+
+    const size_t bytes_per_elem = ggml_type_size(target_type);
+    const size_t buffer_size = (size_t) n * bytes_per_elem;
+
+    std::vector<uint8_t> host_linear(buffer_size);
+    if (target_type == GGML_TYPE_F32) {
+        memcpy(host_linear.data(), host_f32.data(), buffer_size);
+    } else {
+        GGML_ASSERT(target_type == GGML_TYPE_F16);
+        ggml_fp32_to_fp16_row(host_f32.data(), (ggml_fp16_t *) host_linear.data(), n);
+    }
+
+    cl_int err;
+    temp.data = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, buffer_size, NULL, &err);
+    CL_CHECK(err);
+    CL_CHECK(clEnqueueWriteBuffer(backend_ctx->queue, temp.data, CL_TRUE, 0, buffer_size, host_linear.data(), 0, NULL, NULL));
+
+    data_device = temp.data;
+    offset = 0;
+    nb1 = (cl_ulong) (tensor->ne[0] * bytes_per_elem);
+    nb2 = (cl_ulong) (tensor->ne[1] * nb1);
+    nb3 = (cl_ulong) (tensor->ne[2] * nb2);
+
+    static bool warned = false;
+    if (!warned) {
+        GGML_LOG_WARN("%s: OpenCL flash attention dequantizes GPU-resident quantized KV cache into temporary linear buffers; performance may be poor\n", __func__);
+        warned = true;
+    }
+
+    return true;
+}
+
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
@@ -9533,10 +9652,19 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const int n_head_kv = k->ne[2];
     const int n_batch = q->ne[3];
 
+    if (ggml_is_quantized(k->type) || ggml_is_quantized(v->type)) {
+        GGML_ASSERT(ggml_is_quantized(k->type) && ggml_is_quantized(v->type));
+        GGML_ASSERT(k->type == v->type);
+    }
+
+    const ggml_type k_logical_type = ggml_is_quantized(k->type)
+        ? (q->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32)
+        : k->type;
+
     cl_kernel kernel = NULL;
 
     const bool is_f16 = q->type == GGML_TYPE_F16;
-    const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
+    const bool is_mixed = q->type == GGML_TYPE_F32 && k_logical_type == GGML_TYPE_F16;
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
 
     if (n_q == 1) {
@@ -9575,14 +9703,22 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_ulong offset_sinks = extra_sinks ? extra_sinks->offset + sinks->view_offs : 0;
 
     const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], q_nb3 = q->nb[3];
-    const cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
-    const cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
+    cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
+    cl_ulong v_nb1 = v->nb[1], v_nb2 = v->nb[2], v_nb3 = v->nb[3];
     const cl_ulong o_nb1 = dst->nb[1], o_nb2 = dst->nb[2], o_nb3 = dst->nb[3];
     const cl_ulong mask_nb1 = mask ? mask->nb[1] : 0;
     const cl_ulong mask_nb2 = mask ? mask->nb[2] : 0;
     const cl_ulong mask_nb3 = mask ? mask->nb[3] : 0;
     const int mask_ne2 = mask ? mask->ne[2] : 0;
     const int mask_ne3 = mask ? mask->ne[3] : 0;
+
+    ggml_cl_flash_attn_temp_buffer temp_k;
+    ggml_cl_flash_attn_temp_buffer temp_v;
+    const ggml_type kv_target_type = is_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    cl_mem k_data_device = extra_k->data_device;
+    cl_mem v_data_device = extra_v->data_device;
+    ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, k, kv_target_type, temp_k, k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
+    ggml_cl_flash_attn_prepare_quantized_tensor(backend_ctx, v, kv_target_type, temp_v, v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
 
     float scale, max_bias, logit_softcap;
     const float * params = (const float *)dst->op_params;
@@ -9599,9 +9735,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra_q->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset_q));
-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra_k->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &k_data_device));
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offset_k));
-    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extra_v->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &v_data_device));
     CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offset_v));
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem),   &extra_o->data_device));
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offset_o));

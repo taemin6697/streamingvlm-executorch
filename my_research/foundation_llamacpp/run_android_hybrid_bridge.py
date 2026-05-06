@@ -725,10 +725,10 @@ def _finalize_standalone_outputs(result_dir: Path, *, processor: str, return_cod
 
 
 def _result_kv_slug_part(cache_type: str | None) -> str:
-    """Slugs for result dir names: q8_0 -> 8, q4_0 -> 4, f16 -> f16 (llama default KV)."""
+    """Slugs for result dir names: q8_0 -> 8, q4_0 -> 4, f16 -> 16 → suffix _kv16."""
     t = (cache_type or "f16").strip().lower().replace("-", "_")
     if t in ("fp16", "f16"):
-        return "f16"
+        return "16"
     m = re.fullmatch(r"q([0-9]+)_0", t)
     if m:
         return m.group(1)

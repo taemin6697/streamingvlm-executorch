@@ -23,6 +23,7 @@ llama.cpp-nested-history.bundle
 
 # Foundation generated artifacts
 my_research/foundation/results/
+my_research/foundation_llamacpp/results/
 
 # Model/runtime artifacts should be regenerated or downloaded, not committed.
 *.pte

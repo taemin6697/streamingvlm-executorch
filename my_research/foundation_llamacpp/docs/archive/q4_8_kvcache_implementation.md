@@ -1,377 +1,327 @@
-# OpenCL quantized KV (`Q8_0` / `Q4_0`) + Flash Attention — 구현 상세 (확장판)
+# OpenCL 양자 KV (`Q8_0` / `Q4_0`) + Flash Attention — 구현·재현 가이드 (StreamingVLM)
 
-StreamingVLM 워크스페이스에서 **안드로이드 OpenCL**로 `llama.cpp` **`--cache-type-k` / `--cache-type-v`** (`q8_0`, `q4_0` 등)을 쓸 때 필요한 **패치 스택·데이터 레이아웃·디버깅 절차**를 정리합니다.
+**문서 목적:** 안드로이드 **OpenCL**에서 `llama.cpp`의 `--cache-type-k` / `--cache-type-v` 로 **양자 KV**를 쓸 때 필요한 **코드 변경**, **스케줄러 이슈**, **실행 규칙**, **처음부터 재구성 절차**를 한곳에 모은다.
 
-**라인 번호**는 문서 갱신 시점의 `llama.cpp/ggml/src/ggml-opencl/…` 기준입니다. 리베이스 후에는 **심볼 검색**으로 다시 맞추세요.
+**정본(canonical) 코드:** `streamingvlm` 루트의 **`llama.cpp/`** (Git에 포함; **`llama.cpp/models/`** 는 `.gitignore`). 예전 `foundation_llamacpp/kv_code/` 미러는 **삭제됨**.
+
+**라인 번호**는 업스트림 머지마다 흔들리므로 문서에서는 **심볼/파일 검색**을 기준으로 한다.
+
+**최종 정리 시점 (워크스페이스 기준):**  
+- `GGML_OP_SET_ROWS` → Q8_0 / Q4_0 OpenCL 커널 + `supports_op`  
+- `GGML_OP_FLASH_ATTN_EXT` → 양자 KV **dequant 임시 버퍼** + **`supports_op` 에서 양자 KV 허용**(스케줄러가 CPU로 FA를 보내지 않도록)  
+- `ggml_flash_attn_ext` 의 **dst 타입은 항상 F32** → OpenCL `supports_op` 에 **F16 Q + 논리적 F16 K/V + F32 dst** 패턴 필요  
+- 결과 폴더 슬러그: **f16 KV → `_kv16`**, `q8_0` → **`_kv8`**  
+- 스윕 스크립트: **`my_research/foundation_llamacpp/results/log/` 바로 아래**에 런 디렉터리만 생성 (중간 `log_*_sweep_*` 부모 폴더 없음)  
+- 표준 실험 플래그(사용자 규칙): **`--flash-attn on`, `--fit on`, `--warmup`**
 
 ---
 
-## 목차 (빠른 점프)
+## 목차
 
 1. [문제 배경](#1-문제-배경)
-2. [업스트림 베이스 (PR / cherry-pick)](#2-업스트림-베이스-pr--cherry-pick)
-3. [StreamingVLM이 PR 위에 얹는 층](#3-streamingvlm이-pr-위에-얹는-층)
-4. [GGML `SET_ROWS` 연산 의미 — 텐서·포인터 레거시](#4-ggml-set_rows-연산-의미--텐서포인터-레거시)
-5. [`set_rows.cl` — 줄·블록 단위 해설](#5-set_rowscl--줄블록-단위-해설)
-6. [`ggml_cl_set_rows` — 인자 매핑·워크그룹](#6-ggml_cl_set_rows--인자-매핑워크그룹)
-7. [`ggml_opencl_supports_op` / 커널 로드](#7-ggml_opencl_supports_op--커널-로드)
-8. [Flash Attention + 양자 KV: `ggml_cl_flash_attn_prepare_quantized_tensor`](#8-flash-attention--양자-kv-ggml_cl_flash_attn_prepare_quantized_tensor)
-9. [CPU 레퍼런스 줄대줄 대응표 (Q4)](#9-cpu-레퍼런스-줄대줄-대응표-q4)
-10. [CMake: 커널 임베드 파이프라인](#10-cmake-커널-임베드-파이프라인)
-11. [빌드·실행·로그 폴더](#11-빌드실행로그-폴더)
-12. [소스 저장 위치 (미러 없음)](#12-소스-저장-위치-미러-없음)
+2. [업스트림과 StreamingVLM 오버레이의 관계](#2-업스트림과-streamingvlm-오버레이의-관계)
+3. [패치가 건드리는 파일 요약](#3-패치가-건드리는-파일-요약)
+4. [`SET_ROWS` 의미 · OpenCL 디스패치](#4-set_rows-의미--opencl-디스패치)
+5. [`set_rows.cl` (Q8 / Q4)](#5-set_rowscl-q8--q4)
+6. [`ggml_cl_set_rows` 호스트 측](#6-ggml_cl_set_rows-호스트-측)
+7. [`ggml_opencl_supports_op`](#7-ggml_opencl_supports_op)
+   - 7.4 [필수: `GGML_OP_FLASH_ATTN_EXT` + 양자 KV](#74-필수-ggml_op_flash_attn_ext--양자-kv)
+8. [Flash Attention + 양자 KV: 준비 함수](#8-flash-attention--양자-kv-준비-함수)
+9. [CPU 레퍼런스 대응 (Q4)](#9-cpu-레퍼런스-대응-q4)
+10. [CMake / 커널 임베드](#10-cmake--커널-임베드)
+11. [빌드·디바이스 실행·로그 규칙](#11-빌드디바이스-실행로그-규칙)
+12. [foundation_llamacpp 브리지 (`opencl_phase_mtmd`)](#12-foundation_llamacpp-브리지-opencl_phase_mtmd)
 13. [증상 → 원인](#13-증상--원인)
-14. [실험적으로 한 블록 검증하는 법](#14-실험적으로-한-블록-검증하는-법)
-15. [리베이스 체크리스트](#15-리베이스-체크리스트)
+14. [한 블록 단위 검증](#14-한-블록-단위-검증)
+15. [업스트림 리베이스 체크리스트](#15-업스트림-리베이스-체크리스트)
+16. [Greenfield: 처음부터 재구성](#16-greenfield-처음부터-재구성)
+17. [부록: 내부 노트](#17-부록-내부-노트)
 
 ---
 
 ## 1. 문제 배경
 
-1. 양자화 KV를 쓰면, 그래프는 **실수 행**(보통 **F32**, `k_cur`류)과 **양자 버퍼** 사이에서 **`GGML_OP_SET_ROWS`** 로 **scatter + quantize** 를 수행합니다. OpenCL에서는 이게 **GPU `cl_mem`** 위에서 돌아가야 합니다.
-2. OpenCL 백엔드가 **`SET_ROWS`의 `dst` 타입으로 `Q8_0`/`Q4_0`을 허용하지 않거나**, 대응 **커널이 없으면** 예약 단계나 실행 단계에서 실패합니다.
-3. **`GGML_OPENCL_SOA_Q`** (Android OpenCL `CMakeLists.txt`에서 정의)는 **가중치** 쪽 **SoA**(scale/quants 분리) 경로와 맞물립니다. **KV `SET_ROWS` 대상 버퍼**는 보통 **`ggml_tensor_extra_cl::data_device` 단일 버퍼** 위의 **연속 `block_q*` 레이아웃**이므로, **가중치 SoA 커널과 혼동하면 안 됩니다.**
-4. Flash Attention을 켠 경로에서 K/V가 **양자형**이면, FA 커널 입력 전에 **호스트에서 dequant → 임시 선형 F16/F32 버퍼**로 옮기는 **`ggml_cl_flash_attn_prepare_quantized_tensor`** 가 개입합니다. 이때 K/V가 **`ggml_permute` 등으로 `ne[0]` 방향 비연속**이면, **버퍼 전체를 한 덩어리로 `to_float`** 하면 **행 경계가 틀어져** 디코더가 **반복 무의미 토큰**으로 무너질 수 있습니다 → **행 단위 memcpy pack** 패치가 필요합니다.
+1. **양자 KV**를 쓰면 그래프에서 **F32 행**과 **KV 버퍼 뷰** 사이에 **`GGML_OP_SET_ROWS`** (scatter + quantize)가 들어간다. OpenCL에서는 **GPU `cl_mem`** 상에서 동작해야 한다.
+2. OpenCL이 `SET_ROWS` 대상 **`dst` 타입으로 Q8_0/Q4_0을 허용하지 않거나** 커널이 없으면 **예약(`sched_reserve`) 또는 실행 단계**에서 실패한다.
+3. **`--flash-attn on`** 이면 **`GGML_OP_FLASH_ATTN_EXT`** 가 KV를 읽는다. **저장은 q8_0**이어도 FA 커널은 **연속 F16/F32 K·V**를 기대하므로, OpenCL 측에서 **GPU → 호스트 dequant → 임시 선형 버퍼 → 다시 GPU** 같은 **준비 경로**가 필요할 수 있다.
+4. **치명적 버그(2026-05 정리):** `ggml_opencl_supports_op` 가 **양자 K/V인 FA**를 “미지원”으로 두면, 스케줄러가 FA를 **CPU**에 붙이고 K/V 텐서는 **OpenCL 버퍼**에 남긴다. CPU FA는 **호스트 포인터**를 기대하므로 **`common_init_from_params` 빈 워밍업 단계에서 SIGSEGV**가 난다. → **반드시 OpenCL이 양자 KV FA를 지원한다고 선언**하고, 실행 시 **prepare 경로**로 맞춘다.
+5. **`ggml_permute` 등으로 K/V가 `ne[0]` 방향 비연속**이면, GPU 바이트 덤프를 통째로 `to_float` 하면 **행이 어긋나** 디코드가 **무의미 반복 토큰**으로 붕괴한다 → **행 단위 pack** 후 dequant.
 
 ---
 
-## 2. 업스트림 베이스 (PR / cherry-pick)
+## 2. 업스트림과 StreamingVLM 오버레이의 관계
 
-- Draft PR: [llama.cpp#21313](https://github.com/ggml-org/llama.cpp/pull/21313) — OpenCL FA 개선·양자 KV prep 등 (문서 작성 시점 기준 Draft).
-- 실제 패치 파일은 **`llama.cpp/`** 네스트 트리에만 두고, 과거에는 `foundation_llamacpp/kv_code/` 미러가 있었으나 **제거됨** (런타임·빌드 미사용).
-- PR만 가져올 때 예:
-  ```bash
-  git fetch upstream pull/21313/head:refs/tmp/pr21313-opencl-fa
-  git show refs/tmp/pr21313-opencl-fa:ggml/src/ggml-opencl/ggml-opencl.cpp | head
-  ```
+- **참고 Draft PR:** [llama.cpp#21313](https://github.com/ggml-org/llama.cpp/pull/21313) (OpenCL FA·양자 KV 관련 아이디어; 본 워크스페이스는 **전부를 그대로 머지하지 않을 수 있음**).
+- **`ggml-org/llama.cpp` `master`** 를 subtree 등으로 가져온 뒤, **StreamingVLM에서 필요한 최소 diff**만 `llama.cpp/ggml/src/ggml-opencl/` 등에 유지한다.
+- **대형 PR의 kv_pad / split / `flash_attn_pre_f16.cl`** 류는 **정확성에 필수는 아님**(최소 패치는 supports + prepare + SET_ROWS). **성능** 개선용으로만 선택 이식.
 
 ---
 
-## 3. StreamingVLM이 PR 위에 얹는 층
+## 3. 패치가 건드리는 파일 요약
 
-| 구분 | 파일 | 내용 |
+| 구분 | 경로 | 내용 |
 |------|------|------|
-| SET_ROWS 커널 | `llama.cpp/ggml/src/ggml-opencl/kernels/set_rows.cl` | F32 → `block_q8_0` / `block_q4_0` on-GPU |
-| 디스패치·지원 선언 | `llama.cpp/ggml/src/ggml-opencl/ggml-opencl.cpp` | `supports_op`, `ggml_cl_set_rows`, `clCreateKernel` |
-| FA 양자 pack | 동일 `ggml-opencl.cpp` | `ggml_cl_flash_attn_prepare_quantized_tensor` |
-| 빌드 등록 | `llama.cpp/ggml/src/ggml-opencl/CMakeLists.txt` | `set_rows` in `GGML_OPENCL_KERNELS` |
-| 런/로그 | `run_android_hybrid_bridge.py`, `run_opencl_ctx_sweep.sh` | `--cache-type-*`, `…_kv8` 디렉터리 슬러그 |
+| SET_ROWS 커널 | `llama.cpp/ggml/src/ggml-opencl/kernels/set_rows.cl` | F32 행 → `block_q8_0` / `block_q4_0` GPU quant |
+| OpenCL 디스패치 | `llama.cpp/ggml/src/ggml-opencl/ggml-opencl.cpp` | `supports_op`(SET_ROWS, **FLASH_ATTN_EXT**), `ggml_cl_set_rows`, **`ggml_cl_flash_attn`** + **`ggml_cl_flash_attn_prepare_quantized_tensor`**, `clCreateKernel` |
+| 커널 목록 | `llama.cpp/ggml/src/ggml-opencl/CMakeLists.txt` | `set_rows` 가 `GGML_OPENCL_KERNELS` 에 포함 |
+
+**foundation_llacampp 쪽 (브리지·실행)**
+
+| 구분 | 경로 |
+|------|------|
+| Android 브리지 CMake | `my_research/foundation_llamacpp/hybrid_bridge/CMakeLists.txt` |
+| 위상·페이즈 도구 | `my_research/foundation_llamacpp/hybrid_bridge/opencl_phase_mtmd.cpp` |
+| 단일 디바이스 실행 | `my_research/foundation_llamacpp/run_android_hybrid_bridge.py` |
+| ctx 스윕 | `my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh` |
 
 ---
 
-## 4. GGML `SET_ROWS` 연산 의미 — 텐서·포인터 레거시
+## 4. `SET_ROWS` 의미 · OpenCL 디스패치
 
-**선언부** (`llama.cpp/ggml/src/ggml.c`, 검색 `struct ggml_tensor * ggml_set_rows`): 인자 순서 **`(ctx, a, b, c)`**.
+**선언:** `ggml_set_rows(ctx, a, b, c)` (`ggml.c` 검색).
 
-- 호출 패턴 문서 주석 및 **결과 텐서**:
-  - `result = ggml_view_tensor(ctx, a);`
-  - `result->src[0] = b;` ← **실수 원본 행들 (F32)**
-  - `result->src[1] = c;` ← **인덱스 텐서 (I32 또는 I64)**
-  - `result->src[2] = a;` ← **전체 KV(또는 대상) 버퍼의 view — 레거시 순서 주의** (discussion: PR #16063 코멘트 링크가 소스 근처에 있음)
+- 결과 텐서는 **`a`의 뷰**; `src[0]=b`(F32 행들), `src[1]=c`(인덱스 I32/I64), `src[2]=a`(대상 KV 뷰, 레거시 순서 주의).
 
-**의미적으로** 오픈클 구현 함수 `ggml_cl_set_rows(backend, src0, src1, dst)` 에 넘어올 때:
+**OpenCL** `ggml_cl_set_rows(backend, src0, src1, dst)`:
 
-- DAG에서 `dst` 인자가 **scatter 대상 레이아웜** (= view `a`와 같은 버퍼/형태를 가진 텐서).
-- `src0` = **업데이트할 실수 행 묶음 (F32)**.
-- `src1` = **행 번호 매핑 (indices)**.
-
-`ggml.c` 검증 포인터:
-
-- `GGML_ASSERT(b->type == GGML_TYPE_F32);`
-- 인덱스 `c`: `GGML_TYPE_I64 || GGML_TYPE_I32`.
-
-OpenCL 디스패치는 **`dst->type`** 으로 F16/F32/Q8/Q4 선택 (`ggml-opencl.cpp` `ggml_cl_set_rows`).
+- **`dst->type`** 이 Q8_0/Q4_0/F16/F32 에 따라 다른 커널.
 
 ---
 
-## 5. `set_rows.cl` — 줄·블록 단위 해설
+## 5. `set_rows.cl` (Q8 / Q4)
 
-**경로:** `llama.cpp/ggml/src/ggml-opencl/kernels/set_rows.cl`  
-**빌드:** `GGML_OPENCL_EMBED_KERNELS` 시 `embed_kernel.py` → `autogenerated/set_rows.cl.h` 포함 컴파일.
+**경로:** `llama.cpp/ggml/src/ggml-opencl/kernels/set_rows.cl`
 
-### 5.1 헤더·Q8 블록 (대략 L1–23)
+- **Q8_0:** `block_q8_0`, `kernel_set_rows_quantize_block_q8_0`, `kernel_set_rows_q8_0_i32` / `_i64`
+- **Q4_0:** `QK4_0_KV` 등으로 다른 커널과 매크로 충돌 방지; **`kernel_set_rows_i32_as_int8_truncate`**, **`kernel_set_rows_q4_packed_nibble_ref`** 로 CPU `quantize_row_q4_0_ref` 와 같은 **truncate + `(int8_t)(x+8.5f)` + `MIN(15, …)`** 니블 적재
+- **워크그룹:** 한 `ne01` 행을 여러 WI가 **quant 블록** 단위로 나눔 (`nblk0` 루프)
 
-| 줄(대략) | 코드 | 설명 |
-|----------|------|------|
-| L1 | `#pragma OPENCL EXTENSION cl_khr_fp16 : enable` | `half` 사용 |
-| L3–7 | `block_q8_0` | `half d` + `char qs[32]` — GGUF Q8_0 블록 |
-| L10–23 | `kernel_set_rows_quantize_block_q8_0` | 블록별 `amax` → `d=amax/127`, `id=1/d`, 각 원소 `round(x*id)` 후 `convert_char_sat` 로 int8 포화 |
-
-### 5.2 Q4 블록·레퍼 정합 (대략 L25–69)
-
-| 줄(대략) | 코드 | 설명 |
-|----------|------|------|
-| L26–30 | `QK4_0_KV`, `block_q4_0` | 매크로 이름을 `QK4`만 쓰지 않은 이유: 다른 커널/헤더와 심벌 충돌 방지 |
-| L33–39 | `kernel_set_rows_i32_as_int8_truncate` | C의 `(int8_t)(float)` 와 CL `convert_char` 계열 차이 완화: **32비트 정수 → 하위 8비트를 signed 로 해석** |
-| L41–46 | `kernel_set_rows_q4_packed_nibble_ref` | `quantize_row_q4_0_ref` 의 `MIN(15, (int8_t)(x+8.5f))` 를 흉내 냄 |
-| L48–68 | `kernel_set_rows_quantize_block_q4_0` | 블록당 **절대값 최대의 부호있는 원소 `max_val`** 로 `d = max_val/-8`; 상·하반 16개씩 니블 2개 패킹 |
-
-### 5.3 `fastdiv` / `fastmod` (~L71–79)
-
-GPU에서 `%`/`/` 대신 미리 패킹한 상수로 **루프 친화 modulo** — F32/F16 set_rows 와 동일 패턴 유지.
-
-### 5.4 공통 실행 패턴 (`kernel_set_rows_*`)
-
-아래는 **`kernel_set_rows_q8_0_i32`** 기준으로 **거의 한 줄씩** 풀이합니다. **`_i64`** 는 `long` 로드 차이만 다릅니다. **`q4_0`** 는 `block_q4_0*`, 스트라이드 `QK4_0_KV` 차이입니다.
-
-#### (A) 버퍼 베이스 + 오프셋 (~L247–251)
-
-```
-src0 = src0 + offset0;
-src1 = src1 + offset1;
-dst  = dst  + offsetd;
-```
-
-- 모든 포인터는 **`ggml_tensor_extra_cl`** 의 `data_device + view_offs` 를 C++ 에서 미리 더한 바이트 오프셋을 받습니다.
-
-#### (B) 워크아이템 좌표 (~L252–258)
-
-```
-i03 = get_group_id(2);   // ne03 / 배치 깊이
-i02 = get_group_id(1);   // ne02
-i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);  // ne01 (src0 행 축)
-if (i01 >= ne01) return;
-```
-
-- **디멘션 1 (`ne01`)**: `src0` 의 “행” 인덱스 — 이 행이 **어느 KV 슬롯으로 갈지** 정하는 축.
-- **`get_local_id(1)`** 으로 `ne01` 을 쪼갬.
-- **`get_local_id(0)`** 은 뒤쪽 **블록 루프**에서 사용 (한 행에 여러 quant 블록).
-
-#### (C) 인덱스 텐서에서 `i1` (~L260–266)
-
-```
-i12 = fastmod(i03, ne12);
-i11 = fastmod(i02, ne11);
-i10 = i01;
-i1  = ((global int *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
-```
-
-- `src1` 은 보통 **`ne[0]==1`** 인 스칼라 인덱스 격자 — **실제 KV 행 인덱스 `i1`**.
-- **`dst_row` 주소:**
-  `(global block_q8_0 *)(dst + i1*nb1 + i02*nb2 + i03*nb3)`
-- **`src_row` 주소:**
-  `(global float *)(src0 + i01*nb01 + i02*nb02 + i03*nb03)`
-
-즉 **`src0` 의 i01번 “업데이트 행”**을 **`dst` 의 i1번 “KV 슬롯 행”**에 씁니다.
-
-#### (D) 블록 루프 (~L269–271, Q8 예)
-
-```
-for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {
-    kernel_set_rows_quantize_block_q8_0(src_row + ind * QK8_0, dst_row + ind);
-}
-```
-
-- **`nblk0`** (호스트에서 전달) = `ne0 / ggml_blck_size(dst_type)` = **한 논리 행을 몇 개의 quant 블록으로 나누는지**.
-- **Q8_0 / Q4_0** 모두 GGML 표준에서 **블록당 32 원소** → `QK8_0 == 32`, `QK4_0_KV == 32`.
-- **워크아이템 0번 차원**으로 `ind` 를 스트라이드 분배 → 여러 WI가 **한 행의 서로 다른 블록**을 병렬 처리.
-
-**Q4 커널** (`kernel_set_rows_q4_0_i32`, ~L321–365): 구조 동일, `block_q4_0`, `QK4_0_KV`, `kernel_set_rows_quantize_block_q4_0` 호출.
+(세부 줄 단위 테이블은 이전판과 동일하게 커널 파일을 따라가며 확인.)
 
 ---
 
-## 6. `ggml_cl_set_rows` — 인자 매핑·워크그룹
+## 6. `ggml_cl_set_rows` 호스트 측
 
-**위치:** `ggml-opencl.cpp` 검색 `static void ggml_cl_set_rows` (현재 트리 **L6438–6567** 근처).
+**검색:** `static void ggml_cl_set_rows`
 
-### 6.1 호스트에서 뽑는 스칼라
-
-- `ne01,ne02,ne03` ← **`src0`** (F32 소스)의 상위 차원.
-- `nb01,nb02,nb03` ← `src0->nb[1..3]` (바이트 stride).
-- `ne11,ne12` ← **`src1`** (indices) 의 `ne[1],ne[2]`.
-- `nb10,nb11,nb12` ← `src1->nb[0..2]`.
-- `ne0` ← **`dst->ne[0]`** (한 행의 “원소” 수 — 양자형이면 **32의 배수** typical).
-- `nb1,nb2,nb3` ← `dst->nb[1..3]`.
-- **`nblk0 = ne0 / ggml_blck_size(dst->type)`** (**L6472**).
-
-### 6.2 `clSetKernelArg` 표 (kernel arg 인덱스)
-
-| Arg | 변수 | 의미 |
-|-----|------|------|
-| 0 | `extra0->data_device` | src0 클 버퍼 |
-| 1 | `offset0` | src0 서브버퍼 오프셋 |
-| 2 | `extra1->data_device` | src1 (indices) |
-| 3 | `offset1` | src1 오프셋 |
-| 4 | `extrad->data_device` | dst 버퍼 |
-| 5 | `offsetd` | dst 오프셋 |
-| 6 | `ne01` | |
-| 7–9 | `nb01,nb02,nb03` | src0 strides |
-| 10–11 | `ne11_, ne12_` | **fastdiv 패킹 구조체** (`init_fastdiv_values`) |
-| 12–14 | `nb10,nb11,nb12` | src1 strides |
-| 15 | **`nblk0`** | 행당 quant 블록 수 |
-| 16–18 | `nb1,nb2,nb3` | dst strides |
-
-### 6.3 로컬/글로벌 크기 (**L6542–6564**)
-
-- `nth0` 초기: Intel **32**, Adreno **64** 등.
-- `while (nth0 < nblk0 && nth0 < max_workgroup_size) nth0 *= 2` — **한 WI 그룹이 최대한 많은 블록**을 커버하되 **장치 한도** 내.
-- **`rows_per_workgroup`**: `nth0 > nblk0` 이면 `nth0` 를 줄이고 행당 병렬도 조정.
-
-**global:**
-
-- dim0: `(ne01 + rows_per_workgroup - 1) / rows_per_workgroup * nth0`
-- dim1: `ne02 * rows_per_workgroup`
-- dim2: `ne03`
-
-**local:** `{ nth0, rows_per_workgroup, 1 }`
-
-이 레이아웃은 기존 F32/F16 `set_rows` 와 동일하게 **Q8/Q4** 가 병합되도록 설계됨.
+- 차원/`nb`/블록 수 `nblk0 = ne0 / ggml_blck_size(dst_type)` 설정 후 `clSetKernelArg`, global/local NDRange.
 
 ---
 
-## 7. `ggml_opencl_supports_op` / 커널 로드
+## 7. `ggml_opencl_supports_op`
 
-### 7.1 `supports_op` — `GGML_OP_SET_ROWS`
+### 7.1 `GGML_OP_SET_ROWS`
 
-**검색:** `case GGML_OP_SET_ROWS:` (현재 ~**L3885–3901**)
+**검색:** `case GGML_OP_SET_ROWS:`
 
-- `op->src[0]->type == F32` 아니면 **false**.
-- `op->type` (결과=dst 뷰 타입) 이 `F16/F32/Q8_0/Q4_0` 이고 `src1` 이 I64/I32 이면 **true**.
+- `src[0]` F32, `src[1]` I32/I64, **`op->type`(dst)** 가 F16/F32/**Q8_0**/ **Q4_0** 일 때 true (프로젝트 패치 기준).
 
-### 7.2 `GET_ROWS` + SoA 경고
+### 7.2 `GET_ROWS` + SoA
 
-같은 함수 안 **`GGML_OP_GET_ROWS`** 분기에서 **`GGML_TYPE_Q4_0` + `GGML_OPENCL_SOA_Q`** 이면 **false** (~L3875–3878).  
-이건 **가중치 SoA flatten** 미지원 이야기이고, **KV `SET_ROWS`** 와는 별 이슈 — 로그 혼동 주의.
+**`GGML_OP_GET_ROWS`** 에서 **`Q4_0` + `GGML_OPENCL_SOA_Q`** 등은 **가중치 SoA** 경로와 혼동되면 안 됨. KV **`SET_ROWS`** 와 문제 성격이 다르다.
 
-### 7.3 커널 생성
+### 7.3 커널 로드
 
-**검색:** `kernel_set_rows_q8_0_i64` in `clCreateKernel` 블록 (~**L2354–2357**).  
-`program_set_rows` 빌드 직후 **F32/F16 4개 + Q8 2개 + Q4 2개** 총 8개 커널 핸들.
+**검색:** `kernel_set_rows_q8_0_i64`, `program_set_rows` — Q8/Q4 커널 핸들을 `clCreateKernel` 로 등록.
 
----
+### 7.4 필수: `GGML_OP_FLASH_ATTN_EXT` + 양자 KV
 
-## 8. Flash Attention + 양자 KV: `ggml_cl_flash_attn_prepare_quantized_tensor`
+**검색:** `case GGML_OP_FLASH_ATTN_EXT:` 안의 `k_logical_type` / `is_f16_f16_out_f32`.
 
-**정의:** ~**L9110–9200**. **호출:** `ggml_cl_flash_attn` 내부 ~**L9320–9323** (항상 `k`,`v`에 대해 호출).
+- **`ggml_flash_attn_ext()`** 로 만든 노드의 **결과 타입은 항상 F32** (`ggml_new_tensor(..., GGML_TYPE_F32, ...)`).
+- 예전 OpenCL 매칭이 **`q`(F16) + `k`/`v`(Q8 저장) + `op`(F32)** 인 경우를 **전부 거부**했고, 결과적으로 **[증상]** FA가 CPU로 떨어짐 → **SIGSEGV**.
+- **수정 요지:**
+  - K/V 가 **양자**이면 **같은 양자형** 등 제약 검사.
+  - **논리 타입:** `ggml_is_quantized(k)` 이면 `q` 가 F16이면 **논리 K/V는 F16**, 아니면 F32.
+  - **허용 조합 예:**  
+    - `q`/`k`/`v` 저장형이 허용된 F32/F16 조합  
+    - **추가:** **`q` F16 + 논리 K/V F16 + **`op->type == F32`** (`is_f16_f16_out_f32`)** ← llama-graph 기본 FA 노드 패턴과 맞춤.
 
-### 8.1 반환값 의미
-
-- `tensor` 가 **비양자**면 **즉시 `false` 반환** — `k_data_device`, `k_nb*` 는 **호출 전 값 유지** (원본 GPU 버퍼 + 원래 stride).
-- **양자**면 **`true` 암시적** (함수 끝까지 진행): 임시 `cl_mem` 을 만들고 **`data_device`/`offset`/`nb1..3` 을 덮어씀**.
-
-### 8.2 양자일 때 데이터 흐름 (호스트 경유)
-
-1. `sync_with_other_backends` — 멀티 백엔드 시 안전.
-2. `clEnqueueReadBuffer` 로 **전체 `ggml_nbytes(tensor)`** 를 `host_raw`에 복사 (GPU byte 그대로).
-3. `row_bytes = ggml_row_size(type, ne[0])` — **논리적 한 행의 바이트 길이** (양자 블록 정렬 포함).
-4. **`ggml_is_contiguous_0(tensor)` 가 거짓**이면:
-   - `ne1*ne2*ne3` 행을 `(i1,i2,i3)` 순으로 돌며  
-     `row_off = i1*nb[1] + i2*nb[2] + i3*nb[3]`  
-     `memcpy(host_packed, host_raw+row_off, row_bytes)`  
-   - 이렇게 만든 **밀집 양자 슬랩**을 `to_float` 입력으로 사용.
-5. `ggml_get_type_traits->to_float` → **전체 `n = ggml_nelements` 개 float**.
-6. `kv_target_type` (`q`가 F16이면 F16, 아니면 F32)으로 **FP16/FP32 선형 버퍼** 생성 후 `clEnqueueWriteBuffer`.
-7. **Stride 재설정:**  
-   `nb1 = ne[0] * sizeof(elem)`  
-   `nb2 = ne[1] * nb1`  
-   `nb3 = ne[2] * nb2`  
-   → FA 커널이 기대하는 **완전 연속 텐서** 레이아웃.
-
-**비용:** 경고 로그 `"dequantizes GPU-resident quantized KV … performance may be poor"` — 매 FA 스텝마다 **읽기+호스트 dequant+다시 올림** 가능.
-
-### 8.3 `ggml_cl_flash_attn` 에서의 맥락 (~L9227–9323)
-
-- `k`/`v` 가 둘 다 같은 양자형이어야 함 (`GGML_ASSERT`).
-- `kv_target_type` 은 **Q의 타입**에 맞춤 (`is_f16` → F16).
-- **prepare 이후** `k_nb1` 등이 **선형 버퍼 기준**으로 바뀌므로, 이후 **kv pad 커널** 등도 그 stride를 사용 (~L9342+ `k_pad_size` 계산).
+이와 짝으로 **`ggml_cl_flash_attn`** 에서 **`k_logical_type`** 으로 mixed/f16 커널 선택을 맞추고, **`ggml_cl_flash_attn_prepare_quantized_tensor`** 로 실제 디바이스/stride를 교체한다.
 
 ---
 
-## 9. CPU 레퍼런스 줄대줄 대응표 (Q4)
+## 8. Flash Attention + 양자 KV: 준비 함수
 
-**CPU:** `llama.cpp/ggml/src/ggml-quants.c` `quantize_row_q4_0_ref` (~**L36–71**).
+**구조체:** `ggml_cl_flash_attn_temp_buffer` (임시 `cl_mem`, 소멸자에서 `clReleaseMemObject`)
 
-| CPU (C) | OpenCL (`set_rows.cl`) |
-|---------|-------------------------|
-| `amax`, `max` (절대값 최대와 그 위치의 부호값) | `kernel_set_rows_quantize_block_q4_0` 동일 이중 루프 |
-| `d = max / -8` | 동일 |
-| `id = 1/d` (d==0 처리) | `float id = d != 0.f ? ...` |
-| `y[i].d = GGML_FP32_TO_FP16(d)` | `dst_blk->d = (half)d` |
-| `x0 = x[...]*id` 등 | 동일 인덱싱 패턴 (`0+j`, `qk/2+j`) |
-| `MIN(15, (int8_t)(x0 + 8.5f))` | `kernel_set_rows_q4_packed_nibble_ref` + int8 truncate 헬퍼 |
-| 니블 패킹 `xi0 \| (xi1<<4)` | 동일 |
+**함수:** `ggml_cl_flash_attn_prepare_quantized_tensor(...)` (**검색으로 위치 확인**)
 
-Q8 레퍼는 `quantize_row_q8_0` / 타입 특성 테이블 `from_float_ref` 와 블록 루프를 대조하면 됩니다.
+- **비양자:** 즉시 `false` 반환 → **포인터/stride 변경 없음**
+- **양자:**
+  1. `sync_with_other_backends` 후 `clEnqueueReadBuffer` 전체 `ggml_nbytes`
+  2. **`!ggml_is_contiguous_0(tensor)`** 이면 `(i1,i2,i3)` 이중 루프로 **`row_off = i1*nb1+i2*nb2+i3*nb3`**, **`ggml_row_size(type, ne[0])`** 바이트만 `memcpy` 해 **dense 양자 슬랩** 구축
+  3. `to_float` → `kv_target_type`(Q가 F16이면 F16, 아니면 F32)으로 선형 버퍼
+  4. `clCreateBuffer` + `clEnqueueWriteBuffer`; **`data_device`/`offset`/linear `nb1..3`** 갱신
+  5. 성능 경고 1회: dequant 및 임시 버퍼
+
+**호출부:** **`ggml_cl_flash_attn`** 내부에서 **커널 선택 이후**, `clSetKernelArg` 전에 **`k`/`v` 각각 호출**(항상 호출되며, 비양자면 no-op).
+
+**참고:** 업스트림 full PR의 **KV pad preload 커널** 등은 **본 최소 스택에는 없음**—stride만 임시 선형 버퍼에 맞추면 현재 단일 FA 커널 경로로 동작 확인됨.
 
 ---
 
-## 10. CMake: 커널 임베드 파이프라인
+## 9. CPU 레퍼런스 대응 (Q4)
+
+**CPU:** `ggml-quants.c` **`quantize_row_q4_0_ref`**
+
+OpenCL **`kernel_set_rows_quantize_block_q4_0`** + 니블/트렁케이트 헬퍼와 **바이트 단위** 비교로 검증.
+
+---
+
+## 10. CMake / 커널 임베드
 
 **파일:** `llama.cpp/ggml/src/ggml-opencl/CMakeLists.txt`
 
-1. **`add_compile_definitions(GGML_OPENCL_SOA_Q)`** (~L17) — SoA 경로 켜짐 (가중치).
-2. **`function(ggml_opencl_add_kernel KNAME)`** (~L34+):  
-   - `kernels/${KNAME}.cl` → `Python3 embed_kernel.py` → `${BUILD}/autogenerated/${KNAME}.cl.h`  
-   - `target_sources(... PRIVATE ${KERN_HDR})`.
-3. **`set(GGML_OPENCL_KERNELS ... set_rows ...)`** 에 **`set_rows` 포함 필수**.
-4. C++ 에서 **`#include "set_rows.cl.h"`** 포함 위치는 `ggml-opencl.cpp` 초기화 블록 (`program_set_rows`).
-
-임베드 끈 빌드에선 **`configure_file` 로 `.cl` 를 출력 디렉터리에 복사** — 런타임 컴파일/로드 방식 차이 주의.
+- **`set_rows`** 가 **`GGML_OPENCL_KERNELS`** 리스트에 있어야 함.
+- 빌드 시 `embed_kernel.py` → `set_rows.cl.h` 등 자동 생성.
 
 ---
 
-## 11. 빌드·실행·로그 폴더
+## 11. 빌드·디바이스 실행·로그 규칙
 
-- **예시 빌드 트리:** `my_research/foundation_llamacpp/build-hybrid-android-opencl`
-- **재빌드:** `cmake --build …/build-hybrid-android-opencl -j$(nproc)` 후 **`libggml-opencl.so` 타임스탬프** 확인.
+### 11.1 Android OpenCL 브리지 빌드
 
-**스윕:**
+- **CMake 소스 트리:** `my_research/foundation_llamacpp/hybrid_bridge` (여기서 `add_subdirectory(llama.cpp)`).
+- 툴체인 예: Android NDK, `ANDROID_ABI=arm64-v8a`, `ANDROID_PLATFORM` 적절히, **`GGML_OPENCL=ON`**.
 
 ```bash
-CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 PROCESSOR=gpu FLASH_ATTN=auto \
-CTX_SIZES_OVERRIDE=1024 \
-./my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh
+cmake -S my_research/foundation_llamacpp/hybrid_bridge -B build-hybrid-android-opencl \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake"
+cmake --build build-hybrid-android-opencl -j"$(nproc)"
 ```
 
-- 양자 KV 시 스크립트 기본 **`FIT=off`** → `--fit off` (예약 단계 SET_ROWS 문제 완화).
+중요 산출물: `libggml-opencl.so`, **`opencl_phase_mtmd`**, `hybrid_decode`, … (`build-hybrid-android-opencl` 또는 `bin/` 아래 레이아웃은 빌드 설정에 따름).
 
-**결과 경로 패턴:** `…/results/log/<stem>_opencl_ctx_<N>_kv8` 등  
-`_result_kv_slug_part` 규칙: `q8_0`→`8`, `q4_0`→`4`, 미지정 캐시→`f16`→`_kvf16` (`run_android_hybrid_bridge.py` ~L727–755).
+### 11.2 단발 실행 (`run_android_hybrid_bridge.py`)
 
-**플롯:** `plot_opencl_ctx_memory_series.py` 의 `ctx_from_dir` 가 `re.search(r"_ctx_(\d+)", name)` 로 **`_kv…` 접미사가 있어도** ctx 파싱 가능.
+**권장 플래그 (프로덕션 실험):**
+
+- `--flash-attn on`
+- `--fit on`
+- `--warmup`
+
+예 (GPU / InternVL):
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor gpu \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/.../InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/.../mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --ctx-size 8192 \
+  --cache-type-k f16 --cache-type-v f16 \
+  --flash-attn on --fit on --warmup
+```
+
+양자 KV:
+
+```bash
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --flash-attn on --fit on --warmup
+```
+
+### 11.3 ctx 스윕 (`run_opencl_ctx_sweep.sh`)
+
+- **기본 ctx:** `512 1024 2048 4096 8192 16384 32768`
+- **`--results-root` 는 항상**  
+  **`${REPO}/my_research/foundation_llamacpp/results/log`**  
+  에 고정되어 있음 (**중간 `log_*_sweep_*` 부모 디렉터리 사용 안 함**).
+- **`FIT` 미지정**이면: **양자 KV**일 때만 스크립트가 기본 **`FIT=off`** 를 넣음(과거 SET_ROWS+fit 회피). **사용자 규칙이 `fit on` 이면** 반드시 **`FIT=on`** 을 명시.
+
+```bash
+FIT=on FLASH_ATTN=on WARMUP=1 PROCESSOR=gpu \
+  CACHE_TYPE_K=f16 CACHE_TYPE_V=f16 \
+  ./my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh
+
+FIT=on FLASH_ATTN=on WARMUP=1 PROCESSOR=gpu \
+  CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 \
+  ./my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh
+```
+
+### 11.4 결과 디렉터리 이름 (`--results-root` 직속)
+
+`_result_model_name` (`run_android_hybrid_bridge.py` 검색):
+
+- 형식: **`<모델스템>_opencl_ctx_<N>_kv<슬러그>`**
+- **`_result_kv_slug_part`:** `q8_0`→`8`, `q4_0`→`4`, **`f16`/`fp16`→`16`** ⇒ 접미사 **`_kv16`**, **`_kv8`** (예전 `_kvf16` 명명 폐기)
+- 사용자가 추가로 **`results/log/InternVL3-1B_kv16/`** 처럼 그룹 폴더를 **수동으로** 만들 수 있으나, **스크립트 기본은 `results/log/<한 단계만>`**.
+
+### 11.5 로그에서 확인할 것
+
+- **`llama_context: flash_attn = enabled`**
+- **양자 KV + FA:** (최대 1회) `ggml_cl_flash_attn_prepare_quantized_tensor: ... dequantizes ...`
+- **`sched_reserve: graph splits`** — 양자 FA가 OpenCL로 붙으면 **split 수가 과도하게 크지 않은 편**(이전 버그에서는 CPU 분배로 폭증)
+- **`foundation_exit_code.txt` → 0**
 
 ---
 
-## 12. 소스 저장 위치 (미러 없음)
+## 12. foundation_llamacpp 브리지 (`opencl_phase_mtmd`)
 
-OpenCL 패치의 **유일한 정본(canonical)** 은 **`llama.cpp/ggml/src/ggml-opencl/`** (네스트 저장소 안)입니다.  
-예전 **`my_research/foundation_llamacpp/kv_code/`** 디렉터리는 리베이스 비교용 **수동 미러**였고, 빌드·스크립트 어디에서도 참조하지 않아 **삭제해도 됨**(2026-05 삭제 완료).
+`llama.cpp` **업스트림**이 `common` 라이브러리 타깃 이름을 **`llama-common`** 으로 바꾼 뒤:
 
-PR 일부 파일만 받을 때는 `git fetch … pull/<id>/head` 후 `git show <ref>:경로 > 파일` 식으로 **임시 추출**하면 됩니다; 별도 `kv_code` 트리는 필수 아님.
+- **`hybrid_bridge/CMakeLists.txt`:**  
+  `target_link_libraries(opencl_phase_mtmd PRIVATE llama-common mtmd Threads::Threads)`  
+  (`common` 타깃명 사용 불가).
+- **`opencl_phase_mtmd.cpp`:** `base_callback_data` 제거 등 API 변화 대응  
+  → **`std::optional<common_debug_cb_user_data> mtmd_debug_graph_cb`**  
+  → 디버그 시 `emplace()`, `mparams.cb_eval_user_data = &*mtmd_debug_graph_cb`,  
+    `mparams.cb_eval = common_debug_cb_eval` (`mtmd-cli` 패턴 정렬).  
+  **`#include "debug.h"`** 필요.
+
+브리지는 **ExecuTorch를 직접 수정하지 않는** 레이아웃 규칙과 일치하게 `hybrid_bridge/` 아래에만 둔다.
+
+---
 
 ## 13. 증상 → 원인
 
 | 증상 | 우선 확인 |
 |------|-----------|
-| 예약 단계 GGML/OpenCL 에러 (`SET_ROWS`) | `supports_op`; `clCreateKernel` 실패 로그 |
-| 디코더만 반복 문자 | **`prepare_quantized_tensor` pack**; `flash_attn` 실제 on/off 로그 |
-| Q4 만 깨짐 | 니블/`d`; CPU `quantize_row_q4_0_ref` 과 hex dump 비교 |
-| 가중치 Q4 GET_ROWS 문제 | **`GGML_OPENCL_SOA_Q` + flattened Q4 GET_ROWS 차단** — KV 와 무관할 수 있음 |
+| `sched_reserve` / `SET_ROWS` 실패 | `supports_op`(SET_ROWS), `set_rows.cl` 커널 등록 |
+| 빈 워밍업 **SIGSEGV** (exit 139) | **`FLASH_ATTN_EXT` 의 `supports_op` 가 양자 KV를 거절** → CPU FA + GPU 버퍼 |
+| 가독한 영어 대신 문자 반복·깨짐 | **`prepare_quantized_tensor` 행 pack** 여부 (`ggml_is_contiguous_0`) |
+| Q4만 깨짐 | `quantize_row_q4_0_ref` vs OpenCL 니블/`d` |
+| `_kv16` 이름이 안 맞음 | `_result_kv_slug_part` 에서 **`f16`→`16`** |
 
 ---
 
-## 14. 실험적으로 한 블록 검증하는 법
+## 14. 한 블록 단위 검증
 
-1. 같은 **입력 FP32 블록 32개**(한 `block_q*` )를 잡습니다.
-2. CPU: `quantize_row_q4_0_ref` / Q8 경로 또는 `ggml_quantize_*` 호출로 **블록(hex)** 생성.
-3. GPU: 디버깅 빌드에서 해당 **KV 행 하나**만 업데이트한 뒤 `clEnqueueReadBuffer` 로 동일 블록 read (또는 간단 테스트 하네스).
-4. **바이트 단위 비교** — 불일치 시 `half d` 또는 니블 순서부터 좁힘.
+1. 동일 **32원소 FP32 블록**을 CPU quant 와 GPU `SET_ROWS` 한 행 결과로 비교.
+2. 필요 시 해당 행만 `clEnqueueReadBuffer` 로 읽어 **_hex dump**.
 
 ---
 
-## 15. 리베이스 체크리스트
+## 15. 업스트림 리베이스 체크리스트
 
-1. #21313 (또는 후속 메인 브랜치 머지) 와 **`ggml-opencl.cpp` / `flash_attn*.cl`** 충돌 해소.
-2. `set_rows.cl` ↔ **`quantize_row_*_ref`** 재검증.
-3. **`ggml_cl_flash_attn_prepare_quantized_tensor`** 중복·누락 방지 (upstream 과 동작 비교).
-4. Android 재빌드 후 `q8_0`, `q4_0` 스모크 각 1회.
-
----
-
-## 부록: 내부 연구 노트 링크
-
-- `my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp.md` — 일자별 실행·이슈·PR 메모 누적.
+1. **`ggml-opencl.cpp`** 충돌: `supports_op`(SET_ROWS + **FLASH_ATTN_EXT**), `ggml_cl_set_rows`, **`ggml_cl_flash_attn`**, **prepare**.
+2. **`set_rows.cl`** vs `quantize_row_*_ref`.
+3. 커널 리스트 CMake.
+4. **Android 재빌드** 후 **kv16 / kv8** 각각 최소 한 ctx에서 **`--flash-attn on --fit on --warmup`** 스모크.
 
 ---
 
-*본 문서는 구현 디버깅용이다. 라인 번호가 맞지 않으면 다음 심볼로 재탐색: `ggml_set_rows`, `ggml_cl_set_rows`, `kernel_set_rows_q4_0_i32`, `ggml_cl_flash_attn_prepare_quantized_tensor`, `quantize_row_q4_0_ref`.*
+## 16. Greenfield: 처음부터 재구성
+
+1. **저장소:** `streamingvlm` 클론; **`llama.cpp/models/`** 는 Git에 없음 — GGUF/mmproj는 로컬에 둠.
+2. **업스트림 싱크:** (정책에 따라) subtree `llama.cpp` 또는 수동 카피 후 **패치 재적용**.
+3. **`llama.cpp/ggml/src/ggml-opencl/` 에 적용:**
+   - `kernels/set_rows.cl` (Q8/Q4 브랜치)
+   - **`ggml-opencl.cpp`** (SET_ROWS + FA prepare + **`FLASH_ATTN_EXT supports_op`**)
+   - `CMakeLists.txt` 커널 목록.
+4. **NDK 빌드** (11절): `hybrid_bridge` 소스 디렉터리, **`GGML_OPENCL=ON`**.
+5. **ADB** 디바이스 연결 확인 후 **`run_android_hybrid_bridge.py`** 단발 → **`foundation_exit_code.txt` 0**.
+6. **스윕** (선택): `FIT=on FLASH_ATTN=on WARMUP=1` + `CACHE_TYPE_*` 로 **전 ctx 구간**.
+7. **플롯:** `scripts/plot_opencl_ctx_memory_series.py` — `--parent results/log`; **`ctx_from_dir`** 는 `_ctx_(\d+)` 라 **`_kv16` 접미사와 무관하게 ctx 추출 가능**.
+
+---
+
+## 17. 부록: 내부 노트
+
+- **`my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp.md`** — 일자별 이슈·커맨드 누적.
+- **`my_research/foundation/docs/for_cursor_llm.md`** — foundation 레이어와 교차 참고.
+
+---
+
+*심벌 검색 키워드:* `GGML_OP_SET_ROWS`, `GGML_OP_FLASH_ATTN_EXT`, `ggml_cl_set_rows`, `ggml_cl_flash_attn_prepare_quantized_tensor`, `ggml_cl_flash_attn`, `kernel_set_rows_q4_0_i32`, `quantize_row_q4_0_ref`, `_result_kv_slug_part`.

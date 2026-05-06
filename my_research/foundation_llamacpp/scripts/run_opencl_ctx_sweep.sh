@@ -33,17 +33,22 @@
 # Default f16 (baseline). For quantized KV experiments rebuild llama.cpp with OpenCL FA patch;
 # see `foundation_llamacpp/docs/for_cursor_llm_llamacpp.md` (PR #21313 cherry-pick). Example:
 #   CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 PROCESSOR=gpu ./my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh
-# Result dirs append KV slugs after ctx, e.g. ..._opencl_ctx_1024_kv8 (q8_0), ..._kvf16 (f16 default).
+# Result dirs append KV slugs after ctx, e.g. ..._opencl_ctx_1024_kv8 (q8_0), ..._kv16 (f16 KV).
 # Non-f16 KV defaults to `--fit off` (OpenCL SET_ROWS during memory-fit workaround); override with FIT=on|off.
 #
 # Limit ctx steps (space-separated numbers replaces default full sweep):
 #   CTX_SIZES_OVERRIDE="32768" PROCESSOR=gpu ./my_research/.../run_opencl_ctx_sweep.sh
 #
+# Run outputs always go directly under foundation_llamacpp/results/log/, one folder per run:
+#   <modelstem>_opencl_ctx_<N>_kv16|kv8|…  (suffix from --cache-type-k/v; default f16 → _kv16)
+# Use run_android_hybrid_bridge.py directly with another --results-root only if needed.
+#
 # Flash-attn / KV offload / attn rotation / warmup (passed to run_android_hybrid_bridge.py):
 #   FLASH_ATTN=on|off|auto   — omit by default (llama binary default).
 #   NO_KV_OFFLOAD=1        — pass --no-kv-offload.
 #   DISABLE_ATTN_KV_ROTATION=1 — device exports LLAMA_ATTN_ROT_DISABLE=1 before run.
-#   Warmup off by default in run_android_hybrid_bridge.py (--no-warmup). Use WARMUP=1 for --warmup.
+#   WARMUP — default 1: pass --warmup (empty run + CLIP image warmup) for stable OpenCL timings.
+#             Set WARMUP=0 to skip (faster cold runs; V_Encode first slice may include compile cost).
 #
 # Requires: adb device, Android binaries pushed per README.
 
@@ -71,6 +76,8 @@ REMOTE_ROOT_CPU="${REMOTE_ROOT_CPU:-/data/local/tmp/streamingvlm_cpu_vlm}"
 THREADS="${THREADS:-4}"
 CACHE_TYPE_K="${CACHE_TYPE_K:-f16}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-f16}"
+# OpenCL VLM: enable llama --warmup by default so vision slice timing is comparable (see WARMUP in header).
+WARMUP="${WARMUP:-1}"
 # llama.cpp memory fit trips OpenCL SET_ROWS on quantized KV views; default --fit off then.
 FIT="${FIT:-}"
 if [[ "${CACHE_TYPE_K}" != "f16" || "${CACHE_TYPE_V}" != "f16" ]]; then
@@ -80,6 +87,8 @@ if [[ "${CACHE_TYPE_K}" != "f16" || "${CACHE_TYPE_V}" != "f16" ]]; then
 fi
 
 runner_py="${REPO_ROOT}/my_research/foundation_llamacpp/run_android_hybrid_bridge.py"
+# Same default as bridge --results-root (no intermediate dated buckets under results/).
+results_parent="${REPO_ROOT}/my_research/foundation_llamacpp/results/log"
 
 run_one() {
   local backend="$1"
@@ -108,7 +117,7 @@ run_one() {
   [[ -n "${FLASH_ATTN:-}" ]] && extra_bridge_args+=(--flash-attn "${FLASH_ATTN}")
   [[ "${NO_KV_OFFLOAD:-0}" == "1" ]] && extra_bridge_args+=(--no-kv-offload)
   [[ "${DISABLE_ATTN_KV_ROTATION:-0}" == "1" ]] && extra_bridge_args+=(--disable-attn-kv-rotation)
-  [[ "${WARMUP:-0}" == "1" ]] && extra_bridge_args+=(--warmup)
+  [[ "${WARMUP}" == "1" ]] && extra_bridge_args+=(--warmup)
 
   echo "======== [${label}] ctx=${ctx} batch=${batch} ubatch=${ubatch} model=$(basename "${MODEL}") build=$(basename "${build_dir}") ========"
   if [[ "${backend}" == "gpu" ]]; then
@@ -134,7 +143,7 @@ run_one() {
       "${extra_bridge_args[@]}" \
       --baseline-window 5.0 \
       --remote-root "${remote_root}" \
-      --results-root "${REPO_ROOT}/my_research/foundation_llamacpp/results/log" \
+      --results-root "${results_parent}" \
       "${push_flags[@]}"
   else
     python3 "${runner_py}" \
@@ -157,7 +166,7 @@ run_one() {
       "${extra_bridge_args[@]}" \
       --baseline-window 5.0 \
       --remote-root "${remote_root}" \
-      --results-root "${REPO_ROOT}/my_research/foundation_llamacpp/results/log" \
+      --results-root "${results_parent}" \
       "${push_flags[@]}"
   fi
 }

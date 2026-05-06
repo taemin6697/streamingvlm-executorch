@@ -2990,3 +2990,8 @@ python3 for_meetting/plot_meeting_phase_stacked_bars.py \
   then reuse the existing F16/F32 staging path sent to FA kernels.
 
 Rebuild the hybrid Android bridge (e.g. `my_research/foundation_llamacpp/build-hybrid-android-opencl`).
+
+- **Add-on (same build):** Without extending `ggml_opencl_supports_op` for **`GGML_OP_FLASH_ATTN_EXT`**
+  + quantized K/V, the scheduler routed FA to **CPU** while K/V remained on **OpenCL** buffers →
+  **warmup SIGSEGV**. Match `ggml_cl_flash_attn` logical K/V types (and allow F16 Q + F32 dst from
+  `ggml_flash_attn_ext`) so FA stays on OpenCL. See `my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp.md`.

@@ -491,16 +491,22 @@ follow_up:
 - 2026-05-06: `run_android_hybrid_bridge.py` passes **`--flash-attn`** (`on`|`off`|`auto`, aliases `-fa`),
   **`--no-kv-offload`**, and optional **`--disable-attn-kv-rotation`** (remote shell exports `LLAMA_ATTN_ROT_DISABLE=1`).
   `run_opencl_ctx_sweep.sh` forwards env **`FLASH_ATTN`**, **`NO_KV_OFFLOAD=1`**, **`DISABLE_ATTN_KV_ROTATION=1`**.
+  **Default `WARMUP=1`** on the sweep (passes `--warmup`): stable `V_Encode` / `image slice encoded` vs cold OpenCL compile; **`WARMUP=0`** for fastest runs.
 - 2026-05-06: **OpenCL `GGML_OP_SET_ROWS` + Q8_0 KV** — upstream only allowed F16/F32 destinations in
   `ggml_opencl_supports_op`, so quantized KV cache views aborted at `sched_reserve` (`SET_ROWS` on OpenCL buffer).
   Implemented **`kernel_set_rows_q8_0_i32/i64`** in `llama.cpp/ggml/src/ggml-opencl/kernels/set_rows.cl`
   (per-block quant matching `quantize_row_q8_0_ref`) and wired **`ggml_cl_set_rows`** / kernel load /
   `supports_op`. Rebuild Android OpenCL
   (`libggml-opencl.so`, `opencl_phase_mtmd`) after sync.
-  **Device check (Adreno 830):** `sched_reserve` completes for q8 KV (no `SET_ROWS` abort). With `flash_attn=auto`,
-  llama may still disable FA (“Flash Attention tensor … CPU”) and fail init (“quantized V cache … requires Flash Attention”).
-  With `-fa on`, init proceeds past reserve but **warmup empty run segfaults** — remaining work is OpenCL FA + quantized KV
-  execution path (overlaps draft PR #21313), not KV scatter alone.
+  **Device check (Adreno 830):** `sched_reserve` completes for q8 KV (no `SET_ROWS` abort).
+- 2026-05-06 (post-upstream-sync fix): **KV q8 + `-fa on`** — two issues: (1)
+  `GGML_OP_FLASH_ATTN_EXT` in `ggml_opencl_supports_op` only matched storage F32/F16, so **quantized KV**
+  routed FA to **CPU** while K/V stayed OpenCL → **SIGSEGV on empty warmup**. **Fix:** treat quant K/V as
+  logical F16/F32 (same rule as `ggml_cl_flash_attn`) and allow **F16 Q + F16-effective KV + F32 dst**
+  (`ggml_flash_attn_ext` always allocates F32 output). (2) **`ggml_cl_flash_attn_prepare_quantized_tensor`**
+  + **non-contiguous row pack** (see earlier bullet). Combined: InternVL3 1B OpenCL, ctx 8192,
+  `--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit off --warmup` → exit 0 (splits ~2 vs ~50
+  when FA incorrectly fell off OpenCL). Perf: each FA dequantizes KV to temp GPU buffers (one-time warn in log).
 - 2026-05-06: **OpenCL FA + Q8 KV gibberish output** — `ggml_cl_flash_attn_prepare_quantized_tensor`
   read the GPU byte span and called `to_float` as if it were dense. K/V tensors are often **non-contiguous**
   after `ggml_permute` before FA, so dequant fed wrong bytes → garbage attention. **Fix:** when
@@ -510,9 +516,12 @@ follow_up:
 - 2026-05-06 (obsolete): **`kv_code/`** was a mirror of `llama.cpp/ggml/src/ggml-opencl/` for offline diff;
   **removed 2026-05** — patches live only under nested **`llama.cpp/`** plus docs in `docs/archive/q4_8_kvcache_implementation.md`.
 - 2026-05-06: **`run_android_hybrid_bridge.py` result dir names** include KV cache slugs after
-  `ctx_<N>`: e.g. `..._opencl_ctx_1024_kv8` for `q8_0`/`q8_0`, `..._kv4` for `q4_0`, `..._kvf16`
+  `ctx_<N>`: e.g. `..._opencl_ctx_1024_kv8` for `q8_0`/`q8_0`, `..._kv4` for `q4_0`, `..._kv16` for `f16`/`f16`
   when K/V default to f16 (including when `--cache-type-*` omitted). Asymmetric K/V → `..._kv8_4`.
   `plot_opencl_ctx_memory_series.py` `ctx_from_dir` matches `_ctx_(\\d+)` before optional `_kv…`.
+- 2026-05-06: **`scripts/run_opencl_ctx_sweep.sh`** always passes `--results-root` =
+  `my_research/foundation_llamacpp/results/log` — run folders (`<model>_opencl_ctx_<N>_kv…`) live **directly**
+  under that path; avoid introducing another dated parent directory under `results/`.
 - 2026-05-06: **OpenCL `GGML_OP_SET_ROWS` + Q4_0 KV** — same wiring as Q8_0 (`supports_op`,
   `kernel_set_rows_q4_0_i32/i64`, `quantize_block_q4_0` in `set_rows.cl`).
   First device run produced **junk decode** (`char` saturate → wrong nibble saturation vs
@@ -529,10 +538,10 @@ follow_up:
   `rm -rf llama.cpp/` and restoring after add. **Overlay re-applied after sync:** OpenCL
   `kernels/set_rows.cl` Q8_0/Q4_0 block helpers + `kernel_set_rows_{q8_0,q4_0}_{i32,i64}`;
   `ggml-opencl.cpp` `GGML_OP_SET_ROWS` in `ggml_opencl_supports_op`, `clCreateKernel`, and
-  `ggml_cl_set_rows` branches. **Not re-ported in this pass:** older draft-PR OpenCL FA extras
-  (`ggml_cl_flash_attn_prepare_quantized_tensor`, kv_pad / split / `flash_attn_pre_f16.cl`) —
-  current upstream `master` uses a slimmer `ggml_cl_flash_attn`; **Android OpenCL rebuild**
-  + retest **kv8 + FA** vs **f16 + FA off** before relying on quantized KV on device.
+  `ggml_cl_set_rows` branches. **Also port after slim upstream `ggml_cl_flash_attn`:** quantized-KV FA needs
+  **`ggml_cl_flash_attn_prepare_quantized_tensor`** (+ row pack) and **`ggml_opencl_supports_op` FLASH_ATTN_EXT**
+  extended for quant K/V so sched keeps FA on OpenCL (avoid CPU/GPU buffer mix segfault). Optional larger draft-PR
+  extras: kv_pad / split / `flash_attn_pre_f16.cl` for perf, not required for basic correctness.
 
 Suggested note format:
 
