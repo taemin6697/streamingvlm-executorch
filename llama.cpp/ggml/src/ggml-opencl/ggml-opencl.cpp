@@ -525,7 +525,8 @@ struct ggml_backend_opencl_context {
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bm;
     std::map<std::pair<int, int>, int>       kernels_flash_attn_bn;
     cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0;
-    cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
+    cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32,
+        kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32, kernel_set_rows_q4_0_i64, kernel_set_rows_q4_0_i32;
     cl_kernel kernel_rope_norm_f32, kernel_rope_norm_f16, kernel_rope_neox_f32, kernel_rope_neox_f16;
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
@@ -2400,6 +2401,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i64", &err), err));
         CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q8_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q8_0_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q4_0_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q4_0_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_q4_0_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_q4_0_i32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -4163,15 +4168,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
         case GGML_OP_SET_ROWS:
             {
-                // TODO: add support
-                // ref: https://github.com/ggml-org/llama.cpp/pull/14274
-#pragma message("TODO: implement BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL support (https://github.com/ggml-org/llama.cpp/pull/14661)")
+                // StreamingVLM: quantized KV scatter (GPU) — GPU_SET_ROWS kernels in set_rows.cl
+                // ref upstream: PR #14274 / #14661 (BF16, more quant types pending)
+#pragma message("TODO: BF16 / Q5 / IQ4_NL etc. SET_ROWS OpenCL paths (see https://github.com/ggml-org/llama.cpp/pull/14661)")
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }
                 switch (op->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_0:
                         return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
                     default:
                         return false;
@@ -6901,6 +6908,20 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
                 kernel = backend_ctx->kernel_set_rows_f16_i64;
             } else {
                 kernel = backend_ctx->kernel_set_rows_f16_i32;
+            }
+            break;
+        case GGML_TYPE_Q8_0:
+            if (src1->type == GGML_TYPE_I64) {
+                kernel = backend_ctx->kernel_set_rows_q8_0_i64;
+            } else {
+                kernel = backend_ctx->kernel_set_rows_q8_0_i32;
+            }
+            break;
+        case GGML_TYPE_Q4_0:
+            if (src1->type == GGML_TYPE_I64) {
+                kernel = backend_ctx->kernel_set_rows_q4_0_i64;
+            } else {
+                kernel = backend_ctx->kernel_set_rows_q4_0_i32;
             }
             break;
         default:

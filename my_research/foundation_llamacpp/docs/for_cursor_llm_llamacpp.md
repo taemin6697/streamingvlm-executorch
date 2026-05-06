@@ -522,6 +522,17 @@ follow_up:
   **Retest:** `CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0 PROCESSOR=gpu FLASH_ATTN=auto CTX_SIZES_OVERRIDE=1024`
   `run_opencl_ctx_sweep.sh` exit 0; sane Golden Gate caption under
   `results/log/.../InternVL3-1B-Instruct-Q8_0_opencl_ctx_1024_kv4/` (KV slug in folder name since 2026-05-06).
+- 2026-05-06: **`llama.cpp` upstream sync (subtree):** added remote `upstream-llama` →
+  `https://github.com/ggml-org/llama.cpp.git`, committed removal of old vendored tree then
+  `git subtree add --prefix=llama.cpp upstream-llama master --squash` (merge commit +
+  squashed upstream). Local GGUF tree preserved by moving `llama.cpp/models` aside before
+  `rm -rf llama.cpp/` and restoring after add. **Overlay re-applied after sync:** OpenCL
+  `kernels/set_rows.cl` Q8_0/Q4_0 block helpers + `kernel_set_rows_{q8_0,q4_0}_{i32,i64}`;
+  `ggml-opencl.cpp` `GGML_OP_SET_ROWS` in `ggml_opencl_supports_op`, `clCreateKernel`, and
+  `ggml_cl_set_rows` branches. **Not re-ported in this pass:** older draft-PR OpenCL FA extras
+  (`ggml_cl_flash_attn_prepare_quantized_tensor`, kv_pad / split / `flash_attn_pre_f16.cl`) —
+  current upstream `master` uses a slimmer `ggml_cl_flash_attn`; **Android OpenCL rebuild**
+  + retest **kv8 + FA** vs **f16 + FA off** before relying on quantized KV on device.
 
 Suggested note format:
 
