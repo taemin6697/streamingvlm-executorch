@@ -12,8 +12,14 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 executorch/
-llama.cpp/
+# llama.cpp: vendored upstream tree; exclusions follow llama.cpp/.gitignore (except models/ omitted entirely below)
 third_party/
+
+# Llama GGUF checkpoints / local model blobs (whole tree — do not unpick small vocabs into git)
+llama.cpp/models/
+
+# Nested llama.git backup (do not push)
+llama.cpp-nested-history.bundle
 
 # Foundation generated artifacts
 my_research/foundation/results/
