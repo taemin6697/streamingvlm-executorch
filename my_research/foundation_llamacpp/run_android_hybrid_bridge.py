@@ -724,9 +724,35 @@ def _finalize_standalone_outputs(result_dir: Path, *, processor: str, return_cod
         _write_png_phase_duration(result_dir, perf)
 
 
-def _result_model_name(model: Path, processor: str, ctx_size: int) -> str:
+def _result_kv_slug_part(cache_type: str | None) -> str:
+    """Slugs for result dir names: q8_0 -> 8, q4_0 -> 4, f16 -> f16 (llama default KV)."""
+    t = (cache_type or "f16").strip().lower().replace("-", "_")
+    if t in ("fp16", "f16"):
+        return "f16"
+    m = re.fullmatch(r"q([0-9]+)_0", t)
+    if m:
+        return m.group(1)
+    return re.sub(r"[^a-z0-9_]+", "_", t).strip("_") or "unknown"
+
+
+def _result_kv_suffix(cache_type_k: str | None, cache_type_v: str | None) -> str:
+    k = _result_kv_slug_part(cache_type_k)
+    v = _result_kv_slug_part(cache_type_v)
+    if k == v:
+        return f"_kv{k}"
+    return f"_kv{k}_{v}"
+
+
+def _result_model_name(
+    model: Path,
+    processor: str,
+    ctx_size: int,
+    cache_type_k: str | None = None,
+    cache_type_v: str | None = None,
+) -> str:
     suffix = "opencl" if processor == "gpu" else processor
-    return f"{model.stem}_{suffix}_ctx_{ctx_size}"
+    kv = _result_kv_suffix(cache_type_k, cache_type_v)
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}{kv}"
 
 
 def _find_executable(build_dir: Path, name: str) -> Path:
@@ -886,6 +912,12 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
         cmd.extend(["--cache-type-v", args.cache_type_v])
     if getattr(args, "fit", None) is not None:
         cmd.extend(["--fit", args.fit])
+    if getattr(args, "flash_attn", None):
+        cmd.extend(["--flash-attn", args.flash_attn])
+    if getattr(args, "no_kv_offload", False):
+        cmd.append("--no-kv-offload")
+    if getattr(args, "no_warmup", False):
+        cmd.append("--no-warmup")
     _extend_llama_rope_cli(cmd, args)
     return cmd
 
@@ -905,6 +937,27 @@ def _fit_shell_suffix(args: argparse.Namespace) -> str:
     return f" --fit {args.fit}"
 
 
+def _flash_attn_kv_shell_suffix(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    fa = getattr(args, "flash_attn", None)
+    if fa:
+        parts.append(f"--flash-attn {shlex.quote(fa)}")
+    if getattr(args, "no_kv_offload", False):
+        parts.append("--no-kv-offload")
+    if getattr(args, "no_warmup", False):
+        parts.append("--no-warmup")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _remote_llama_env_exports(args: argparse.Namespace) -> str:
+    """Lines emitted after cd ... || exit 1 (LD_LIBRARY_PATH + optional experiment vars)."""
+    lines: list[str] = []
+    if getattr(args, "disable_attn_kv_rotation", False):
+        lines.append("export LLAMA_ATTN_ROT_DISABLE=1")
+    lines.append("export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.")
+    return "\n".join(lines)
+
+
 def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, layout_image: Path) -> str:
     prompt = shlex.quote(args.prompt)
     device_arg = f"--device {shlex.quote(args.device)}" if args.device else ""
@@ -919,9 +972,11 @@ def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, 
     cache_suffix = _cache_type_shell_suffix(args)
     fit_suffix = _fit_shell_suffix(args)
     rope_suffix = _rope_shell_suffix(args)
+    flash_kv_suffix = _flash_attn_kv_shell_suffix(args)
+    env_exports = _remote_llama_env_exports(args)
     return f"""#!/system/bin/sh
 cd {shlex.quote(args.remote_root)} || exit 1
-export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.
+{env_exports}
 rm -f android_memory_timeline.csv hybrid_vision_stdout.txt hybrid_decode_stdout.txt \\
   vision_output_stats.csv vision_phase_stats.csv decoder_phase_stats.csv \\
   foundation_token_io.txt \\
@@ -937,7 +992,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
   --wait-for-embedding --wait-timeout-ms 120000 \\
   --token-io-path foundation_token_io.txt {('--force-generation' if args.force_generation else '')} \\
   -p {prompt} -n {args.force_generation or args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} \\
-  -ngl {args.gpu_layers} {device_arg}{cache_suffix}{fit_suffix}{rope_suffix} > hybrid_decode_stdout.txt 2>&1 &
+  -ngl {args.gpu_layers} {device_arg}{cache_suffix}{fit_suffix}{rope_suffix}{flash_kv_suffix} > hybrid_decode_stdout.txt 2>&1 &
 decoder_pid=$!
 
 ./hybrid_vision_dump --encoder_path={shlex.quote(encoder_pte.name)} \\
@@ -986,9 +1041,10 @@ def _build_standalone_remote_script(args: argparse.Namespace, *, use_precise_pha
         'kill -0 "$runner_pid" 2>/dev/null',
         '"$runner_pid"',
     )
+    env_exports = _remote_llama_env_exports(args)
     return f"""#!/system/bin/sh
 cd {shlex.quote(args.remote_root)} || exit 1
-export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.
+{env_exports}
 rm -f foundation_output.txt foundation_exit_code.txt android_memory_timeline.csv foundation_phase_stats.csv foundation_token_io.txt
 printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
@@ -1082,6 +1138,40 @@ def main() -> int:
         choices=("on", "off"),
         default=None,
         help="llama.cpp memory fit (passthrough --fit). Omit by default; use off to skip common_fit_params (OpenCL SET_ROWS abort workaround).",
+    )
+    parser.add_argument(
+        "--flash-attn",
+        "-fa",
+        choices=("on", "off", "auto"),
+        default=None,
+        dest="flash_attn",
+        metavar="MODE",
+        help="llama.cpp --flash-attn (-fa). Omit to use binary default.",
+    )
+    parser.add_argument(
+        "--no-kv-offload",
+        action="store_true",
+        dest="no_kv_offload",
+        help="Pass --no-kv-offload (-nkvo) to llama (standalone GPU/CPU and hybrid_decode).",
+    )
+    parser.add_argument(
+        "--disable-attn-kv-rotation",
+        action="store_true",
+        dest="disable_attn_kv_rotation",
+        help="On device: export LLAMA_ATTN_ROT_DISABLE=1 before llama (see llama-kv-cache.cpp).",
+    )
+    parser.set_defaults(no_warmup=True)
+    parser.add_argument(
+        "--warmup",
+        action="store_false",
+        dest="no_warmup",
+        help="Pass --warmup to llama (enable empty warmup before generation). Off by default for bridge benchmarks.",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        dest="no_warmup",
+        help="Skip empty warmup (default for this script).",
     )
     parser.add_argument(
         "--rope-scaling",
@@ -1206,7 +1296,13 @@ def main() -> int:
         _run(adb + ["shell", "rm", "-rf", args.remote_root])
     _run(adb + ["shell", "mkdir", "-p", args.remote_root])
 
-    result_dir = args.results_root / _result_model_name(args.model, args.processor, args.ctx_size)
+    result_dir = args.results_root / _result_model_name(
+        args.model,
+        args.processor,
+        args.ctx_size,
+        args.cache_type_k,
+        args.cache_type_v,
+    )
     result_dir.mkdir(parents=True, exist_ok=True)
 
     _push_llama_runtime(

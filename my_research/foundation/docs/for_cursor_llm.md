@@ -2961,3 +2961,32 @@ python3 for_meetting/plot_meeting_phase_stacked_bars.py \
   `PYTHONPATH`, bundled `QNN_SDK_ROOT` example path, `--force_push`), plus the
   **`internvl3_1b_qnn_*_16a8w`** batch example via `QNN_ARTIFACT_DIRS` +
   `FORCE_GENERATE_TOKEN`.
+
+## llama.cpp reset to GitHub PR [#21312](https://github.com/ggml-org/llama.cpp/pull/21312) (2026-05-06)
+
+- Replaced the old `streamingvlm/` merge attempt with a **fresh clone** of upstream
+  `llama.cpp`, then `git fetch origin pull/21312/head:streamingvlm/pr21312` and checkout
+  **`streamingvlm/pr21312`** (tip commit `0e3323a6b`).
+
+- **Preserved** existing weights under `llama.cpp/models/` (~66 GB) by moving the tree to
+  `llama.cpp.models.preserved` during the delete/clone step, then moving it back to
+  `llama.cpp/models/`.
+
+- Expect this tree to **lack** whatever landed on `master` *after* PR 21312's base and *not*
+  included in the PR (e.g. local IQ4_NL batch GEMM glue that only existed on our old
+  cherry-pick branch). If you need upstream `master` plus 21312 again, rebase/merge that PR
+  onto current `master` instead of this snapshot.
+
+## llama.cpp OpenCL: quantized KV + flash-attn host dequant (2026-05-06)
+
+- **Symptom:** `CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0` + OpenCL FA produced coherent
+  English on CPU/F16 KV but **gibberish logits** under Q8 KV.
+- **Cause:** `ggml_cl_flash_attn_prepare_quantized_tensor` downloaded the tensor’s **byte span**
+  and passed it to `to_float()`/`dequantize_row_*`, which assume **dense** row-major quantized
+  data. In `llama-graph.cpp`, **`ggml_permute` on K/V** before FA often leaves tensors **non-contiguous**;
+  the span is not logically dense → wrong dequant into the FA temp buffers.
+- **Fix (local `ggml-opencl.cpp`):** if `!ggml_is_contiguous_0(tensor)`, **pack rows** using
+  `tensor->nb[1..3]` (`ggml_row_size` bytes per logical row along `ne[0]`) before `to_float`,
+  then reuse the existing F16/F32 staging path sent to FA kernels.
+
+Rebuild the hybrid Android bridge (e.g. `my_research/foundation_llamacpp/build-hybrid-android-opencl`).

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -99,7 +100,7 @@ struct decode_context {
   llama_batch batch;
   int n_batch = 0;
   llama_pos n_past = 0;
-  common_debug_cb_user_data cb_data;
+  std::optional<base_callback_data> mtmd_debug_graph_cb;
 
   explicit decode_context(common_params& params) : llama_init(common_init_from_params(params)) {
     model = llama_init->model();
@@ -126,8 +127,9 @@ struct decode_context {
     mparams.image_min_tokens = params.image_min_tokens;
     mparams.image_max_tokens = params.image_max_tokens;
     if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
-      mparams.cb_eval_user_data = &cb_data;
-      mparams.cb_eval = common_debug_cb_eval;
+      mtmd_debug_graph_cb.emplace(params, std::vector<std::string>{});
+      mparams.cb_eval_user_data = params.cb_eval_user_data;
+      mparams.cb_eval = params.cb_eval;
     }
     ctx_vision.reset(mtmd_init_from_file(params.mmproj.path.c_str(), model, mparams));
     if (!ctx_vision.get()) {

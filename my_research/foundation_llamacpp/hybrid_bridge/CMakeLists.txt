@@ -48,8 +48,8 @@ if(HYBRID_BRIDGE_BUILD_LLAMA_DECODER)
       "${LLAMA_CPP_ROOT}/ggml/include"
       "${LLAMA_CPP_ROOT}/ggml/src"
   )
-  target_link_libraries(hybrid_decode PRIVATE llama-common mtmd Threads::Threads)
-  target_link_libraries(opencl_phase_mtmd PRIVATE llama-common mtmd Threads::Threads)
+  target_link_libraries(hybrid_decode PRIVATE common mtmd Threads::Threads)
+  target_link_libraries(opencl_phase_mtmd PRIVATE common mtmd Threads::Threads)
   target_compile_features(hybrid_decode PRIVATE cxx_std_17)
   target_compile_features(opencl_phase_mtmd PRIVATE cxx_std_17)
 endif()

@@ -55,7 +55,8 @@ def parse_common_memory_breakdown(foundation_output: Path) -> dict[str, float] |
 
 
 def ctx_from_dir(name: str) -> int | None:
-    m = re.search(r"_ctx_(\d+)$", name)
+    # e.g. ..._opencl_ctx_1024 or ..._opencl_ctx_1024_kv8 (KV suffix after ctx)
+    m = re.search(r"_ctx_(\d+)", name)
     return int(m.group(1)) if m else None
 
 

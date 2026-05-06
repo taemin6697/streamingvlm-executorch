@@ -486,8 +486,42 @@ follow_up:
   repo ignores `llama.cpp/` — replicate this cherry-pick locally or merge upstream once landed.
   Android Adreno may still fail (PR [#21501](https://github.com/ggml-org/llama.cpp/issues/21501)).
 - 2026-05-06: `run_opencl_ctx_sweep.sh` env **`CACHE_TYPE_K`** / **`CACHE_TYPE_V`**
-  (default `f16`) forwarded to `--cache-type-k` / `--cache-type-v`. Reference file snapshot:
-  `my_research/foundation_llamacpp/kv_code/`.
+  (default `f16`) forwarded to `--cache-type-k` / `--cache-type-v`. Source of truth: nested
+  `llama.cpp/ggml/src/ggml-opencl/` (the old `foundation_llamacpp/kv_code/` mirror was removed as unused).
+- 2026-05-06: `run_android_hybrid_bridge.py` passes **`--flash-attn`** (`on`|`off`|`auto`, aliases `-fa`),
+  **`--no-kv-offload`**, and optional **`--disable-attn-kv-rotation`** (remote shell exports `LLAMA_ATTN_ROT_DISABLE=1`).
+  `run_opencl_ctx_sweep.sh` forwards env **`FLASH_ATTN`**, **`NO_KV_OFFLOAD=1`**, **`DISABLE_ATTN_KV_ROTATION=1`**.
+- 2026-05-06: **OpenCL `GGML_OP_SET_ROWS` + Q8_0 KV** — upstream only allowed F16/F32 destinations in
+  `ggml_opencl_supports_op`, so quantized KV cache views aborted at `sched_reserve` (`SET_ROWS` on OpenCL buffer).
+  Implemented **`kernel_set_rows_q8_0_i32/i64`** in `llama.cpp/ggml/src/ggml-opencl/kernels/set_rows.cl`
+  (per-block quant matching `quantize_row_q8_0_ref`) and wired **`ggml_cl_set_rows`** / kernel load /
+  `supports_op`. Rebuild Android OpenCL
+  (`libggml-opencl.so`, `opencl_phase_mtmd`) after sync.
+  **Device check (Adreno 830):** `sched_reserve` completes for q8 KV (no `SET_ROWS` abort). With `flash_attn=auto`,
+  llama may still disable FA (“Flash Attention tensor … CPU”) and fail init (“quantized V cache … requires Flash Attention”).
+  With `-fa on`, init proceeds past reserve but **warmup empty run segfaults** — remaining work is OpenCL FA + quantized KV
+  execution path (overlaps draft PR #21313), not KV scatter alone.
+- 2026-05-06: **OpenCL FA + Q8 KV gibberish output** — `ggml_cl_flash_attn_prepare_quantized_tensor`
+  read the GPU byte span and called `to_float` as if it were dense. K/V tensors are often **non-contiguous**
+  after `ggml_permute` before FA, so dequant fed wrong bytes → garbage attention. **Fix:** when
+  `!ggml_is_contiguous_0(tensor)`, pack each logical row (`nb[1..3]`, `ggml_row_size` along `ne[0]`)
+  into a dense buffer, then `to_float`. Implemented in `llama.cpp/ggml/src/ggml-opencl/ggml-opencl.cpp`.
+- 2026-05-06: **`run_android_hybrid_bridge.py`** — default **skips llama empty warmup** (`--no-warmup` implied). Use **`--warmup`** to re-enable. First CLIP/vision encode still runs `clip_model_loader::warmup()` once to allocate graphs (log line `warmup: flash attention is ...`); that is separate from `--no-warmup`.
+- 2026-05-06 (obsolete): **`kv_code/`** was a mirror of `llama.cpp/ggml/src/ggml-opencl/` for offline diff;
+  **removed 2026-05** — patches live only under nested **`llama.cpp/`** plus docs in `docs/archive/q4_8_kvcache_implementation.md`.
+- 2026-05-06: **`run_android_hybrid_bridge.py` result dir names** include KV cache slugs after
+  `ctx_<N>`: e.g. `..._opencl_ctx_1024_kv8` for `q8_0`/`q8_0`, `..._kv4` for `q4_0`, `..._kvf16`
+  when K/V default to f16 (including when `--cache-type-*` omitted). Asymmetric K/V → `..._kv8_4`.
+  `plot_opencl_ctx_memory_series.py` `ctx_from_dir` matches `_ctx_(\\d+)` before optional `_kv…`.
+- 2026-05-06: **OpenCL `GGML_OP_SET_ROWS` + Q4_0 KV** — same wiring as Q8_0 (`supports_op`,
+  `kernel_set_rows_q4_0_i32/i64`, `quantize_block_q4_0` in `set_rows.cl`).
+  First device run produced **junk decode** (`char` saturate → wrong nibble saturation vs
+  reference `quantize_row_q4_0_ref`: `(int8_t)(x + 8.5f)` then `(uint8_t)MIN(15, …)`).
+  **Fix:** `kernel_set_rows_i32_as_int8_truncate` + `kernel_set_rows_q4_packed_nibble_ref`:
+  truncate `x+8.5` to signed int8 semantics, clamp to `[0,15]`, write nibbles like C `(uint8_t)`.
+  **Retest:** `CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0 PROCESSOR=gpu FLASH_ATTN=auto CTX_SIZES_OVERRIDE=1024`
+  `run_opencl_ctx_sweep.sh` exit 0; sane Golden Gate caption under
+  `results/log/.../InternVL3-1B-Instruct-Q8_0_opencl_ctx_1024_kv4/` (KV slug in folder name since 2026-05-06).
 
 Suggested note format:
 
