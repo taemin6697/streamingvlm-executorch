@@ -12,6 +12,12 @@ The default mode is all, covering:
   512 1k 2k 4k 8k 16k for Vulkan
 
 Mode qnn runs QNN manifests under results/model/qnn/ (needs QNN_SDK_ROOT, -b, -m via env).
+  Default QNN_SDK_ROOT (repo-bundled QAIRT): $ROOT_DIR/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724
+  Override QNN_SDK_ROOT if you use another SDK install.
+
+  If the device reports "libQnnHtp.so not found", libQnnHtp.so is not under
+  $QNN_SDK_ROOT/lib/aarch64-android (or a subfolder); set QNN_AARCH64_LIB_DIR to the
+  directory that contains it and use --force_push once to refresh the device cache.
 
 Environment overrides:
   ROOT_DIR                Project root. Default: auto-detected /workspace/streamingvlm
@@ -19,12 +25,14 @@ Environment overrides:
   RUNNER_BINARY           Default: $ROOT_DIR/executorch/build-android-unified/foundation/xnnpack_qnn_runner
   BUILD_PATH              QNN only: ExecuTorch Android build tree (-b). Default: $ROOT_DIR/executorch/build-android-unified
   SOC_MODEL               QNN only: SoC for launcher (-m). Default: SM8750
+  QNN_SDK_ROOT            QNN only: SDK root passed to launcher. Default:
+                          $ROOT_DIR/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724
   QNN_ARTIFACT_BASE       QNN only: Directory containing artifact folders. Default: $ROOT_DIR/my_research/foundation/results/model/qnn
   QNN_ARTIFACT_DIRS       QNN only: Space-separated artifact folder names under QNN_ARTIFACT_BASE.
                           Default: internvl3_1b_hybrid_16p_* 512/1k/…/16k with 16a4w
   IMAGE                   Default: COCO cat sample URL
   QUESTION                Default: Describe this image briefly using around 10 words.
-  FORCE_GENERATE_TOKEN    Default: 128
+  FORCE_GENERATE_TOKEN    Default: 64
   TEMPERATURE             Default: 0.0
 EOF
 }
@@ -60,12 +68,14 @@ DEVICE="${DEVICE:-R3KYC01FW1P}"
 RUNNER_BINARY="${RUNNER_BINARY:-${ROOT_DIR}/executorch/build-android-unified/foundation/xnnpack_qnn_runner}"
 BUILD_PATH="${BUILD_PATH:-${ROOT_DIR}/executorch/build-android-unified}"
 SOC_MODEL="${SOC_MODEL:-SM8750}"
+DEFAULT_QNN_SDK_ROOT="${ROOT_DIR}/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724"
+export QNN_SDK_ROOT="${QNN_SDK_ROOT:-${DEFAULT_QNN_SDK_ROOT}}"
 QNN_ARTIFACT_BASE="${QNN_ARTIFACT_BASE:-${ROOT_DIR}/my_research/foundation/results/model/qnn}"
 DEFAULT_QNN_ARTIFACT_DIRS="internvl3_1b_hybrid_16p_512_16a4w internvl3_1b_hybrid_16p_1k_16a4w internvl3_1b_hybrid_16p_2k_16a4w internvl3_1b_hybrid_16p_4k_16a4w internvl3_1b_hybrid_16p_8k_16a4w internvl3_1b_hybrid_16p_16k_16a4w"
 read -r -a QNN_ARTIFACT_DIR_LIST <<< "${QNN_ARTIFACT_DIRS:-${DEFAULT_QNN_ARTIFACT_DIRS}}"
 IMAGE="${IMAGE:-http://images.cocodataset.org/val2017/000000039769.jpg}"
 QUESTION="${QUESTION:-Describe this image briefly using around 10 words.}"
-FORCE_GENERATE_TOKEN="${FORCE_GENERATE_TOKEN:-128}"
+FORCE_GENERATE_TOKEN="${FORCE_GENERATE_TOKEN:-64}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 
 export PYTHONPATH="${ROOT_DIR}:${ROOT_DIR}/executorch${PYTHONPATH:+:${PYTHONPATH}}"
@@ -121,6 +131,9 @@ run_qnn_manifest() {
 }
 
 run_qnn_matrix() {
+  if [[ ! -d "${QNN_SDK_ROOT}" ]]; then
+    die "QNN_SDK_ROOT is not a directory: ${QNN_SDK_ROOT} (export QNN_SDK_ROOT or install QAIRT under ${DEFAULT_QNN_SDK_ROOT})"
+  fi
   for artifact_dir in "${QNN_ARTIFACT_DIR_LIST[@]}"; do
     run_qnn_manifest "${artifact_dir}"
   done

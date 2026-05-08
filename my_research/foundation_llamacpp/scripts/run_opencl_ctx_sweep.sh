@@ -44,13 +44,17 @@
 # Use run_android_hybrid_bridge.py directly with another --results-root only if needed.
 #
 # Flash-attn / KV offload / attn rotation / warmup (passed to run_android_hybrid_bridge.py):
-#   FLASH_ATTN=on|off|auto   — omit by default (llama binary default).
+#   FLASH_ATTN — default `on`; always forwarded as `--flash-attn <value>` (set off|auto to override).
 #   NO_KV_OFFLOAD=1        — pass --no-kv-offload.
 #   DISABLE_ATTN_KV_ROTATION=1 — device exports LLAMA_ATTN_ROT_DISABLE=1 before run.
 #   WARMUP — default 1: pass --warmup (empty run + CLIP image warmup) for stable OpenCL timings.
 #             Set WARMUP=0 to skip (faster cold runs; V_Encode first slice may include compile cost).
 #
 # Requires: adb device, Android binaries pushed per README.
+#
+# OpenCL quantized-KV debug (log lines in ggml-opencl.cpp; set on host, passed to device):
+#   GGML_OPENCL_DEBUG_KV=1 CACHE_TYPE_K=q4_0 … ./my_research/.../run_opencl_ctx_sweep.sh
+# Then inspect remote hybrid_decode_stdout.txt for FA prepare / FLASH_ATTN_EXT unsupported / mul_mat Q4_0 lines.
 
 set -uo pipefail
 
@@ -78,6 +82,7 @@ CACHE_TYPE_K="${CACHE_TYPE_K:-f16}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-f16}"
 # OpenCL VLM: enable llama --warmup by default so vision slice timing is comparable (see WARMUP in header).
 WARMUP="${WARMUP:-1}"
+FLASH_ATTN="${FLASH_ATTN:-on}"
 # llama.cpp memory fit trips OpenCL SET_ROWS on quantized KV views; default --fit off then.
 FIT="${FIT:-}"
 if [[ "${CACHE_TYPE_K}" != "f16" || "${CACHE_TYPE_V}" != "f16" ]]; then
@@ -114,7 +119,7 @@ run_one() {
   local fit_args=()
   [[ -n "${FIT}" ]] && fit_args+=(--fit "${FIT}")
   local extra_bridge_args=()
-  [[ -n "${FLASH_ATTN:-}" ]] && extra_bridge_args+=(--flash-attn "${FLASH_ATTN}")
+  extra_bridge_args+=(--flash-attn "${FLASH_ATTN}")
   [[ "${NO_KV_OFFLOAD:-0}" == "1" ]] && extra_bridge_args+=(--no-kv-offload)
   [[ "${DISABLE_ATTN_KV_ROTATION:-0}" == "1" ]] && extra_bridge_args+=(--disable-attn-kv-rotation)
   [[ "${WARMUP}" == "1" ]] && extra_bridge_args+=(--warmup)

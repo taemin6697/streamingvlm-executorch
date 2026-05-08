@@ -252,10 +252,36 @@ class _AdbWorkspace:
             self.push_file(str(path), force_push=force_push)
 
     def push_qnn_libs(self) -> None:
-        qnn_lib_dir = self.qnn_sdk / "lib" / "aarch64-android"
+        # Default: $QNN_SDK_ROOT/lib/aarch64-android. Some SDK layouts ship libQnnHtp.so only
+        # under a subfolder (e.g. product-specific bundles). Override with QNN_AARCH64_LIB_DIR.
+        override = os.environ.get("QNN_AARCH64_LIB_DIR", "").strip()
+        qnn_lib_dir = Path(override) if override else (self.qnn_sdk / "lib" / "aarch64-android")
+
+        libs: list[Path] = []
         if qnn_lib_dir.exists():
+            by_name: dict[str, Path] = {}
+            # Prefer top-level, then immediate subdirectories (basename wins first hit).
             for lib in sorted(qnn_lib_dir.glob("libQnn*.so")):
+                by_name.setdefault(lib.name, lib)
+            for sub in sorted(p for p in qnn_lib_dir.iterdir() if p.is_dir()):
+                for lib in sorted(sub.glob("libQnn*.so")):
+                    by_name.setdefault(lib.name, lib)
+            libs = [by_name[k] for k in sorted(by_name)]
+            for lib in libs:
                 self.push_file(str(lib))
+        else:
+            print(f"[foundation] warning: QNN aarch64 lib dir missing: {qnn_lib_dir}", file=sys.stderr)
+
+        if "libQnnHtp.so" not in {p.name for p in libs}:
+            print(
+                "[foundation] error: libQnnHtp.so was not found under "
+                f"{qnn_lib_dir} (nor its immediate subdirs). "
+                "Set QNN_AARCH64_LIB_DIR to the directory that contains libQnnHtp.so, "
+                "or install a full QNN HTP aarch64-android package. "
+                f"QNN_SDK_ROOT={self.qnn_sdk}",
+                file=sys.stderr,
+            )
+
         arch = self._htp_arch()
         htp_skel = (
             self.qnn_sdk

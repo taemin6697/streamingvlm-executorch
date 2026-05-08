@@ -24,7 +24,9 @@ inline void kernel_set_rows_quantize_block_q8_0(global const float * src_block, 
 
 // Match ggml quantize_row_q4_0_ref: asymmetric 4-bit, d from signed element of max |x|
 #define QK4_0_KV 32
-typedef struct {
+// Must match ggml block_q4_0 (18 bytes / block, no padding). OpenCL C may pad
+// half+uchar[16] to 20 bytes without packed, breaking row stride vs ggml nb[].
+typedef struct __attribute__((packed)) {
     half d;
     uchar qs[QK4_0_KV / 2];
 } block_q4_0;

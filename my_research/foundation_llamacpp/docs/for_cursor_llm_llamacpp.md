@@ -13,6 +13,14 @@ Use it to record:
 - per-stage timing, such as image encode, prefill, and decode
 - backend-specific observations for CPU, Vulkan, OpenCL, or other paths
 
+## HF parity: tokenizer token IDs are ground truth
+
+Aligned with **`my_research/foundation/docs/for_cursor_llm.md`** → section **foundation_llamacpp: ground truth = tokenizer token IDs (policy)**.
+
+- **Prefill parity** is defined by matching **integer token IDs** (HF `tokenizer.encode` vs GGUF `common_tokenize` / traces in `foundation_inference_tokens.txt`), not by eyeballing decoded strings.
+- **Vision placeholders** (`-1` / slot markers) are excluded from vocab comparison; **all text token IDs** in order must match the reference encode for the same prompt bytes.
+- **Video / multi-frame:** same rule — pick the canonical HF user string first, then match its **full encode**; extra labels only if the reference template encodes them.
+
 ## Patch Policy
 
 - This file must be updated continuously whenever `my_research/foundation_llamacpp`
@@ -528,9 +536,8 @@ follow_up:
   reference `quantize_row_q4_0_ref`: `(int8_t)(x + 8.5f)` then `(uint8_t)MIN(15, …)`).
   **Fix:** `kernel_set_rows_i32_as_int8_truncate` + `kernel_set_rows_q4_packed_nibble_ref`:
   truncate `x+8.5` to signed int8 semantics, clamp to `[0,15]`, write nibbles like C `(uint8_t)`.
-  **Retest:** `CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0 PROCESSOR=gpu FLASH_ATTN=auto CTX_SIZES_OVERRIDE=1024`
-  `run_opencl_ctx_sweep.sh` exit 0; sane Golden Gate caption under
-  `results/log/.../InternVL3-1B-Instruct-Q8_0_opencl_ctx_1024_kv4/` (KV slug in folder name since 2026-05-06).
+  **Retest:** `CACHE_TYPE_K=q4_0 CACHE_TYPE_V=q4_0` OpenCL sweep (`run_opencl_ctx_sweep.sh`, `CTX_SIZES_OVERRIDE=1024`) can **exit 0** once `SET_ROWS`/graph issues are resolved — that only means **no crash / sched OK**, not caption quality.
+  **User re-check (correcting earlier log):** **`InternVL3-1B-Instruct-Q8_0` weights + `_kv4`** and more generally **small VLM + `_kv4`** are **not** a safe “green” baseline — **Q4_K weights + `q4_0` KV** can still yield **bad decode** on device; treat **`_kv8` / `_kv16`** as the quality baselines until q4 KV is re-validated end-to-end per model.
 - 2026-05-06: **`llama.cpp` upstream sync (subtree):** added remote `upstream-llama` →
   `https://github.com/ggml-org/llama.cpp.git`, committed removal of old vendored tree then
   `git subtree add --prefix=llama.cpp upstream-llama master --squash` (merge commit +
@@ -542,6 +549,31 @@ follow_up:
   **`ggml_cl_flash_attn_prepare_quantized_tensor`** (+ row pack) and **`ggml_opencl_supports_op` FLASH_ATTN_EXT**
   extended for quant K/V so sched keeps FA on OpenCL (avoid CPU/GPU buffer mix segfault). Optional larger draft-PR
   extras: kv_pad / split / `flash_attn_pre_f16.cl` for perf, not required for basic correctness.
+- **2026-05-06 (device sweep, Adreno / OpenCL):** Reported for **InternVL3-8B-Instruct-Q4_K_M** weights:
+  **`CACHE_TYPE_K/V=q4_0` (`_kv4`)** decode broken vs **`q8_0` (`_kv8`)** / **`f16` (`_kv16`)** on the same prompt
+  (historical note; see also OpenCL `prepare` fixes below). **Correction:** **`InternVL3-1B` + `_kv4`** is **not** reliably good either
+  (**Q4_K + `q4_0` KV** can fail on 1B too); do not use 1B as proof that kv4 is “fine.”
+- **2026-05-06:** **`ggml_cl_flash_attn_prepare_quantized_tensor`** (nested `llama.cpp/.../ggml-opencl.cpp`) —
+  always build a **dense row-major slab** (`memcpy` each row using `tensor->nb[1..3]`) before
+  `to_float` / `dequantize_row_*`. The old `if (!ggml_is_contiguous_0)` fast path passed **`host_raw`**
+  straight through when “contiguous”; after permutes, **`nb[1]` may still exceed `ggml_row_size`**, so
+  **`dequantize_row_q4_0`** (walks consecutive `block_q4_0`) read wrong bytes; Q8 path was less visibly
+  wrong. **`clFinish(queue)`** before `clEnqueueReadBuffer` when only one OpenCL device (cross-backend
+  `sync` is a no-op). Rebuild Android **`libggml-opencl.so`** and re-test **`_kv4`**.
+- **2026-05-06:** **`GGML_OPENCL_DEBUG_KV`** — set `GGML_OPENCL_DEBUG_KV=1` on the host when calling
+  `run_opencl_ctx_sweep.sh` / `run_android_hybrid_bridge.py`; the wrapper exports it on device.
+  **`ggml-opencl.cpp`** then emits **throttled `GGML_LOG_WARN`** lines: (1)
+  **`ggml_cl_flash_attn_prepare_quantized_tensor`** first 64 calls — packed-quant CRC, F32 sample min/max, NaNs,
+  tensor name / `view_offs`; (2) **`FLASH_ATTN_EXT`** `supports_op` reject reasons (dims, dtypes); (3) first 96
+  **`mul_mat` with `src0=Q4_0`** — name, `llama_kv_aos`, shapes. Standalone GPU runs log into
+  **`foundation_output.txt`** (stdout+stderr merged). Hybrid runs: **`hybrid_decode_stdout.txt`** before finalize.
+- **2026-05-06 (Android CPU KV A/B — InternVL3-8B, flash-attn):** Built **`build-android-cpu-noomp`**, ran `run_android_hybrid_bridge.py --processor cpu` → **`q8_0` KV** yields a normal Golden Gate caption; **`q4_0` KV** yields broken continuation (`The … 111…`). **`q4` KV + FA** degradation is **not OpenCL-only**. (Does **not** imply 1B is immune — see SET_ROWS / sweep correction above.)
+
+  `--flash-attn on` + `--ctx-size 512` via `run_android_hybrid_bridge.py` (stub local GGUF paths, remote cache keeps
+  real weights). **`foundation_output.txt`:** FA prepare lines for every layer show names like **`cache_*_lN (view) (permuted)`**,
+  **nans=0**, plausible F32 ranges; **`FLASH_ATTN_EXT OpenCL unsupported`** absent (dk=dv=128 path accepted);
+  **`mul_mat … Q4_0`** throttle lines absent in this workload. Decoder text still degraded vs F16 KV — next focus:
+  OpenCL FA kernel vs temp strides / mask / `n_kv`, not KV empty names or naive prepare NaNs alone.
 
 Suggested note format:
 

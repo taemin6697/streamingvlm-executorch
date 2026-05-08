@@ -23,6 +23,11 @@ WORKSPACE = Path(__file__).resolve().parents[2]
 FOUNDATION_LLAMA = Path(__file__).resolve().parent
 
 
+def _standalone_completion_mode(args: argparse.Namespace) -> bool:
+    """--processor cpu|gpu and no --image → text-only llama-completion (no mmproj/vision)."""
+    return args.processor in ("cpu", "gpu") and getattr(args, "image", None) is None
+
+
 def _run(cmd: list[str], *, check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=check, text=True, capture_output=capture_output)
 
@@ -145,9 +150,12 @@ def _push_llama_runtime(
             for path in sorted(subdir.iterdir()):
                 if path.name == "libOpenCL.so" and not push_opencl_loader:
                     continue
-                if path.is_file() and (path.suffix == ".so" or path.name in {"hybrid_decode", "llama-mtmd-cli", "opencl_phase_mtmd"}):
+                if path.is_file() and (
+                    path.suffix == ".so"
+                    or path.name in {"hybrid_decode", "llama-mtmd-cli", "opencl_phase_mtmd", "llama-completion"}
+                ):
                     _push(adb, path, remote_dir)
-    for name in ("hybrid_decode", "opencl_phase_mtmd"):
+    for name in ("hybrid_decode", "opencl_phase_mtmd", "llama-completion"):
         path = llama_build_dir / name
         if path.exists():
             _push(adb, path, remote_dir)
@@ -224,6 +232,33 @@ def _parse_log_summary(log_text: str) -> dict[str, object]:
     return summary
 
 
+def _ansi_sub(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _extract_generated_text_text_only(log_text: str) -> str:
+    """Best-effort completion output (llama-completion) before llama_perf_context_print."""
+    body = _ansi_sub(log_text)
+    stop = body.find("llama_perf_context_print:")
+    if stop >= 0:
+        body = body[:stop]
+    body = re.sub(r"(?mi)\s*\[end of text\]\s*\Z", "", body)
+    lines_out: list[str] = []
+    for line in body.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith(("ggml_", "llama_", "clip_", "load_backend", "broadcast_", "check_tensor", "alloc_tensor")):
+            continue
+        if re.match(r"^(main|eval|graph|prompt|encode|decode|sampler|tensor|model|kv|opencl|cpu|gpu|device)\s*:", s, re.I):
+            continue
+        if s.startswith(("[", "warn", "info", "deprecat", "fatal", "error")):
+            continue
+        lines_out.append(line.rstrip())
+    return "\n".join(lines_out).strip()
+
+
 def _extract_generated_text_from_log(log_text: str) -> str:
     lines = log_text.splitlines()
     start_idx = -1
@@ -242,19 +277,37 @@ def _extract_generated_text_from_log(log_text: str) -> str:
     return "\n".join(out_lines).strip()
 
 
-def _write_fallback_token_io_txt(result_dir: Path, prompt: str, log_text: str, image_tokens: int = 256) -> None:
+def _internvl_hf_official_question_single_image(plain_prompt: str) -> str:
+    """Match OpenGVLab HF single-image chat: question = '<image>\\n' + text when leader missing."""
+    if plain_prompt.startswith("<image>"):
+        return plain_prompt
+    return "<image>\n" + plain_prompt
+
+
+def _hf_user_assistant_echo(hf_question: str, assistant_text: str) -> str:
+    """Same print shape as HF demo: User: {question}\\nAssistant: {response}"""
+    return f"User: {hf_question}\nAssistant: {assistant_text}"
+
+
+def _write_fallback_token_io_txt(
+    result_dir: Path,
+    prompt: str,
+    log_text: str,
+    *,
+    text_only: bool = False,
+    image_tokens: int = 256,
+) -> None:
+    del image_tokens  # HF single-image path does not synthesize <IMG_CONTEXT> rows
     token_io = result_dir / "foundation_token_io.txt"
     if token_io.exists():
         return
-    generated = _extract_generated_text_from_log(log_text)
-    image_context = "<IMG_CONTEXT>" * image_tokens
-    text = (
-        "<|im_start|>user:\n"
-        f"Frame1: <img>{image_context}</img>\n"
-        f"{prompt}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        f"{generated}\n"
-    )
+    if text_only:
+        generated = _extract_generated_text_text_only(log_text)
+        text = f"<|im_start|>user\n{prompt}\n<|im_start|>assistant\n{generated}\n"
+    else:
+        generated = _extract_generated_text_from_log(log_text)
+        hf_q = _internvl_hf_official_question_single_image(prompt)
+        text = _hf_user_assistant_echo(hf_q, generated) + "\n"
     token_io.write_text(text, encoding="utf-8")
 
 
@@ -670,12 +723,19 @@ def _finalize_hybrid_outputs(result_dir: Path) -> None:
         _write_png_phase_duration(result_dir, perf)
 
 
-def _finalize_standalone_outputs(result_dir: Path, *, processor: str, return_code: str, prompt: str = "Describe this image briefly.") -> None:
+def _finalize_standalone_outputs(
+    result_dir: Path,
+    *,
+    processor: str,
+    return_code: str,
+    prompt: str = "Describe this image briefly.",
+    text_only: bool = False,
+) -> None:
     output_path = result_dir / "foundation_output.txt"
     if not output_path.exists():
         return
     log_text = output_path.read_text(encoding="utf-8", errors="replace")
-    _write_fallback_token_io_txt(result_dir, prompt, log_text)
+    _write_fallback_token_io_txt(result_dir, prompt, log_text, text_only=text_only)
     summary = _parse_log_summary(log_text)
     memory_rows = []
     memory_path = result_dir / "android_memory_timeline.csv"
@@ -684,7 +744,19 @@ def _finalize_standalone_outputs(result_dir: Path, *, processor: str, return_cod
     wall_s = max([float(row.get("elapsed_s", "0") or 0) for row in memory_rows] or [0.0])
 
     summary_rows: list[dict[str, object]] = [
-        {"metric": "backend", "value": "llamacpp_cpu" if processor == "cpu" else "llamacpp_opencl", "unit": ""},
+        {
+            "metric": "backend",
+            "value": (
+                "llamacpp_cpu_text"
+                if processor == "cpu" and text_only
+                else "llamacpp_opencl_text"
+                if processor == "gpu" and text_only
+                else "llamacpp_cpu"
+                if processor == "cpu"
+                else "llamacpp_opencl"
+            ),
+            "unit": "",
+        },
         {"metric": "model_name", "value": result_dir.name, "unit": ""},
         {"metric": "wall_time_s", "value": round(wall_s, 3), "unit": "s"},
         {"metric": "return_code", "value": return_code, "unit": ""},
@@ -749,10 +821,13 @@ def _result_model_name(
     ctx_size: int,
     cache_type_k: str | None = None,
     cache_type_v: str | None = None,
+    *,
+    text_only: bool = False,
 ) -> str:
     suffix = "opencl" if processor == "gpu" else processor
     kv = _result_kv_suffix(cache_type_k, cache_type_v)
-    return f"{model.stem}_{suffix}_ctx_{ctx_size}{kv}"
+    mid = "_text" if text_only else ""
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}"
 
 
 def _find_executable(build_dir: Path, name: str) -> Path:
@@ -922,6 +997,61 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
     return cmd
 
 
+def _build_text_only_command(args: argparse.Namespace) -> list[str]:
+    """Standalone text generation via upstream llama-completion (no mmproj / vision)."""
+    selected_gpu_layers = 0 if args.processor == "cpu" else args.gpu_layers
+    selected_device = args.device
+    if selected_device is None and args.processor == "cpu":
+        selected_device = "none"
+    n_predict = args.force_generation or args.n_predict
+    cmd: list[str] = [
+        "./llama-completion",
+        "-m",
+        args.model.name,
+        "-no-cnv",
+        "-lv",
+        "2",
+        "-co",
+        "off",
+        "--no-display-prompt",
+        "-st",
+        "-p",
+        args.prompt,
+        "-n",
+        str(n_predict),
+        "-t",
+        str(args.threads),
+        "-ngl",
+        str(selected_gpu_layers),
+        "--ctx-size",
+        str(args.ctx_size),
+        "--batch-size",
+        str(args.batch_size),
+        "--ubatch-size",
+        str(args.ubatch_size),
+        "--temp",
+        str(args.temperature),
+    ]
+    if args.force_generation:
+        cmd.append("--ignore-eos")
+    if selected_device:
+        cmd.extend(["--device", selected_device])
+    if getattr(args, "cache_type_k", None):
+        cmd.extend(["--cache-type-k", args.cache_type_k])
+    if getattr(args, "cache_type_v", None):
+        cmd.extend(["--cache-type-v", args.cache_type_v])
+    if getattr(args, "fit", None) is not None:
+        cmd.extend(["--fit", args.fit])
+    if getattr(args, "flash_attn", None):
+        cmd.extend(["--flash-attn", args.flash_attn])
+    if getattr(args, "no_kv_offload", False):
+        cmd.append("--no-kv-offload")
+    if getattr(args, "no_warmup", False):
+        cmd.append("--no-warmup")
+    _extend_llama_rope_cli(cmd, args)
+    return cmd
+
+
 def _cache_type_shell_suffix(args: argparse.Namespace) -> str:
     parts: list[str] = []
     if getattr(args, "cache_type_k", None):
@@ -954,6 +1084,9 @@ def _remote_llama_env_exports(args: argparse.Namespace) -> str:
     lines: list[str] = []
     if getattr(args, "disable_attn_kv_rotation", False):
         lines.append("export LLAMA_ATTN_ROT_DISABLE=1")
+    dbg_kv = os.environ.get("GGML_OPENCL_DEBUG_KV")
+    if dbg_kv:
+        lines.append(f"export GGML_OPENCL_DEBUG_KV={shlex.quote(dbg_kv)}")
     lines.append("export LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=.")
     return "\n".join(lines)
 
@@ -979,7 +1112,7 @@ cd {shlex.quote(args.remote_root)} || exit 1
 {env_exports}
 rm -f android_memory_timeline.csv hybrid_vision_stdout.txt hybrid_decode_stdout.txt \\
   vision_output_stats.csv vision_phase_stats.csv decoder_phase_stats.csv \\
-  foundation_token_io.txt \\
+  foundation_token_io.txt foundation_inference_tokens.txt \\
   foundation_exit_code.txt vision_exit_code.txt decoder_exit_code.txt \\
   vision_ready.flag decoder_ready.flag start_encode.flag vision_embedding.svlmemb
 printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
@@ -1033,7 +1166,10 @@ exit "$decoder_rc"
 
 def _build_standalone_remote_script(args: argparse.Namespace, *, use_precise_phases: bool) -> str:
     remote_memory_csv = f"{args.remote_root}/android_memory_timeline.csv"
-    llm_cmd = _build_standalone_command(args, use_precise_phases=use_precise_phases)
+    if _standalone_completion_mode(args):
+        llm_cmd = _build_text_only_command(args)
+    else:
+        llm_cmd = _build_standalone_command(args, use_precise_phases=use_precise_phases)
     baseline_loop = _baseline_sampling_shell(remote_memory_csv, args.sample_interval, args.baseline_window)
     memory_loop = _memory_sampling_shell(
         remote_memory_csv,
@@ -1045,7 +1181,7 @@ def _build_standalone_remote_script(args: argparse.Namespace, *, use_precise_pha
     return f"""#!/system/bin/sh
 cd {shlex.quote(args.remote_root)} || exit 1
 {env_exports}
-rm -f foundation_output.txt foundation_exit_code.txt android_memory_timeline.csv foundation_phase_stats.csv foundation_token_io.txt
+rm -f foundation_output.txt foundation_exit_code.txt android_memory_timeline.csv foundation_phase_stats.csv foundation_token_io.txt foundation_inference_tokens.txt
 printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
 {baseline_loop}
@@ -1098,8 +1234,18 @@ def main() -> int:
     )
     parser.add_argument("--llama-build-dir", "--build-dir", dest="llama_build_dir", type=Path, required=True, help="Android build dir containing llama.cpp and overlay binaries.")
     parser.add_argument("--model", type=Path, required=True, help="Text GGUF model.")
-    parser.add_argument("--mmproj", type=Path, required=True, help="llama.cpp mmproj GGUF.")
-    parser.add_argument("--image", type=Path, default=FOUNDATION_LLAMA / "sample_images" / "golden_gate_bridge_448.jpg")
+    parser.add_argument(
+        "--mmproj",
+        type=Path,
+        default=None,
+        help="Mmproj GGUF for multimodal (--image given). Omitted when --image is not passed (cpu/gpu text-only). Required for --processor hybrid.",
+    )
+    parser.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        help="Input image for vision. Omit on cpu/gpu for text-only generation (llama-completion). Required for hybrid.",
+    )
     parser.add_argument("--prompt", default="Describe this image briefly.")
     parser.add_argument("--n-predict", "--max-new-tokens", dest="n_predict", type=int, default=32)
     parser.add_argument(
@@ -1123,7 +1269,7 @@ def main() -> int:
         dest="cache_type_k",
         default=None,
         metavar="TYPE",
-        help="KV-cache dtype for K (llama.cpp --cache-type-k), e.g. q8_0. GPU/Hybrid: opencl_phase_mtmd / hybrid_decode; CPU: llama-mtmd-cli.",
+        help="KV-cache dtype for K (llama.cpp --cache-type-k). Multimodal: opencl_phase_mtmd / llama-mtmd-cli; text-only (no --image): llama-completion.",
     )
     parser.add_argument(
         "--cache-type-v",
@@ -1273,15 +1419,36 @@ def main() -> int:
     args.remote_root = args.remote_root.rstrip("/")
     args.baseline_window = max(args.baseline_window, 0.0)
     args.model = args.model.resolve()
-    args.mmproj = args.mmproj.resolve()
-    args.image = args.image.resolve()
     args.llama_build_dir = args.llama_build_dir.resolve()
     if args.vision_build_dir is None:
         args.vision_build_dir = args.llama_build_dir
     else:
         args.vision_build_dir = args.vision_build_dir.resolve()
 
-    for required in (args.llama_build_dir, args.model, args.mmproj, args.image):
+    if args.processor == "hybrid":
+        if args.image is None:
+            raise SystemExit("--processor hybrid requires --image.")
+        if args.mmproj is None:
+            raise SystemExit("--processor hybrid requires --mmproj.")
+        args.mmproj = args.mmproj.resolve()
+        args.image = args.image.resolve()
+    elif _standalone_completion_mode(args):
+        args.mmproj = None
+        args.image = None
+    else:
+        if args.mmproj is None:
+            raise SystemExit(
+                "--mmproj is required when --image is set. Omit --image on cpu/gpu for text-only (llama-completion)."
+            )
+        args.mmproj = args.mmproj.resolve()
+        args.image = args.image.resolve()
+
+    exist_paths: list[Path] = [args.llama_build_dir, args.model]
+    if args.mmproj is not None:
+        exist_paths.append(args.mmproj)
+    if args.image is not None:
+        exist_paths.append(args.image)
+    for required in exist_paths:
         if not required.exists():
             raise SystemExit(f"Missing required path: {required}")
     if args.processor == "hybrid" and args.manifest is None:
@@ -1302,6 +1469,7 @@ def main() -> int:
         args.ctx_size,
         args.cache_type_k,
         args.cache_type_v,
+        text_only=_standalone_completion_mode(args),
     )
     result_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1313,8 +1481,10 @@ def main() -> int:
         args.push_opencl_loader,
     )
     _push_model_cached(adb, args.model, args.remote_root, force=args.model_push)
-    _push_model_cached(adb, args.mmproj, args.remote_root, force=args.model_push)
-    _push(adb, args.image, args.remote_root)
+    if args.mmproj is not None:
+        _push_model_cached(adb, args.mmproj, args.remote_root, force=args.model_push)
+    if args.image is not None:
+        _push(adb, args.image, args.remote_root)
 
     encoder_pte: Path | None = None
     with tempfile.TemporaryDirectory(prefix="streamingvlm_android_inputs_") as tmp:
@@ -1343,6 +1513,7 @@ def main() -> int:
                 "vision_phase_stats.csv",
                 "decoder_phase_stats.csv",
                 "foundation_token_io.txt",
+                "foundation_inference_tokens.txt",
                 "vision_embedding.svlmemb",
                 "foundation_exit_code.txt",
                 "vision_exit_code.txt",
@@ -1350,13 +1521,23 @@ def main() -> int:
                 "android_memory_timeline.csv",
             )
         else:
-            llama_cli = _find_executable(args.llama_build_dir, "llama-mtmd-cli")
-            use_precise_phases = args.processor == "gpu" and _find_executable(args.llama_build_dir, "opencl_phase_mtmd").exists()
-            if not use_precise_phases and not llama_cli.exists():
-                raise SystemExit("Missing llama-mtmd-cli. Build llama.cpp first.")
-            chmod_targets = "llama-mtmd-cli"
-            if use_precise_phases:
-                chmod_targets += " opencl_phase_mtmd"
+            completion_mode = _standalone_completion_mode(args)
+            if completion_mode:
+                completion_bin = _find_executable(args.llama_build_dir, "llama-completion")
+                if not completion_bin.exists():
+                    raise SystemExit(
+                        "Missing llama-completion. Build llama.cpp with the completion tool target (see tools/completion)."
+                    )
+                chmod_targets = "llama-completion"
+                use_precise_phases = False
+            else:
+                llama_cli = _find_executable(args.llama_build_dir, "llama-mtmd-cli")
+                use_precise_phases = args.processor == "gpu" and _find_executable(args.llama_build_dir, "opencl_phase_mtmd").exists()
+                if not use_precise_phases and not llama_cli.exists():
+                    raise SystemExit("Missing llama-mtmd-cli. Build llama.cpp first.")
+                chmod_targets = "llama-mtmd-cli"
+                if use_precise_phases:
+                    chmod_targets += " opencl_phase_mtmd"
             _run(adb + ["shell", f"cd {shlex.quote(args.remote_root)} && chmod +x {chmod_targets} 2>/dev/null || true"])
             script_text = _build_standalone_remote_script(args, use_precise_phases=use_precise_phases)
             pull_names = (
@@ -1364,6 +1545,7 @@ def main() -> int:
                 "foundation_exit_code.txt",
                 "foundation_phase_stats.csv",
                 "foundation_token_io.txt",
+                "foundation_inference_tokens.txt",
                 "android_memory_timeline.csv",
             )
 
@@ -1379,7 +1561,13 @@ def main() -> int:
         _finalize_hybrid_outputs(result_dir)
         (result_dir / "hybrid_decode_stdout.txt").unlink(missing_ok=True)
     else:
-        _finalize_standalone_outputs(result_dir, processor=args.processor, return_code=return_code, prompt=args.prompt)
+        _finalize_standalone_outputs(
+            result_dir,
+            processor=args.processor,
+            return_code=return_code,
+            prompt=args.prompt,
+            text_only=_standalone_completion_mode(args),
+        )
     return run_res.returncode
 
 

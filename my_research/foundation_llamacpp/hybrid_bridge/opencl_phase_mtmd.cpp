@@ -7,11 +7,15 @@
 #include "mtmd.h"
 #include "sampling.h"
 
+#include "foundation_token_io_format.hpp"
+#include "inference_trace.hpp"
+
 #include <clocale>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -191,7 +195,9 @@ int eval_message(
     common_chat_msg& msg,
     const std::vector<std::string>& images,
     phase_recorder& phases,
-    std::string* input_special_text) {
+    std::string* input_special_text,
+    std::size_t* out_image_placeholder_slots,
+    streamingvlm::hybrid_bridge::inference_trace_collector* trace) {
   bool add_bos = ctx.chat_history.empty();
   auto formatted_chat = chat_add_and_format(ctx, msg);
 
@@ -230,7 +236,38 @@ int eval_message(
     *input_special_text = render_chunks_with_special_tokens(ctx, chunks);
   }
 
+  if (out_image_placeholder_slots != nullptr) {
+    *out_image_placeholder_slots = 0;
+    const size_t n_img_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+    for (size_t i = 0; i < n_img_chunks; ++i) {
+      const mtmd_input_chunk* pch = mtmd_input_chunks_get(chunks.ptr.get(), i);
+      if (mtmd_input_chunk_get_type(pch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        *out_image_placeholder_slots += mtmd_input_chunk_get_n_tokens(pch);
+      }
+    }
+  }
+
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+
+  if (trace != nullptr && static_cast<bool>(*trace)) {
+    trace->write_prefill_header();
+    for (size_t ci = 0; ci < n_chunks; ++ci) {
+      const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks.ptr.get(), ci);
+      const auto ctype = mtmd_input_chunk_get_type(ch);
+      if (ctype == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+        size_t nt = 0;
+        const llama_token* toks = mtmd_input_chunk_get_tokens_text(ch, &nt);
+        trace->chunk_text_begin(ci, nt);
+        for (size_t ti = 0; ti < nt; ++ti) {
+          const std::string piece = common_token_to_piece(ctx.lctx, toks[ti], true);
+          trace->token_line(toks[ti], piece);
+        }
+      } else if (ctype == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        trace->chunk_image_begin(ci, mtmd_input_chunk_get_n_tokens(ch), mtmd_input_chunk_get_id(ch));
+      }
+    }
+  }
+
   std::vector<std::vector<float>> encoded_image_embeddings(n_chunks);
   const int64_t decoder_embedding_size = llama_model_n_embd_inp(ctx.model);
   for (size_t i = 0; i < n_chunks; ++i) {
@@ -299,17 +336,26 @@ int eval_message(
   return 0;
 }
 
-std::string generate_response(decode_context& ctx, int n_predict, bool force_generation, phase_recorder& phases) {
-  llama_tokens generated_tokens;
+std::string generate_response(
+    decode_context& ctx,
+    int n_predict,
+    bool force_generation,
+    phase_recorder& phases,
+    streamingvlm::hybrid_bridge::inference_trace_collector* trace) {
   std::string generated_text;
+  if (trace != nullptr && static_cast<bool>(*trace)) {
+    trace->decode_header();
+  }
   for (int i = 0; i < n_predict; ++i) {
     llama_token token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
-    generated_tokens.push_back(token_id);
     common_sampler_accept(ctx.smpl, token_id, true);
     const std::string piece = common_token_to_piece(ctx.lctx, token_id, true);
     generated_text += piece;
     LOG("%s", piece.c_str());
     fflush(stdout);
+    if (trace != nullptr && static_cast<bool>(*trace)) {
+      trace->token_line(token_id, piece);
+    }
     if (llama_vocab_is_eog(ctx.vocab, token_id) && !force_generation) {
       LOG("\n");
       break;
@@ -372,6 +418,8 @@ int main(int argc, char** argv) {
   const long load_end_ms = ggml_time_ms();
   phases.row("L_DecoderLoad", load_start_ms, load_end_ms);
 
+  const std::string export_plain_prompt = params.prompt;
+
   if (params.prompt.find(mtmd_default_marker()) == std::string::npos) {
     for (size_t i = 0; i < params.image.size(); ++i) {
       params.prompt = mtmd_default_marker() + params.prompt;
@@ -381,13 +429,40 @@ int main(int argc, char** argv) {
   common_chat_msg msg;
   msg.role = "user";
   msg.content = params.prompt;
-  std::string input_special_text;
-  if (eval_message(ctx, msg, params.image, phases, &input_special_text) != 0) {
+
+  std::unique_ptr<streamingvlm::hybrid_bridge::inference_trace_collector> trace_writer;
+  if (!custom.token_io_path.empty()) {
+    trace_writer = std::make_unique<streamingvlm::hybrid_bridge::inference_trace_collector>(
+        streamingvlm::hybrid_bridge::sibling_foundation_inference_tokens_path(custom.token_io_path));
+  }
+
+  const std::string hf_q =
+      streamingvlm::hybrid_bridge::internvl_hf_official_question_single_image(export_plain_prompt);
+
+  if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+    trace_writer->write_hf_reference_question_literal(hf_q);
+    trace_writer->write_hf_official_user_segment_reference(ctx.lctx, hf_q);
+  }
+
+  if (
+      eval_message(
+          ctx,
+          msg,
+          params.image,
+          phases,
+          nullptr,
+          nullptr,
+          trace_writer.get()) != 0) {
     return 1;
   }
   int n_predict = params.n_predict < 0 ? INT32_MAX : params.n_predict;
-  const std::string generated_text = generate_response(ctx, n_predict, custom.force_generation, phases);
-  write_text_file(custom.token_io_path, input_special_text + generated_text + "\n");
+  const std::string generated_text = generate_response(ctx, n_predict, custom.force_generation, phases, trace_writer.get());
+  std::string token_io_doc =
+      streamingvlm::hybrid_bridge::build_hf_user_assistant_echo(hf_q, generated_text) + "\n";
+  if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+    token_io_doc += trace_writer->format_token_io_appendix();
+  }
+  write_text_file(custom.token_io_path, token_io_doc);
   LOG("\n\n");
   llama_perf_context_print(ctx.lctx);
   return 0;

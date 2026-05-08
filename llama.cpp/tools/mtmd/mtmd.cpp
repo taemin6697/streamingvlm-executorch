@@ -395,9 +395,11 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_INTERNVL:
                 {
-                    // <img> ... (image embeddings) ... </img>
-                    img_beg = "<img>";
-                    img_end = "</img>";
+                    // HF `apply_chat_template` user turn uses literal "<image>\\n" + task (BPE splits to
+                    // "<", "image", ">\\n"), not the merged tokenizer special "<img>" (single id).
+                    // Omit a closing "</img>" wrapper so the task text follows vision like typical HF layout.
+                    img_beg = "<image>\n";
+                    img_end = "";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_internvl>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_KIMIVL:

@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <charconv>
+#include <cstdlib>
 #include <mutex>
 
 #undef MIN
@@ -52,6 +53,8 @@
 //------------------------------------------------------------------------------
 
 bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor);
+
+static bool ggml_opencl_debug_kv(void);
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
@@ -4410,6 +4413,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     }
                 }
                 if (!dims_supported) {
+                    if (ggml_opencl_debug_kv()) {
+                        GGML_LOG_WARN(
+                            "%s: FLASH_ATTN_EXT OpenCL unsupported: dk=%d dv=%d (not in kernel dim list)\n",
+                            __func__,
+                            dk,
+                            dv);
+                    }
                     return false;
                 }
 
@@ -4417,6 +4427,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // match ggml_cl_flash_attn (CPU cannot execute FA on GPU-buffer quant tensors without copies).
                 if (ggml_is_quantized(k->type) || ggml_is_quantized(v->type)) {
                     if (!ggml_is_quantized(k->type) || !ggml_is_quantized(v->type) || k->type != v->type) {
+                        if (ggml_opencl_debug_kv()) {
+                            GGML_LOG_WARN(
+                                "%s: FLASH_ATTN_EXT OpenCL unsupported: K/V quant mismatch k=%s v=%s\n",
+                                __func__,
+                                ggml_type_name(k->type),
+                                ggml_type_name(v->type));
+                        }
                         return false;
                     }
                 }
@@ -4438,7 +4455,22 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 const bool is_f16_f16_out_f32 = q->type == GGML_TYPE_F16 && k_logical_type == GGML_TYPE_F16 &&
                                                 v_logical_type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32;
 
-                return is_f32_f32 || is_f16_f16 || is_f32_f16 || is_f16_f16_out_f32;
+                const bool ok = is_f32_f32 || is_f16_f16 || is_f32_f16 || is_f16_f16_out_f32;
+                if (!ok && ggml_opencl_debug_kv()) {
+                    GGML_LOG_WARN(
+                        "%s: FLASH_ATTN_EXT OpenCL unsupported: q=%s k_log=%s v_log=%s dst=%s "
+                        "dk=%d dv=%d k_raw=%s v_raw=%s\n",
+                        __func__,
+                        ggml_type_name(q->type),
+                        ggml_type_name(k_logical_type),
+                        ggml_type_name(v_logical_type),
+                        ggml_type_name(op->type),
+                        dk,
+                        dv,
+                        ggml_type_name(k->type),
+                        ggml_type_name(v->type));
+                }
+                return ok;
             }
         default:
             return false;
@@ -9526,6 +9558,16 @@ static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, NULL, dst);
 }
 
+// GGML_OPENCL_DEBUG_KV=1: throttled GGML_LOG_WARN for quantized-KV paths (Android / host).
+static bool ggml_opencl_debug_kv(void) {
+    static int memo = -1;
+    if (memo < 0) {
+        const char * env = getenv("GGML_OPENCL_DEBUG_KV");
+        memo = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return memo != 0;
+}
+
 struct ggml_cl_flash_attn_temp_buffer {
     cl_mem data = nullptr;
 
@@ -9559,6 +9601,8 @@ static bool ggml_cl_flash_attn_prepare_quantized_tensor(
     const size_t nbytes = ggml_nbytes(tensor);
 
     sync_with_other_backends(backend_ctx);
+    // Ensure GPU writes visible before read (single-device builds skip cross-backend barriers).
+    CL_CHECK(clFinish(backend_ctx->queue));
     std::vector<uint8_t> host_raw(nbytes);
     CL_CHECK(clEnqueueReadBuffer(
         backend_ctx->queue,
@@ -9571,30 +9615,80 @@ static bool ggml_cl_flash_attn_prepare_quantized_tensor(
         NULL,
         NULL));
 
-    const uint8_t * packed_quant = host_raw.data();
-    std::vector<uint8_t> host_packed;
+    // dequantize_row_* / to_float assume consecutive quantization blocks with no gaps (dense slab).
+    // ggml_is_contiguous_0 alone is insufficient after permutes: nb[1] may not equal row_bytes.
     const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
-    if (!ggml_is_contiguous_0(tensor)) {
-        const int64_t ne1 = tensor->ne[1];
-        const int64_t ne2 = tensor->ne[2];
-        const int64_t ne3 = tensor->ne[3];
-        host_packed.resize(row_bytes * (size_t)(ne1 * ne2 * ne3));
-        uint8_t * dst = host_packed.data();
-        for (int64_t i3 = 0; i3 < ne3; ++i3) {
-            for (int64_t i2 = 0; i2 < ne2; ++i2) {
-                for (int64_t i1 = 0; i1 < ne1; ++i1) {
-                    const size_t row_off = (size_t)(i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3]);
-                    GGML_ASSERT(row_off + row_bytes <= host_raw.size());
-                    memcpy(dst, host_raw.data() + row_off, row_bytes);
-                    dst += row_bytes;
-                }
+    const int64_t ne1 = tensor->ne[1];
+    const int64_t ne2 = tensor->ne[2];
+    const int64_t ne3 = tensor->ne[3];
+    std::vector<uint8_t> host_packed(row_bytes * (size_t)(ne1 * ne2 * ne3));
+    uint8_t * dst = host_packed.data();
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                const size_t row_off = (size_t)(i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3]);
+                GGML_ASSERT(row_off + row_bytes <= host_raw.size());
+                memcpy(dst, host_raw.data() + row_off, row_bytes);
+                dst += row_bytes;
             }
         }
-        packed_quant = host_packed.data();
     }
+    const uint8_t * packed_quant = host_packed.data();
 
     std::vector<float> host_f32(n);
     ggml_get_type_traits(tensor->type)->to_float(packed_quant, host_f32.data(), n);
+
+    if (ggml_opencl_debug_kv()) {
+        static std::mutex dbg_mu;
+        static uint32_t dbg_n = 0;
+        uint32_t tag = 0;
+        {
+            std::lock_guard<std::mutex> lock(dbg_mu);
+            if (dbg_n < 64) {
+                tag = ++dbg_n;
+            }
+        }
+        if (tag) {
+            uint32_t crc = 0;
+            const size_t crc_len = MIN(host_packed.size(), (size_t) 256);
+            for (size_t i = 0; i < crc_len; i++) {
+                crc = crc * 31u + (uint32_t) host_packed[i];
+            }
+            float f_min = HUGE_VALF;
+            float f_max = -HUGE_VALF;
+            const size_t n_f = (size_t) n;
+            const size_t ncheck = MIN(n_f, (size_t) 2048);
+            int nans = 0;
+            for (size_t i = 0; i < ncheck; i++) {
+                const float x = host_f32[i];
+                if (x != x) {
+                    nans++;
+                }
+                f_min = MIN(f_min, x);
+                f_max = MAX(f_max, x);
+            }
+            const char * nm = tensor->name[0] ? tensor->name : "(no name)";
+            GGML_LOG_WARN(
+                "%s: [%u] FA prepare quant name=%s type=%s ne=%" PRId64 " %" PRId64 " %" PRId64 " %" PRId64
+                " nbytes=%zu row_b=%zu crc256=%u f32 samp=%zu min=%g max=%g nans=%d view_offs=%" PRId64 "\n",
+                __func__,
+                (unsigned) tag,
+                nm,
+                ggml_type_name(tensor->type),
+                tensor->ne[0],
+                tensor->ne[1],
+                tensor->ne[2],
+                tensor->ne[3],
+                (size_t) nbytes,
+                row_bytes,
+                crc,
+                (size_t) ncheck,
+                (double) f_min,
+                (double) f_max,
+                nans,
+                (int64_t) tensor->view_offs);
+        }
+    }
 
     const size_t bytes_per_elem = ggml_type_size(target_type);
     const size_t buffer_size = (size_t) n * bytes_per_elem;
@@ -11391,6 +11485,27 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
+// llama KV cache tensors are ggml_format_name(..., "cache_k_l%d" / "cache_v_l%d") (see llama-kv-cache.cpp).
+// SET_ROWS writes ggml-native interleaved blocks into ggml_tensor_extra_cl::data_device (AOS).
+// GGML_OPENCL_SOA_Q weight paths pass ggml_tensor_extra_cl_q4_0::{q,d} split buffers instead — incompatible.
+// Match llama KV roots "cache_k_l%%d", "cache_v_l%%d" and views "… (view)".
+// Scheduler copies may prefix names: %%s#%%s#%%d → use strstr, not prefix-only compare.
+static bool ggml_cl_llama_kv_tensor_name_roots_to_cache_kv(const ggml_tensor * tensor) {
+    if (!tensor || tensor->name[0] == 0) {
+        return false;
+    }
+    const ggml_tensor * r = tensor;
+    while (r->view_src) {
+        r = r->view_src;
+    }
+    const char * n = r->name;
+    return strstr(n, "cache_k_l") != nullptr || strstr(n, "cache_v_l") != nullptr;
+}
+
+static bool ggml_cl_is_llama_q4_kv_aos(const ggml_tensor * src0) {
+    return src0 && src0->type == GGML_TYPE_Q4_0 && ggml_cl_llama_kv_tensor_name_roots_to_cache_kv(src0);
+}
+
 static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -11432,6 +11547,33 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     int r2 = ne12/ne02;
     int r3 = ne13/ne03;
+
+    if (ggml_opencl_debug_kv() && src0t == GGML_TYPE_Q4_0) {
+        static std::mutex dbg_mu;
+        static uint32_t dbg_mm = 0;
+        uint32_t tag = 0;
+        {
+            std::lock_guard<std::mutex> lock(dbg_mu);
+            if (dbg_mm < 96) {
+                tag = ++dbg_mm;
+            }
+        }
+        if (tag) {
+            const bool is_kv_aos = ggml_cl_is_llama_q4_kv_aos(src0);
+            const char * nm = src0->name[0] ? src0->name : "(no name)";
+            GGML_LOG_WARN(
+                "%s: [%u] mul_mat src0=Q4_0 name=%s llama_kv_aos=%d ne00=%d ne01=%d ne11=%d src1t=%s dst_t=%s\n",
+                __func__,
+                (unsigned) tag,
+                nm,
+                (int) is_kv_aos,
+                ne00,
+                ne01,
+                ne11,
+                ggml_type_name(src1t),
+                ggml_type_name(dst->type));
+        }
+    }
 
     GGML_ASSERT(ne00 == ne10);
 
@@ -11475,9 +11617,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // limit, so the check is omitted.
 
         // q4_0 x fp32
+        // KV cache stays AOS in data_device — Adreno GEMM expects SOA {q,d} from set_tensor.
         if(src0t == GGML_TYPE_Q4_0 && src1t == GGML_TYPE_F32) {
-            ggml_cl_mul_mat_q4_0_f32_adreno(backend, src0, src1, dst);
-            return;
+            if (!ggml_cl_is_llama_q4_kv_aos(src0)) {
+                ggml_cl_mul_mat_q4_0_f32_adreno(backend, src0, src1, dst);
+                return;
+            }
         }
 
         // q4_1 x fp32
@@ -11664,6 +11809,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     break;
                 }
                 if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+                    break;
+                }
+
+                // KV AOS buffers: kernel expects SOA ql/d from weights (see GGML_OPENCL_SOA_Q set_tensor path).
+                if (ggml_cl_is_llama_q4_kv_aos(src0)) {
                     break;
                 }
 
@@ -11987,6 +12137,10 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // Set up kernel.
         switch(src0t) {
             case GGML_TYPE_Q4_0:
+                if (ggml_cl_is_llama_q4_kv_aos(src0)) {
+                    break;
+                }
+
                 // This should have been satisfied.
                 GGML_ASSERT(ne11 == ne1);
                 GGML_ASSERT(ne01 == ne0);
@@ -12026,7 +12180,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
 
         // Launch kernel.
-        if (src0t == GGML_TYPE_Q4_0) {
+        if (src0t == GGML_TYPE_Q4_0 && !ggml_cl_is_llama_q4_kv_aos(src0)) {
             size_t global_work_size[] = {(size_t)(ne01 + 7)/8*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
             size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
@@ -12146,37 +12300,71 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             GGML_ASSERT(ne01 == ne0);
 
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
-                nth0 = 16;
-                nth1 = 1;
+            if (ggml_cl_is_llama_q4_kv_aos(src0)) {
+                // Llama KV cache: ggml-interleaved Q4 blocks in ggml_tensor_extra_cl::data_device.
+                // Use the legacy mul-mv kernels that read AOS buffers (matches non-GGML_OPENCL_SOA_Q path).
+                if (backend_ctx->gpu_family == INTEL) {
+                    nth0 = 16;
+                    nth1 = 1;
+                    kernel = backend_ctx->kernel_mul_mat_q4_0_f32;
+                    ndst = 4;
+                } else if (backend_ctx->gpu_family == ADRENO) {
+                    nth0 = 64;
+                    nth1 = 1;
+                    kernel = backend_ctx->kernel_mul_mat_q4_0_f32_v;
+                    ndst = 4;
+                } else {
+                    GGML_ASSERT(false && "TODO: Unknown GPU");
+                }
 
-                kernel = backend_ctx->kernel_mul_mat_q4_0_f32_8x_flat;
-                ndst = 8;
-            } else if (backend_ctx->gpu_family == ADRENO) {
-                nth0 = 64;
-                nth1 = 1;
-
-                kernel = backend_ctx->kernel_mul_mat_q4_0_f32_8x_flat;
-                ndst =8;
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
             } else {
-                GGML_ASSERT(false && "TODO: Unknown GPU");
-            }
+                if (backend_ctx->gpu_family == INTEL) {
+                    nth0 = 16;
+                    nth1 = 1;
 
-            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_0->q));
-            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_0->d));
-            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
-            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
-            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
-            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
-            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
-            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
-            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
-            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
-            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
-            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
-            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
-            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
-            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+                    kernel = backend_ctx->kernel_mul_mat_q4_0_f32_8x_flat;
+                    ndst = 8;
+                } else if (backend_ctx->gpu_family == ADRENO) {
+                    nth0 = 64;
+                    nth1 = 1;
+
+                    kernel = backend_ctx->kernel_mul_mat_q4_0_f32_8x_flat;
+                    ndst =8;
+                } else {
+                    GGML_ASSERT(false && "TODO: Unknown GPU");
+                }
+
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q4_0->q));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q4_0->d));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne10));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne0));
+                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne1));
+                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
+            }
 #else // GGML_OPENCL_SOA_Q
             if (backend_ctx->gpu_family == INTEL) {
                 // Use 1D local size. Each workgroup is a SIMD group. Each SIMD

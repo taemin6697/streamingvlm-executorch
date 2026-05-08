@@ -2995,3 +2995,46 @@ Rebuild the hybrid Android bridge (e.g. `my_research/foundation_llamacpp/build-h
   + quantized K/V, the scheduler routed FA to **CPU** while K/V remained on **OpenCL** buffers →
   **warmup SIGSEGV**. Match `ggml_cl_flash_attn` logical K/V types (and allow F16 Q + F32 dst from
   `ggml_flash_attn_ext`) so FA stays on OpenCL. See `my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp.md`.
+
+## foundation_llamacpp: HF single-image echo + GGUF inference token trace (2026-05-06)
+
+- **`foundation_token_io.txt`:** written as HF demo-style `User: {question}\nAssistant: {generated}`,
+  where `question` follows InternVL HF single-image convention `'<image>\n' + -p text` unless the CLI
+  prompt already begins with `<image>` (same logic in C++ `foundation_token_io_format.hpp` and Python
+  `run_android_hybrid_bridge.py` fallback writer).
+- **`foundation_inference_tokens.txt`:** sibling of `foundation_token_io.txt` when
+  `--token-io-path` is set (`sibling_foundation_inference_tokens_path` in `inference_trace.hpp`).
+  Contains the HF question literal block plus PREFILL (mtmd text chunk token ids + pieces) and DECODE
+  lines; for InternVL, prefill `<image>` BPE matches HF after mtmd `img_beg` fix (see section below).
+- **Android pull / cleanup:** `run_android_hybrid_bridge.py` pulls and `rm -f` includes
+  `foundation_inference_tokens.txt` for hybrid and standalone `opencl_phase_mtmd` runs.
+- **`hybrid_decode`:** matches `opencl_phase_mtmd` for trace + HF echo (see `hybrid_decode.cpp`).
+
+## llama.cpp mtmd: InternVL HF-style `<image>` BPE (2026-05-06)
+
+- **`llama.cpp/tools/mtmd/mtmd.cpp`** `PROJECTOR_TYPE_INTERNVL`: `img_beg` / `img_end` were `<img>` / `</img>`
+  (single-token `<img>`). Hugging Face user turns use literal `"<image>\\n"` + task, which BPE-splits
+  (e.g. `<`, `image`, `>\\n`). Updated to `img_beg = "<image>\\n"`, `img_end = ""` so **actual prefill**
+  text tokens match HF `tokenizer.encode` on that segment; upstream change — reapply as patch when
+  rebasing llama.cpp.
+
+## foundation_llamacpp: ground truth = tokenizer token IDs (policy)
+
+**Source of truth for “does our prefill match HF?” is always the tokenizer output in integer token
+IDs**, not human-readable strings, substring heuristics, or “it looks similar” decoding.
+
+- **Reference:** Hugging Face `tokenizer.encode(...)` on the exact user/assistant string the
+  official recipe uses (same chat template, same `<image>` / multi-image layout when that lands).
+- **On-device / GGUF:** same logical sequence must match **`common_tokenize`** (or equivalent)
+  on the **same** flattened prompt bytes; traces like `foundation_inference_tokens.txt` exist to
+  compare **ID-by-ID** against the HF list.
+- **Vision slots:** mtmd fills `-1` / `VISION_KV_SLOT` placeholders where there is no vocab
+  token; alignment means **text token IDs before/after/between** those slots match HF for the same
+  string layout.
+- **Video / multi-frame later:** still **tokenizer-first**: build the canonical HF string for “frame
+  1, frame 2, …” (or repeated `<image>` as in the model card), then **match that encode’s token ID
+  sequence** end-to-end; do not cargo-cult extra English labels like `Frame 1` unless the reference
+  template actually includes them after `encode`.
+
+If logits or generations diverge, the first check is **token ID parity** for the relevant prompt
+segment; only after IDs match is it worthwhile to blame sampling, KV dtype, or kernels.
