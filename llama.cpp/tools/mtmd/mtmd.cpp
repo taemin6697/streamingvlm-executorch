@@ -1075,6 +1075,29 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
 }
 
+int32_t mtmd_project_features(mtmd_context * ctx, const float * features, int32_t n_tokens, int32_t n_feature_embd) {
+    clip_ctx * ctx_clip = ctx->ctx_v;
+    if (!ctx_clip) {
+        LOG_ERR("%s: model does not support vision input\n", __func__);
+        return 1;
+    }
+    auto proj_type = clip_get_projector_type(ctx_clip);
+    if (proj_type != PROJECTOR_TYPE_INTERNVL) {
+        LOG_ERR("%s: only InternVL projector is supported for external feature projection\n", __func__);
+        return 1;
+    }
+    int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
+    ctx->image_embd_v.resize((size_t) n_tokens * n_mmproj_embd);
+    bool ok = clip_project_internvl_features(
+        ctx_clip,
+        ctx->n_threads,
+        features,
+        n_tokens,
+        n_feature_embd,
+        ctx->image_embd_v.data());
+    return ok ? 0 : 1;
+}
+
 bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     auto proj_type = ctx->proj_type_v();
     if (chunk && chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {

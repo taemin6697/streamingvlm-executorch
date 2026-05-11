@@ -128,6 +128,7 @@ struct phase_recorder {
              "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
       out << "# L_DecoderLoad: llama.cpp model/context/mmproj load  "
              "ExternalEmbeddingRead: .svlmemb read  LayoutTokenize: mtmd text/image layout  "
+             "Mmproj: OpenCL mmproj projection for QNN pre-projector features  "
              "ImagePrefill: external image embedding decode  T_Prefill: text prompt eval  "
              "D: one generated-token decode\n";
     }
@@ -179,7 +180,9 @@ struct decode_context {
     mparams.print_timings = true;
     mparams.n_threads = params.cpuparams.n_threads;
     mparams.flash_attn_type = params.flash_attn_type;
-    mparams.warmup = params.warmup;
+    // Vision activations come from QNN (hybrid_vision_dump); do not run CLIP ViT warmup on OpenCL/mmproj.
+    // `params.warmup` still applies to the text decoder via `common_init_from_params` above.
+    mparams.warmup = false;
     mparams.image_min_tokens = params.image_min_tokens;
     mparams.image_max_tokens = params.image_max_tokens;
     ctx_vision.reset(mtmd_init_from_file(params.mmproj.path.c_str(), model, mparams));
@@ -305,19 +308,57 @@ int eval_with_external_embedding(
     if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
       const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
       const int32_t n_embd = llama_model_n_embd_inp(ctx.model);
-      if (embedding.values.size() != n_tokens * static_cast<size_t>(n_embd)) {
-        die_fmt(
-            "embedding size mismatch: file has %zu floats, image chunk expects %zu x %d",
-            embedding.values.size(),
+      float* image_embedding = embedding.values.data();
+      if (embedding.values.size() == n_tokens * static_cast<size_t>(n_embd)) {
+        // Already projected into the decoder input embedding dimension.
+        LOG_INF(
+            "external embedding is already projected: tokens=%zu embd=%d floats=%zu\n",
             n_tokens,
-            n_embd);
+            n_embd,
+            embedding.values.size());
+      } else {
+        int32_t n_feature_embd = 0;
+        if (embedding.shape.size() >= 3 && embedding.shape[embedding.shape.size() - 2] == static_cast<int64_t>(n_tokens)) {
+          n_feature_embd = static_cast<int32_t>(embedding.shape.back());
+        } else if (embedding.shape.size() == 2 && embedding.shape[0] == static_cast<int64_t>(n_tokens)) {
+          n_feature_embd = static_cast<int32_t>(embedding.shape[1]);
+        }
+        if (n_feature_embd <= 0 || embedding.values.size() != n_tokens * static_cast<size_t>(n_feature_embd)) {
+          die_fmt(
+              "embedding size mismatch: file has %zu floats, image chunk expects %zu x %d projected embedding or valid pre-projector features",
+              embedding.values.size(),
+              n_tokens,
+              n_embd);
+        }
+        LOG_INF(
+            "external embedding is pre-projector: tokens=%zu feature_embd=%d projected_embd=%d floats=%zu\n",
+            n_tokens,
+            n_feature_embd,
+            n_embd,
+            embedding.values.size());
+        const long mmproj_start_ms = ggml_time_ms();
+        if (mtmd_project_features(
+                ctx.ctx_vision.get(),
+                embedding.values.data(),
+                static_cast<int32_t>(n_tokens),
+                n_feature_embd) != 0) {
+          die("failed to project external vision features with mmproj");
+        }
+        const long mmproj_end_ms = ggml_time_ms();
+        phases.row("Mmproj", mmproj_start_ms, mmproj_end_ms);
+        image_embedding = mtmd_get_output_embd(ctx.ctx_vision.get());
+      }
+      if (image_embedding == nullptr) {
+        die_fmt(
+            "mmproj output is null for image chunk with %zu tokens",
+            n_tokens);
       }
       const long image_prefill_start_ms = ggml_time_ms();
       if (mtmd_helper_decode_image_chunk(
               ctx.ctx_vision.get(),
               ctx.lctx,
               chunk,
-              embedding.values.data(),
+              image_embedding,
               ctx.n_past,
               0,
               ctx.n_batch,

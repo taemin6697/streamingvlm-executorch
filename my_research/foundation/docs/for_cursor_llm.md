@@ -3009,6 +3009,8 @@ Rebuild the hybrid Android bridge (e.g. `my_research/foundation_llamacpp/build-h
 - **Android pull / cleanup:** `run_android_hybrid_bridge.py` pulls and `rm -f` includes
   `foundation_inference_tokens.txt` for hybrid and standalone `opencl_phase_mtmd` runs.
 - **`hybrid_decode`:** matches `opencl_phase_mtmd` for trace + HF echo (see `hybrid_decode.cpp`).
+  **Hybrid QNN vision:** `hybrid_decode` forces **mtmd/CLIP `warmup = false`** so OpenCL does not run a dummy ViT
+  warmup in `clip_init`; vision prep is QNN’s job. Text decoder `--warmup` still applies via `common_init_from_params`.
 
 ## llama.cpp mtmd: InternVL HF-style `<image>` BPE (2026-05-06)
 
@@ -3038,3 +3040,95 @@ IDs**, not human-readable strings, substring heuristics, or “it looks similar�
 
 If logits or generations diverge, the first check is **token ID parity** for the relevant prompt
 segment; only after IDs match is it worthwhile to blame sampling, KV dtype, or kernels.
+
+## foundation: InternVL3 pre-projector vision-tower export (2026-05-08)
+
+- Existing `my_research/foundation/models/internvl3/vision_encoder/model.py` remains **fused**:
+  it loads `vision_tower` plus `multi_modal_projector`, so `vision_encoder_pte` output is already
+  in the decoder input embedding dimension (for example 1B emits `256 x 896`; 8B expects
+  `256 x 3584`).
+- Added a separate, upgrade-safe path under
+  `my_research/foundation/models/internvl3/vision_encoder/pre_projector.py` and
+  `export_pre_projector.py`. This wraps Qualcomm `InternVL3VisionEncoder` only through
+  `vision_tower` + CLS removal + `pixel_shuffle`, stopping before `multi_modal_projector`.
+- Pre-projector artifacts live under `my_research/foundation/results/vision_models/` and are
+  intentionally **not** drop-in replacements for current `vision_encoder_pte`; a decoder-size-specific
+  projector must be exported or implemented before feeding llama.cpp/OpenCL decoder embeddings.
+
+## foundation_llamacpp: direct `--vision` hybrid PTE path (2026-05-08)
+
+- `my_research/foundation_llamacpp/run_android_hybrid_bridge.py` now accepts
+  `--vision/--vision-encoder <pte>` for `--processor hybrid`. This bypasses manifest parsing and
+  directly pushes the requested ExecuTorch/QNN vision PTE. The old `--manifest` path remains as a
+  fallback for existing fused QNN exports.
+- Added `my_research/foundation/models/internvl3/vision_encoder/export_pre_projector_qnn.py` to
+  compile the InternVL3 pre-projector vision tower to QNN and write artifacts under
+  `my_research/foundation_llamacpp/results/vision_models/<model>_vision_tower_preproj_qnn_<soc>/`.
+- Exported the local 1B artifact from
+  `my_research/foundation/results/model/hf/InternVL3-1B-hf` plus
+  `my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth` to
+  `my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_sm8750/vision_tower_preproj_qnn.pte`.
+  Metadata says `quantization: 16a8w`, `projector_included: false`, and output shape
+  `[1, 256, 4096]`.
+- For host QNN export in this container, include Qualcomm's bundled libc++ path:
+  `LIBCXX_DIR=/opt/conda/envs/stream/lib/python3.11/site-packages/executorch/backends/qualcomm/sdk/libcxx-14.0.0`
+  and add `$QNN_SDK_ROOT/lib/x86_64-linux-clang:$LIBCXX_DIR:$EXECUTORCH_ROOT/build-x86/lib`
+  to `LD_LIBRARY_PATH`; otherwise QNN load can fail on `libc++.so.1`.
+- Important limitation: current `hybrid_decode` still treats `.svlmemb` as already projected LM
+  embeddings. A pre-projector QNN PTE therefore still needs a decoder-side mmproj-only bridge before
+  it can replace the old fused `vision_encoder_qnn.pte` in end-to-end decode.
+
+## foundation_llamacpp: QNN vision-only + OpenCL mmproj bridge (2026-05-08)
+
+- `hybrid_embedding_file.cpp` now writes `.svlmemb` atomically via `<path>.tmp` then `rename`, so
+  `hybrid_decode --wait-for-embedding` cannot read a partially written embedding file.
+- Added a narrow InternVL-only projector path in llama.cpp mtmd:
+  `mtmd_project_features()` and `clip_project_internvl_features()` take QNN pre-projector features
+  shaped `1 x 256 x 4096`, apply the mmproj GGUF `multi_modal_projector` on OpenCL, and produce
+  decoder embeddings shaped `256 x 896` for image prefill.
+- `hybrid_decode` now detects whether external `.svlmemb` is already projected (`n_tokens * n_embd`)
+  or pre-projector (`shape[-2] == n_tokens`) and automatically inserts a `Mmproj` phase for the
+  latter before `mtmd_helper_decode_image_chunk`.
+- Android run succeeded with
+  `my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_sm8750/vision_tower_preproj_qnn.pte`.
+  Result directory:
+  `my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_4096_kv8/`.
+  Key timings: QNN vision encode `331 ms`, OpenCL mmproj `15 ms`, image prefill `301 ms`, prompt eval
+  `558.65 ms`, decode eval `4632.9 ms`, return code `0`.
+
+## foundation_llamacpp: QNN vision-only quality debug notes (2026-05-08)
+
+- Image preprocessing is not the observed caption-quality issue. The Android launcher path
+  (`run_android_hybrid_bridge.py::_normalize_image_to_bin`) and calibration path
+  (`export_xnnpack.py::_load_calibration_data`, reused by `export_pre_projector_qnn.py`) both use
+  RGB resize to `448 x 448`, float `[0, 1]`, ImageNet mean/std
+  `[0.485, 0.456, 0.406] / [0.229, 0.224, 0.225]`, and CHW layout. Numeric comparison on
+  `sample_coco_cats_448.jpg` and `golden_gate_bridge_448.jpg` produced exact diff `0.0`.
+- Fixed `export_pre_projector_qnn.py` CLI override bug: the callable defaults for `soc_model`,
+  `quant`, and `calibration_num` must be `None`, otherwise calling the module from CLI with
+  `--quant fp16` was overwritten by the Python function default `16a8w` after `parse_args()`.
+- Exported a separate fp16 pre-projector QNN artifact:
+  `my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_fp16_sm8750/vision_tower_preproj_qnn.pte`.
+  Metadata confirms `quantization: fp16`, `projector_included: false`, output `1 x 256 x 4096`.
+- Android fp16 test must use both `--force-push` and `--model-push`, because different artifact
+  directories still push the same remote filename `vision_tower_preproj_qnn.pte`; otherwise the
+  remote cached PTE can silently remain from an earlier run.
+- Initial fp16/16a8w pre-projector artifacts were bad because they were exported with
+  `--encoder-weights my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth`. That file
+  has decoder-style keys (`layers.*`, `tok_embeddings.*`) and **no** `vision_tower.*` keys, so
+  `pre_projector.py` loaded no vision weights under `strict=False`; Android `.svlmemb` stats were
+  all zero and captions hallucinated. `pre_projector.py` now fails fast when an `--encoder-weights`
+  file contains no vision-tower keys.
+- Refactored the llama.cpp InternVL projector path so `clip_graph_internvl_projector_only` inherits
+  from `clip_graph_internvl` and calls the same `build_projector()` helper used by the normal
+  OpenCL full-vision path. `hybrid_decode` now logs whether the external embedding is already
+  projected or pre-projector (`tokens=256 feature_embd=4096 projected_embd=896`).
+- Correct 16a8w artifact with real HF vision weights:
+  `my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte`.
+  Export used `--model-path OpenGVLab/InternVL3-1B-hf` without `--encoder-weights` and calibration
+  images `sample_coco_cats_448.jpg` plus `golden_gate_bridge_448.jpg`.
+- Android run with the real-weight 16a8w PTE succeeded:
+  `my_research/foundation_llamacpp/results/log_realweights_quant_debug/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_4096_kv16/`.
+  `.svlmemb` stats were non-zero (`mean -0.1406`, `std 1.0058`, `norm 1039.9`) and the caption was
+  correct: two cats on a pink blanket with remote controls. Use both `--force-push` and
+  `--model-push` when swapping PTE artifacts because remote filenames are identical.

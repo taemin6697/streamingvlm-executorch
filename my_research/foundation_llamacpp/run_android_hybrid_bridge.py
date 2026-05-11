@@ -1224,7 +1224,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run unified llama.cpp / hybrid Android VLM processors.")
     parser.add_argument("--processor", choices=("cpu", "gpu", "hybrid"), required=True)
     parser.add_argument("--serial", default=None)
-    parser.add_argument("--manifest", type=Path, default=None, help="Foundation QNN manifest with vision_encoder_pte. Required for --processor hybrid.")
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Foundation QNN manifest with vision_encoder_pte. Hybrid may use this or --vision.",
+    )
+    parser.add_argument(
+        "--vision",
+        "--vision-encoder",
+        dest="vision_encoder",
+        type=Path,
+        default=None,
+        help="Direct ExecuTorch/QNN vision encoder PTE for --processor hybrid. Overrides --manifest.",
+    )
     parser.add_argument("--vision-build-dir", type=Path, default=None, help="CMake build dir containing hybrid_vision_dump. Defaults to --llama-build-dir.")
     parser.add_argument(
         "--executorch-build-dir",
@@ -1419,6 +1432,8 @@ def main() -> int:
     args.remote_root = args.remote_root.rstrip("/")
     args.baseline_window = max(args.baseline_window, 0.0)
     args.model = args.model.resolve()
+    if args.vision_encoder is not None:
+        args.vision_encoder = args.vision_encoder.resolve()
     args.llama_build_dir = args.llama_build_dir.resolve()
     if args.vision_build_dir is None:
         args.vision_build_dir = args.llama_build_dir
@@ -1448,11 +1463,13 @@ def main() -> int:
         exist_paths.append(args.mmproj)
     if args.image is not None:
         exist_paths.append(args.image)
+    if args.vision_encoder is not None:
+        exist_paths.append(args.vision_encoder)
     for required in exist_paths:
         if not required.exists():
             raise SystemExit(f"Missing required path: {required}")
-    if args.processor == "hybrid" and args.manifest is None:
-        raise SystemExit("--manifest is required when --processor hybrid.")
+    if args.processor == "hybrid" and args.manifest is None and args.vision_encoder is None:
+        raise SystemExit("--processor hybrid requires either --manifest or --vision.")
 
     qnn_sdk = os.environ.get("QNN_SDK_ROOT")
     if args.processor == "hybrid" and not qnn_sdk:
@@ -1490,8 +1507,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="streamingvlm_android_inputs_") as tmp:
         layout_image = args.image
         if args.processor == "hybrid":
-            manifest = _load_manifest(args.manifest.resolve())
-            encoder_pte = Path(manifest["paths"]["vision_encoder_pte"])
+            if args.vision_encoder is not None:
+                encoder_pte = args.vision_encoder
+            else:
+                manifest = _load_manifest(args.manifest.resolve())
+                encoder_pte = Path(manifest["paths"]["vision_encoder_pte"])
             vision_bin = _find_executable(args.vision_build_dir, "hybrid_vision_dump")
             decode_bin = _find_executable(args.llama_build_dir, "hybrid_decode")
             if not vision_bin.exists() or not decode_bin.exists():

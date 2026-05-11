@@ -260,6 +260,25 @@ ggml_tensor * clip_graph::build_mm(ggml_tensor * w, ggml_tensor * x) const {
     return ggml_mul_mat(ctx0, w, x);
 }
 
+struct clip_graph_internvl_projector_only : clip_graph_internvl {
+    clip_graph_internvl_projector_only(clip_ctx * ctx, const clip_image_f32 & img, const float * features, int n_tokens, int n_feature_embd)
+        : clip_graph_internvl(ctx, img), features(features), n_tokens(n_tokens), n_feature_embd(n_feature_embd) {}
+
+    const float * features;
+    int n_tokens;
+    int n_feature_embd;
+
+    ggml_cgraph * build() override {
+        GGML_ASSERT(proj_type == PROJECTOR_TYPE_INTERNVL);
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_feature_embd, n_tokens);
+        ggml_set_name(cur, "external_vision_features");
+        ggml_set_input(cur);
+        cur = build_projector(cur);
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+};
+
 void clip_graph::cb(ggml_tensor * cur, const char * name, int il) const {
     if (il >= 0) {
         ggml_format_name(cur, "%s-%d", name, il);
@@ -3778,6 +3797,71 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         LOG_INF("=== END MTMD_DEBUG_EMBEDDINGS ===\n\n");
     }
 
+    return true;
+}
+
+bool clip_project_internvl_features(clip_ctx * ctx, const int n_threads, const float * features, int n_tokens, int n_feature_embd, float * vec) {
+    if (ctx->proj_type() != PROJECTOR_TYPE_INTERNVL) {
+        LOG_ERR("%s: only InternVL projector is supported\n", __func__);
+        return false;
+    }
+    if (ctx->model.mm_0_w == nullptr || ctx->model.mm_3_w == nullptr) {
+        LOG_ERR("%s: InternVL projector tensors are missing\n", __func__);
+        return false;
+    }
+    const int expected_n_feature_embd = ctx->model.mm_0_w->ne[0];
+    if (n_feature_embd != expected_n_feature_embd) {
+        LOG_ERR("%s: expected InternVL pre-projector feature dim %d, got %d\n",
+                __func__, expected_n_feature_embd, n_feature_embd);
+        return false;
+    }
+    clip_image_f32 dummy;
+    dummy.nx = ctx->model.hparams.image_size;
+    dummy.ny = ctx->model.hparams.image_size;
+
+    if (ctx->buf_compute_meta.empty()) {
+        ctx->buf_compute_meta.resize(ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+    }
+    ggml_backend_sched_reset(ctx->sched.get());
+    clip_graph_internvl_projector_only builder(ctx, dummy, features, n_tokens, n_feature_embd);
+    ggml_cgraph * gf = builder.build();
+    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+
+    ggml_tensor * inp = ggml_graph_get_tensor(gf, "external_vision_features");
+    if (inp == nullptr) {
+        LOG_ERR("%s: failed to get external feature input\n", __func__);
+        return false;
+    }
+    if (inp->type != GGML_TYPE_F32 || ggml_nelements(inp) != (int64_t) n_tokens * n_feature_embd) {
+        LOG_ERR("%s: invalid external feature tensor\n", __func__);
+        return false;
+    }
+    ggml_backend_tensor_set(inp, features, 0, ggml_nbytes(inp));
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) {
+        auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (ggml_backend_set_n_threads_fn) {
+            ggml_backend_set_n_threads_fn(ctx->backend_cpu, n_threads);
+        }
+    }
+
+    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
+        return false;
+    }
+
+    ggml_tensor * embeddings = ggml_graph_node(gf, -1);
+    const int n_tokens_out = embeddings->ne[1];
+    const int n_embd_out = embeddings->ne[0];
+    const int expected_n_embd_out = clip_n_mmproj_embd(ctx);
+    if (n_tokens_out != n_tokens || n_embd_out != expected_n_embd_out) {
+        LOG_ERR("%s: expected output %d x %d, got %d x %d\n", __func__, expected_n_embd_out, n_tokens, n_embd_out, n_tokens_out);
+        return false;
+    }
+    ggml_backend_tensor_get(embeddings, vec, 0, ggml_nbytes(embeddings));
     return true;
 }
 

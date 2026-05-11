@@ -49,21 +49,23 @@ ggml_cgraph * clip_graph_internvl::build() {
             cur->ne[1] * cur->ne[2]);
     }
 
-    // projector (always using GELU activation)
-    {
-        // projector LayerNorm uses pytorch's default eps = 1e-5
-        // ref: https://huggingface.co/OpenGVLab/InternVL3-8B-Instruct/blob/a34d3e4e129a5856abfd6aa6de79776484caa14e/modeling_internvl_chat.py#L79
-        cur = build_norm(cur, model.mm_0_w, model.mm_0_b, NORM_TYPE_NORMAL, 1e-5, -1);
-        cur = build_ffn(cur,
-            model.mm_1_w, model.mm_1_b,
-            nullptr, nullptr,
-            model.mm_3_w, model.mm_3_b,
-            FFN_GELU,
-            -1);
-    }
+    cur = build_projector(cur);
 
     // build the graph
     ggml_build_forward_expand(gf, cur);
 
     return gf;
+}
+
+ggml_tensor * clip_graph_internvl::build_projector(ggml_tensor * cur) {
+    GGML_ASSERT(model.mm_0_w && model.mm_0_b && model.mm_1_w && model.mm_1_b && model.mm_3_w && model.mm_3_b);
+    // projector LayerNorm uses pytorch's default eps = 1e-5
+    // ref: https://huggingface.co/OpenGVLab/InternVL3-8B-Instruct/blob/a34d3e4e129a5856abfd6aa6de79776484caa14e/modeling_internvl_chat.py#L79
+    cur = build_norm(cur, model.mm_0_w, model.mm_0_b, NORM_TYPE_NORMAL, 1e-5, -1);
+    return build_ffn(cur,
+        model.mm_1_w, model.mm_1_b,
+        nullptr, nullptr,
+        model.mm_3_w, model.mm_3_b,
+        FFN_GELU,
+        -1);
 }

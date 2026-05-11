@@ -97,12 +97,21 @@ token transcript is reconstructed by the Python runner from stdout.
 
 ## Result Layout
 
-Unified runner results:
+Unified runner writes each run under `--results-root` using the **text GGUF stem**,
+`--processor` (`cpu`, `opencl` for GPU, or `hybrid`), `--ctx-size`, and KV dtypes:
 
 ```text
-my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_cpu_ctx_32768/
-my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768/
-my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768/
+<GGUF_stem>_<processor>_ctx_<N>_kv<KV>
+```
+
+`<KV>` comes from `--cache-type-k` / `--cache-type-v` (when omitted, both default to
+`f16` in the folder slug → `_kv16`). Examples for InternVL3-1B Q8_0 at ctx `32768`
+with default FP16 KV:
+
+```text
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_cpu_ctx_32768_kv16/
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768_kv16/
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768_kv16/
 ```
 
 Important artifacts:
@@ -155,8 +164,8 @@ Use CPU for a simple correctness baseline. This path uses upstream
 python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --processor cpu \
   --llama-build-dir llama.cpp/build-android-cpu-noomp \
-  --model llama.cpp/models/InternVL3-8B-Instruct-GGUF/InternVL3-8B-Instruct-Q4_K_M.gguf \
-  --mmproj llama.cpp/models/InternVL3-8B-Instruct-GGUF/mmproj-InternVL3-8B-Instruct-Q8_0.gguf \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
   --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
   --prompt "Describe this image briefly." \
   --n-predict 32 \
@@ -174,8 +183,11 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 Expected output directory:
 
 ```text
-my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_cpu_ctx_32768/
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_cpu_ctx_32768_kv16/
 ```
+
+Using a different GGUF (for example InternVL3-8B) changes `<GGUF_stem>` in the folder
+name accordingly.
 
 ## Run OpenCL GPU
 
@@ -187,8 +199,8 @@ uses it instead of upstream `llama-mtmd-cli` to produce precise phase rows.
 python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --processor gpu \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
-  --model llama.cpp/models/InternVL3-14B-Instruct-GGUF/InternVL3-14B-Instruct-Q4_K_M.gguf \
-  --mmproj llama.cpp/models/InternVL3-14B-Instruct-GGUF/mmproj-InternVL3-14B-Instruct-Q8_0.gguf \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
   --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
   --prompt "Describe this image briefly." \
   --n-predict 32 \
@@ -196,16 +208,26 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --threads 4 \
   --gpu-layers 99 \
   --device GPUOpenCL \
-  --ctx-size 512 \
+  --ctx-size 32768 \
   --batch-size 2048 \
   --ubatch-size 512 \
   --temperature 0.0 \
   --cache-type-k f16 \
   --cache-type-v f16 \
+  --fit off \
   --baseline-window 5.0 \
   --remote-root /data/local/tmp/streamingvlm_unified \
   --results-root my_research/foundation_llamacpp/results/log
 ```
+
+Expected output directory for the command above (`--ctx-size 32768`, FP16 KV):
+
+```text
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768_kv16/
+```
+
+Changing `--ctx-size` or `--cache-type-k` / `--cache-type-v` updates the `_ctx_<N>` / `_kv…`
+segments in the folder name (for example `_ctx_512_kv16` or `_ctx_32768_kv8`).
 
 HF에서 `rope_scaling: { "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768 }` 인 체크포인트를 그대로 반영해 실행하는 예입니다. **롱컨텍스트 상한(약 128k)** 을 쓰려면 `--ctx-size 131072`처럼 올리면 되고, 메모리가 빠듯하면 `32768`로 두고 아래 RoPE 플래그만 맞춰도 됩니다.
 
@@ -231,20 +253,21 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --yarn-orig-ctx 32768 \
   --cache-type-k f16 \
   --cache-type-v f16 \
+  --fit off \
   --baseline-window 5.0 \
   --remote-root /data/local/tmp/streamingvlm_unified \
   --results-root my_research/foundation_llamacpp/results/log
 ```
 
+YaRN 예제 결과 디렉터리 예시:
+
+```text
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_131072_kv16/
+```
+
 GGUF 메타에 동일한 RoPE 설정이 이미 들어 있으면 위 `--rope-scaling` / `--rope-scale` / `--yarn-orig-ctx` 는 생략해도 됩니다. 추가로 조정할 때만 `--rope-freq-base`, `--rope-freq-scale`, `--yarn-ext-factor`, `--yarn-attn-factor`, `--yarn-beta-slow`, `--yarn-beta-fast` 를 붙이면 됩니다.
 
 KV-cache를 8비트로 쓰려면 `--cache-type-k q8_0 --cache-type-v q8_0`처럼 지정하면 됩니다 (upstream llama.cpp `common_params`와 동일한 플래그명으로 그대로 전달됩니다). 결과 로그의 `llama_kv_cache` 줄에서 `K (q8_0)`, `V (q8_0)`로 표시되는지 확인하면 됩니다. 디바이스·백엔드 조합에 따라 해당 타입이 거부되면 로드 시 에러가 날 수 있습니다. OpenCL에서 초기화 단계(`common_fit_params`)가 `SET_ROWS` 등으로 abort 할 때는 `--fit off`로 자동 메모리 맞춤을 끄고 다시 시도하면 됩니다 (runner가 `opencl_phase_mtmd`에 그대로 넘깁니다).
-
-Expected output directory:
-
-```text
-my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768/
-```
 
 Important OpenCL note:
 
@@ -270,22 +293,31 @@ Use the hybrid bridge for the main streaming-system experiment:
 
 ```text
 ExecuTorch QNN:
-  vision encoder + projector
+  Fused PTE (vision tower + multi_modal_projector), or vision-tower-only PTE whose
+  features are projected by the llama.cpp GGUF mmproj before decoder prefill.
 
 llama.cpp OpenCL:
   layout tokenize + image/text prefill + token decode
 ```
 
-Typical run:
+The QNN manifest and the llama.cpp model/mmproj must use the same InternVL size.
+For example, a 1B QNN manifest emits image embeddings sized for the 1B decoder
+(`256 x 896` for the standard 256 image tokens). Do not pair that manifest with
+an 8B GGUF/mmproj (`256 x 3584` expected), or `hybrid_decode` will stop with an
+embedding size mismatch.
+
+Typical run (**OpenCL FP16 KV cache**, K/V 모두 `f16`). KV cache를 8bit로
+바꾸려면 `--cache-type-k q8_0 --cache-type-v q8_0 --fit off`를 사용하면
+됩니다(결과 폴더는 `_kv8` 접미사).
 
 ```bash
 python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --processor hybrid \
-  --manifest my_research/foundation/results/model/qnn/internvl3_1b_qnn_1k_16a8w/manifest.json \
+  --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
   --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
-  --image my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+  --image my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg \
   --prompt "Describe this image briefly." \
   --n-predict 32 \
   --force-generation 64 \
@@ -294,25 +326,96 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --ubatch-size 512 \
   --gpu-layers 99 \
   --device GPUOpenCL \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --fit off \
   --soc-model SM8750 \
   --baseline-window 5.0 \
   --remote-root /data/local/tmp/streamingvlm_unified \
-  --results-root my_research/foundation_llamacpp/results/log
+  --results-root my_research/foundation_llamacpp/results/log \
+  --force-push \
+  --model-push
 ```
+
+This `--vision` artifact is the 16a8w QNN vision-tower-only export:
+`projector_included: false`, output shape `1 x 256 x 4096`. Because it stops
+before InternVL3 `multi_modal_projector`, the decoder bridge must apply mmproj
+before image prefill for this command to run end-to-end.
 
 Expected output directory:
 
 ```text
-my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768/
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768_kv16/
 ```
 
 The unified runner caches only model-like files (`--model`, `--mmproj`, and the
 hybrid QNN `.pte`) on device. If they already exist under `--remote-root`, it
-skips pushing them; pass `--model-push` to force re-push. Runtime binaries,
+skips pushing them; pass `--model-push` to force re-push. Use `--force-push`
+when changing the remote workdir contents wholesale. Runtime binaries,
 shared libraries, scripts, and input images are always pushed so rebuilds are
 reflected immediately. In hybrid mode, the runner starts the QNN vision process
 and llama.cpp decoder process together, waits until both are loaded, then starts
 QNN `V_Encode`.
+
+### Vision-Tower-Only Artifacts
+
+The current QNN `vision_encoder_pte` is fused: it runs InternVL3 `vision_tower`
+and the model-size-specific `multi_modal_projector`, then writes embeddings in
+the decoder input dimension. `run_android_hybrid_bridge.py --processor hybrid`
+now accepts either the old manifest or a direct PTE:
+
+```bash
+--vision my_research/foundation_llamacpp/results/vision_models/<artifact>/vision_tower_preproj_qnn.pte
+```
+
+For experiments that need the raw visual features before that projector, use the
+separate pre-projector export path:
+
+```bash
+export QNN_SDK_ROOT=/workspace/streamingvlm/executorch/backends/qualcomm/sdk/qnn/qairt/2.37.0.250724
+export EXECUTORCH_ROOT=/workspace/streamingvlm/executorch
+export ANDROID_NDK_ROOT=/opt/android-ndk-r26c
+export LIBCXX_DIR=/opt/conda/envs/stream/lib/python3.11/site-packages/executorch/backends/qualcomm/sdk/libcxx-14.0.0
+export PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch
+export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/x86_64-linux-clang:$LIBCXX_DIR:$EXECUTORCH_ROOT/build-x86/lib:${LD_LIBRARY_PATH:-}"
+
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
+python -m my_research.foundation.models.internvl3.vision_encoder.export_pre_projector_qnn \
+  --model-name internvl3_1b \
+  --model-path OpenGVLab/InternVL3-1B-hf \
+  --artifact-root my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750 \
+  --soc-model SM8750 \
+  --quant 16a8w \
+  --calibration-images \
+    my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg \
+    my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+  --calibration-num 2
+```
+
+Do not pass `--encoder-weights my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth`
+for this export: that file is a decoder-style checkpoint and contains no
+`vision_tower.*` weights. The exporter now fails fast if `--encoder-weights`
+does not contain vision-tower keys.
+
+Expected artifact:
+
+```text
+my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte
+```
+
+Full exports write under:
+
+```text
+my_research/foundation_llamacpp/results/vision_models/<model>_vision_tower_preproj_qnn_<soc>/
+```
+
+and include `vision_tower_preproj_qnn_metadata.json` with
+`projector_included: false`. These artifacts are intentionally not the same as
+the old fused `vision_encoder_pte`: the output is still in vision hidden space,
+so `hybrid_decode` needs a decoder-side mmproj/projector step before image
+prefill. The current `hybrid_decode` supports this InternVL pre-projector path:
+it detects `1 x 256 x 4096`, runs the GGUF `mmproj` through OpenCL, then feeds
+the resulting `256 x 896` image embeddings into decoder prefill.
 
 ## Optional Backends
 
@@ -348,9 +451,9 @@ LayoutTokenize
   mtmd_tokenize() text/image layout construction.
 
 V_Encode
-  Vision encoder + projector.
+  Vision encoder (+ projector when fused), 또는 tower-only QNN 출력 후 디코더 쪽 mmproj.
   OpenCL: llama.cpp OpenCL vision path.
-  Hybrid: ExecuTorch QNN vision_encoder_pte.
+  Hybrid: ExecuTorch QNN `.pte` (매니페스트 또는 `--vision`).
 
 EmbeddingFileWrite
   Write `.svlmemb`. Hybrid only.
@@ -373,11 +476,16 @@ on execution. The full trace remains in `foundation_proc.csv`.
 
 ## Current Matched Results
 
+아래 숫자는 **동일 디코더 설정**(예: `n_ctx=32768`, `n_batch=2048`, `n_ubatch=512`)으로
+잡은 과거 측정값입니다. 결과 폴더 경로는 러너 버전에 따라 예전
+`results/log/opencl/<stem>/` 같은 하위 디렉터리 대신, 위 **Result Layout** 규칙의
+`..._<stem>_opencl_ctx_32768_kv16/` 형태를 씁니다.
+
 Latest standalone OpenCL precise run:
 
 ```text
-result:
-  my_research/foundation_llamacpp/results/log/opencl/InternVL3-1B-Instruct-Q8_0/
+result (representative folder name today):
+  my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768_kv16/
 
 V_Encode             = 714 ms
 ImagePrefill         = 36 ms
@@ -391,8 +499,8 @@ llama.cpp total      = 2444.37 ms
 Latest hybrid QNN vision + OpenCL decoder run:
 
 ```text
-result:
-  my_research/foundation_llamacpp/results/log/hybrid_bridge_opencl/InternVL3-1B-Instruct-Q8_0/
+result (representative folder name today):
+  my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768_kv16/
 
 V_Encode / QNN vision = 369 ms
 ImagePrefill          = 57 ms

@@ -1,6 +1,7 @@
 #include "hybrid_embedding_file.h"
 
 #include <cstring>
+#include <cstdio>
 #include <fstream>
 #include <stdexcept>
 
@@ -18,9 +19,10 @@ void write_embedding_file(
   header.n_dims = shape.size();
   header.n_values = n_values;
 
-  std::ofstream out(path, std::ios::binary);
+  const std::string tmp_path = path + ".tmp";
+  std::ofstream out(tmp_path, std::ios::binary);
   if (!out.is_open()) {
-    throw std::runtime_error("failed to open embedding output: " + path);
+    throw std::runtime_error("failed to open embedding output: " + tmp_path);
   }
   out.write(reinterpret_cast<const char*>(&header), sizeof(header));
   out.write(
@@ -31,6 +33,13 @@ void write_embedding_file(
       static_cast<std::streamsize>(n_values * sizeof(float)));
   if (!out.good()) {
     throw std::runtime_error("failed to write embedding output: " + path);
+  }
+  out.close();
+  if (!out.good()) {
+    throw std::runtime_error("failed to close embedding output: " + tmp_path);
+  }
+  if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    throw std::runtime_error("failed to publish embedding output: " + path);
   }
 }
 

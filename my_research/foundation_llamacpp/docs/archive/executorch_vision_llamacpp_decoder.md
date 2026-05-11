@@ -166,15 +166,16 @@ not modify upstream ExecuTorch or upstream llama.cpp.
 ```text
 Process 1: hybrid_vision_dump
   image bin
-  -> ExecuTorch Module(vision_encoder_qnn.pte)
-  -> QNN/HTP delegated InternVL vision path
-  -> projected image embeddings
+  -> ExecuTorch Module(vision_tower_preproj_qnn.pte)
+  -> QNN/HTP delegated InternVL vision tower
+  -> pre-projector visual features
   -> vision_embedding.svlmemb
 
 Process 2: hybrid_decode
   vision_embedding.svlmemb + original image file + text prompt
   -> llama.cpp mtmd_tokenize() only for text/image chunk layout
-  -> mtmd_helper_decode_image_chunk() with external embedding pointer
+  -> OpenCL mmproj when `.svlmemb` is pre-projector
+  -> mtmd_helper_decode_image_chunk() with projected embedding pointer
   -> llama.cpp OpenCL decoder prefill and token generation
 ```
 
@@ -188,14 +189,15 @@ Important files:
 
 ```text
 hybrid_embedding_file.h/.cpp
-  Small binary `.svlmemb` file format for projected image embeddings.
+  Small binary `.svlmemb` file format for external image features or embeddings.
 
 hybrid_vision_dump.cpp
   ExecuTorch-side tool. Runs the QNN vision encoder and writes `.svlmemb`.
 
 hybrid_decode.cpp
-  llama.cpp-side tool. Reads `.svlmemb`, builds the mtmd layout, and injects
-  external embeddings through mtmd_helper_decode_image_chunk().
+  llama.cpp-side tool. Reads `.svlmemb`, builds the mtmd layout, applies mmproj
+  for InternVL pre-projector features, and injects projected embeddings through
+  mtmd_helper_decode_image_chunk().
 
 CMakeLists.txt
   Overlay build. Pulls in ExecuTorch and llama.cpp without editing upstream.
@@ -225,17 +227,20 @@ ExecuTorch source files are intentionally not modified.
 
 ```text
 my_research/foundation_llamacpp/hybrid_bridge/hybrid_vision_dump.cpp
-  ExecuTorch/QNN vision process. Loads `vision_encoder_qnn.pte`, runs the
-  InternVL3 projected vision encoder, and writes a `.svlmemb` embedding file.
+  ExecuTorch/QNN vision process. Loads the QNN vision PTE, runs InternVL3 vision
+  features, and writes a `.svlmemb` file. The current recommended PTE is the
+  vision-tower-only pre-projector artifact.
 
 my_research/foundation_llamacpp/hybrid_bridge/hybrid_decode.cpp
   llama.cpp decoder process. Loads GGUF model + mmproj, reads `.svlmemb`, uses
-  mtmd only to recover text/image layout, then feeds the external embedding into
+  mtmd to recover text/image layout, projects InternVL pre-projector features
+  with OpenCL mmproj when needed, then feeds projected embeddings into
   `mtmd_helper_decode_image_chunk()`.
 
 my_research/foundation_llamacpp/hybrid_bridge/hybrid_embedding_file.h/.cpp
-  The split-process embedding file format. Current payload is float32 projected
-  embeddings with shape metadata.
+  The split-process embedding file format. Current payload is float32 plus shape
+  metadata. It can carry either decoder-ready embeddings (`1 x 256 x 896`) or
+  InternVL pre-projector features (`1 x 256 x 4096`).
 
 my_research/foundation_llamacpp/run_android_hybrid_bridge.py
   Android runner for the split-process bridge. It preprocesses the image, pushes
@@ -321,13 +326,26 @@ current OpenCL precise ordering:
 This makes standalone OpenCL comparable with the hybrid bridge, where QNN
 `V_Encode` also happens before decoder prefill.
 
-## What the QNN Vision Encoder Contains
+## QNN Vision Boundary
 
-For InternVL3, the ExecuTorch `vision_encoder_pte` is not only the raw vision
-tower. It includes the projector path needed to produce decoder-ready image
-embeddings.
+There are two InternVL3 QNN vision artifact types in this workspace:
 
-The upstream Qualcomm model wrapper defines:
+```text
+Fused vision encoder PTE
+  vision_tower + pixel_shuffle/downsample + multi_modal_projector
+  output: decoder-ready image embeddings, e.g. 1 x 256 x 896 for InternVL3-1B
+
+Vision-tower-only pre-projector PTE
+  vision_tower + pixel_shuffle/downsample
+  output: raw visual features before multi_modal_projector, e.g. 1 x 256 x 4096
+```
+
+The old manifest path points at the fused artifact. The current recommended
+hybrid path passes a direct `--vision` PTE that contains only the vision tower;
+`hybrid_decode` applies the GGUF `mmproj` on the llama.cpp/OpenCL side before
+image prefill.
+
+The upstream Qualcomm fused wrapper defines:
 
 ```text
 InternVL3VisionEncoder
@@ -360,7 +378,8 @@ That matches llama.cpp's decoder input embedding dimension for the
 256 image tokens x 896 decoder embedding dim
 ```
 
-Therefore, the fair phase-level comparison is:
+For the current vision-only QNN + OpenCL mmproj path, the fair phase-level
+comparison is:
 
 ```text
 Pure llama.cpp OpenCL:
@@ -368,13 +387,353 @@ Pure llama.cpp OpenCL:
     ~= InternVL vision tower + pixel shuffle/downsample + mm projector
 
 Hybrid:
-  QNN Vision Encoder
-    ~= InternVL vision tower + pixel shuffle/downsample + multi_modal_projector
+  QNN V_Encode
+    ~= InternVL vision tower + pixel shuffle/downsample
+
+  Mmproj
+    ~= llama.cpp OpenCL multi_modal_projector
 ```
 
 The llama.cpp `image decoded` line is different. It means the already projected
 image embeddings are being decoded/prefilled into the LLM context. It is not the
 vision encoder or projector.
+
+## What Was Changed
+
+This section records the actual implementation changes that enabled the current
+vision-only QNN + OpenCL mmproj bridge.
+
+### Vision-Only QNN Export
+
+```text
+my_research/foundation/models/internvl3/vision_encoder/pre_projector.py
+```
+
+Added `InternVL3VisionPreProjector`, a wrapper around Qualcomm's
+`InternVL3VisionEncoder` that stops before `multi_modal_projector`.
+
+The exported forward path is:
+
+```text
+pixel_values
+-> vision_tower(pixel_values).last_hidden_state
+-> remove CLS token when feature_select_strategy == "default"
+-> reshape [B, 1024, C] to [B, 32, 32, C]
+-> Qualcomm `pixel_shuffle(..., downsample_ratio=0.5)`
+-> reshape to [B, 256, 4096]
+-> return
+```
+
+The wrapper intentionally omits:
+
+```text
+multi_modal_projector(...)
+```
+
+Also added a fail-fast guard: when `--encoder-weights` is provided but the file
+contains no `vision_tower.*` keys, loading raises an error. This prevents the
+previous silent bad export where `internvl3_1b_meta_cpu.pth` was passed even
+though it only contains decoder-style keys.
+
+```text
+my_research/foundation/models/internvl3/vision_encoder/export_pre_projector_qnn.py
+```
+
+Added the QNN export entry point for the pre-projector wrapper. It:
+
+```text
+loads InternVL3VisionPreProjector
+optionally loads real calibration images
+applies Qualcomm InternVL3 encoder 16a8w PTQ recipe
+lowers to QNN HTP backend
+writes vision_tower_preproj_qnn.pte
+writes vision_tower_preproj_qnn_metadata.json
+```
+
+The correct working export uses real HF weights from:
+
+```text
+OpenGVLab/InternVL3-1B-hf
+```
+
+Do not pass:
+
+```text
+--encoder-weights my_research/foundation/results/model/hf/internvl3_1b_meta_cpu.pth
+```
+
+That file has no vision tower weights. A PTE exported that way can produce
+all-zero `.svlmemb` features and hallucinated captions.
+
+### Android Runner
+
+```text
+my_research/foundation_llamacpp/run_android_hybrid_bridge.py
+```
+
+Added direct vision PTE selection:
+
+```text
+--vision / --vision-encoder <pte>
+```
+
+This bypasses manifest parsing. The old `--manifest` path remains for fused
+QNN artifacts, but the current recommended path is direct `--vision` with the
+pre-projector PTE.
+
+The runner path is:
+
+```text
+_prepare_inputs()
+  -> load image with transformers.image_utils.load_image
+  -> _normalize_image_to_bin()
+     RGB resize 448x448
+     float32 / 255
+     ImageNet mean/std
+     CHW float32 bin
+
+push runtime/model files
+  -> hybrid_vision_dump
+  -> hybrid_decode
+  -> vision_tower_preproj_qnn.pte
+  -> GGUF model
+  -> GGUF mmproj
+  -> frame_0000.bin
+  -> layout jpg
+  -> QNN libs / HTP skel / ExecuTorch QNN backend
+
+remote script
+  -> start hybrid_decode and hybrid_vision_dump
+  -> wait for decoder_ready.flag and vision_ready.flag
+  -> create start_encode.flag
+  -> QNN V_Encode starts only after both sides are loaded
+```
+
+When swapping PTE artifacts, use both:
+
+```text
+--force-push
+--model-push
+```
+
+Different local artifact directories still push to the same remote filename
+`vision_tower_preproj_qnn.pte`, so stale remote cache can otherwise hide a bad
+or old PTE.
+
+### Vision Process
+
+```text
+my_research/foundation_llamacpp/hybrid_bridge/hybrid_vision_dump.cpp
+```
+
+This process did not need model-specific projector logic. It:
+
+```text
+loads ExecuTorch Module(vision_tower_preproj_qnn.pte)
+reads frame_0000.bin via Qualcomm example::load_image()
+runs module.forward()
+expects float32 output
+records output shape, e.g. 1 x 256 x 4096
+writes vision_embedding.svlmemb
+```
+
+```text
+my_research/foundation_llamacpp/hybrid_bridge/hybrid_embedding_file.cpp
+```
+
+Updated `.svlmemb` writes to be atomic:
+
+```text
+write <path>.tmp
+close and validate stream
+rename <path>.tmp -> <path>
+```
+
+This prevents `hybrid_decode --wait-for-embedding` from reading a partially
+written embedding file.
+
+### Decoder Bridge
+
+```text
+my_research/foundation_llamacpp/hybrid_bridge/hybrid_decode.cpp
+```
+
+The image chunk path now handles two payload types:
+
+```text
+Projected payload:
+  values.size == n_image_tokens * llama_model_n_embd_inp(model)
+  use embedding.values.data() directly
+
+Pre-projector payload:
+  shape[-2] == n_image_tokens
+  values.size == n_image_tokens * feature_dim
+  call mtmd_project_features(...)
+  use mtmd_get_output_embd(...) as the projected image embedding
+```
+
+The actual image prefill still goes through the normal public mtmd helper:
+
+```text
+mtmd_helper_decode_image_chunk(
+  ctx_vision,
+  llama_context,
+  image_chunk,
+  projected_image_embedding,
+  n_past,
+  seq_id,
+  n_batch,
+  &new_n_past
+)
+```
+
+The decoder also disables mtmd/CLIP warmup:
+
+```text
+mparams.warmup = false
+```
+
+Hybrid vision activations come from QNN, so OpenCL should not run a dummy CLIP
+ViT warmup. Text-side llama.cpp warmup remains controlled by common params.
+
+### llama.cpp mtmd Projector API
+
+```text
+llama.cpp/tools/mtmd/mtmd.h
+llama.cpp/tools/mtmd/mtmd.cpp
+```
+
+Added:
+
+```text
+mtmd_project_features(ctx, features, n_tokens, n_feature_embd)
+```
+
+It validates that the loaded mmproj is InternVL, resizes the mtmd image embedding
+buffer to:
+
+```text
+n_tokens * clip_n_mmproj_embd(ctx_clip)
+```
+
+then calls:
+
+```text
+clip_project_internvl_features(...)
+```
+
+```text
+llama.cpp/tools/mtmd/clip.h
+llama.cpp/tools/mtmd/clip.cpp
+```
+
+Added:
+
+```text
+clip_project_internvl_features(ctx, n_threads, features, n_tokens, n_feature_embd, vec)
+```
+
+This function:
+
+```text
+validates PROJECTOR_TYPE_INTERNVL
+validates feature dim against mmproj LayerNorm input dim
+builds a projector-only graph with an external input tensor
+sets external_vision_features from the `.svlmemb` float buffer
+runs ggml_backend_sched_graph_compute()
+copies projected output to `vec`
+```
+
+```text
+llama.cpp/tools/mtmd/models/internvl.cpp
+llama.cpp/tools/mtmd/models/models.h
+```
+
+Refactored the existing InternVL full OpenCL path so the projector is shared:
+
+```text
+clip_graph_internvl::build()
+  -> vision tower
+  -> CLS removal
+  -> pixel shuffle
+  -> build_projector(cur)
+
+clip_graph_internvl_projector_only::build()
+  -> external_vision_features
+  -> build_projector(cur)
+```
+
+The shared helper is:
+
+```text
+clip_graph_internvl::build_projector(cur)
+  -> build_norm(cur, mm_0_w, mm_0_b, LayerNorm eps=1e-5)
+  -> build_ffn(cur, mm_1_w/mm_1_b, mm_3_w/mm_3_b, GELU)
+```
+
+This is the key alignment point: the external QNN pre-projector path and the
+normal llama.cpp OpenCL InternVL path now use the same mmproj graph code.
+
+## Runtime Call Path
+
+End-to-end call path for the current working command:
+
+```text
+run_android_hybrid_bridge.py
+  -> _prepare_inputs()
+     -> _normalize_image_to_bin()
+  -> push files to /data/local/tmp/...
+  -> create remote shell script
+  -> start hybrid_decode in background
+  -> start hybrid_vision_dump in background
+  -> wait decoder_ready.flag + vision_ready.flag
+  -> touch start_encode.flag
+
+hybrid_vision_dump
+  -> Module encoder(vision_tower_preproj_qnn.pte)
+  -> method_meta input shape check
+  -> example::load_image(frame_0000.bin)
+  -> encoder.forward(image)
+  -> output tensor shape: 1 x 256 x 4096
+  -> write_embedding_file(vision_embedding.svlmemb)
+
+hybrid_decode
+  -> common_init_from_params()
+  -> mtmd_init_from_file(mmproj GGUF, mparams.warmup=false)
+  -> wait_for_file(vision_embedding.svlmemb)
+  -> read_embedding_file()
+  -> mtmd_tokenize(prompt + layout image)
+  -> iterate mtmd chunks
+     -> text chunk:
+        mtmd_helper_eval_chunk_single()
+     -> image chunk:
+        detect pre-projector shape 1 x 256 x 4096
+        mtmd_project_features()
+          -> clip_project_internvl_features()
+             -> clip_graph_internvl_projector_only::build()
+             -> clip_graph_internvl::build_projector()
+        mtmd_get_output_embd()
+        mtmd_helper_decode_image_chunk()
+  -> llama_decode() token by token
+```
+
+Observed healthy log line:
+
+```text
+external embedding is pre-projector: tokens=256 feature_embd=4096 projected_embd=896 floats=1048576
+```
+
+Observed healthy `.svlmemb` stats for the real-weight 16a8w artifact:
+
+```text
+mean -0.1406
+std   1.0058
+norm  1039.9
+```
+
+All-zero `.svlmemb` stats mean the vision PTE is bad, not that mmproj or
+tokenization is bad. The previous bad PTE was caused by exporting with a
+decoder-only checkpoint as `--encoder-weights`.
 
 ## Embedding File Boundary
 
@@ -399,6 +758,17 @@ n_dims
 n_values
 shape[]
 float32 values[]
+```
+
+`hybrid_decode` detects the payload shape:
+
+```text
+1 x 256 x 896
+  Already projected into the InternVL3-1B decoder input dimension.
+
+1 x 256 x 4096
+  Pre-projector visual features. `hybrid_decode` runs the GGUF InternVL mmproj
+  on OpenCL, then feeds the projected `256 x 896` embeddings into image prefill.
 ```
 
 This is deliberately simple for the first prototype. It makes the boundary easy
@@ -628,7 +998,7 @@ EXECUTORCH_BUILD_DIR=/workspace/streamingvlm/executorch/build-android-unified
 ```text
 hybrid_vision_dump
 hybrid_decode
-vision_encoder_qnn.pte
+vision_tower_preproj_qnn.pte or fused vision_encoder_qnn.pte
 InternVL3-1B-Instruct-Q8_0.gguf
 mmproj-InternVL3-1B-Instruct-Q8_0.gguf
 preprocessed frame_0000.bin
@@ -874,7 +1244,9 @@ LayoutTokenize
   Load the layout image and run mtmd_tokenize() to recover text/image chunks.
 
 ImagePrefill
-  Feed external projected image embeddings through mtmd_helper_decode_image_chunk().
+  Feed projected image embeddings through mtmd_helper_decode_image_chunk().
+  In the vision-only hybrid path, these embeddings come from OpenCL mmproj
+  applied to QNN pre-projector features.
 
 T_Prefill
   Text chunk eval through mtmd_helper_eval_chunk_single().
@@ -1059,8 +1431,8 @@ memory trend.
 The expected inputs are:
 
 ```text
-ExecuTorch QNN manifest:
-  my_research/foundation/results/model/qnn/internvl3_1b_qnn_1k_16a8w/manifest.json
+ExecuTorch QNN vision-only PTE:
+  my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte
 
 llama.cpp text model:
   llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf
@@ -1069,7 +1441,7 @@ llama.cpp mmproj:
   llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf
 
 sample image:
-  my_research/foundation_llamacpp/sample_coco_cats_448.jpg
+  my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg
 ```
 
 Required environment:
@@ -1105,26 +1477,35 @@ Typical Android run:
 
 ```bash
 python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
-  --manifest my_research/foundation/results/model/qnn/internvl3_1b_qnn_1k_16a8w/manifest.json \
-  --vision-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --processor hybrid \
+  --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
   --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
-  --image my_research/foundation_llamacpp/sample_coco_cats_448.jpg \
+  --image my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg \
   --prompt "Describe this image briefly." \
   --n-predict 32 \
-  --ctx-size 32768 \
+  --force-generation 64 \
+  --ctx-size 4096 \
   --batch-size 2048 \
   --ubatch-size 512 \
   --gpu-layers 99 \
   --device GPUOpenCL \
-  --results-root my_research/foundation_llamacpp/results/log/hybrid_bridge_opencl
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --soc-model SM8750 \
+  --baseline-window 5.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log \
+  --force-push \
+  --model-push
 ```
 
 The result directory should be:
 
 ```text
-my_research/foundation_llamacpp/results/log/hybrid_bridge_opencl/InternVL3-1B-Instruct-Q8_0/
+my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_4096_kv16/
 ```
 
 Canonical result artifacts:
@@ -1191,7 +1572,7 @@ python3 my_research/foundation_llamacpp/run_android_llamacpp.py \
   --build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
   --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
-  --image my_research/foundation_llamacpp/sample_coco_cats_448.jpg \
+  --image my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg \
   --prompt "Describe this image briefly." \
   --max-new-tokens 32 \
   --threads 4 \
@@ -1338,7 +1719,7 @@ image -> OpenCL vision/mmproj -> OpenCL decoder prefill -> OpenCL token decode
 The hybrid path separates the heavy vision stage onto QNN:
 
 ```text
-image -> QNN vision/projector -> file embedding -> OpenCL decoder
+image -> QNN vision tower -> file pre-projector features -> OpenCL mmproj -> OpenCL decoder
 ```
 
 So a shorter hybrid prompt eval does not mean QNN directly accelerated prompt
@@ -1493,14 +1874,22 @@ embedding size mismatch
 Expected for InternVL3-1B:
 
 ```text
-embedding shape = 1 x 256 x 896
-n_values        = 229376
+projected embedding shape      = 1 x 256 x 896
+projected n_values             = 229376
+
+pre-projector feature shape    = 1 x 256 x 4096
+pre-projector n_values         = 1048576
 ```
 
 The decoder checks:
 
 ```text
-embedding.values.size() == n_image_tokens * llama_model_n_embd_inp(model)
+projected path:
+  embedding.values.size() == n_image_tokens * llama_model_n_embd_inp(model)
+
+pre-projector path:
+  shape[-2] == n_image_tokens and values.size() == n_image_tokens * feature_dim
+  then `mtmd_project_features()` applies the GGUF mmproj
 ```
 
 If this fails, the likely causes are:
@@ -1509,9 +1898,14 @@ If this fails, the likely causes are:
 wrong model/mmproj pair
 wrong image preprocessing size
 wrong PTE variant
-projector not included in the external encoder
+pre-projector feature dim does not match mmproj LayerNorm input dim
 dynamic tiling mismatch changing image token count
 ```
+
+If the shape is accepted but captions are nonsense, inspect `.svlmemb` stats.
+All-zero stats usually mean the QNN PTE was exported without real vision weights.
+For InternVL3-1B, do not use `internvl3_1b_meta_cpu.pth` as `--encoder-weights`
+for the pre-projector QNN export; it contains decoder keys, not `vision_tower.*`.
 
 ### ADB or Remote State Problems
 
