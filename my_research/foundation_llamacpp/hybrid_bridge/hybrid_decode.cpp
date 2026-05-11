@@ -8,7 +8,6 @@
 #include "mtmd.h"
 #include "sampling.h"
 
-#include "foundation_token_io_format.hpp"
 #include "inference_trace.hpp"
 
 #include <clocale>
@@ -494,13 +493,6 @@ int main(int argc, char** argv) {
   }
 
   const std::string export_plain_prompt = params.prompt;
-  const std::string hf_q =
-      streamingvlm::hybrid_bridge::internvl_hf_official_question_single_image(export_plain_prompt);
-  if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
-    trace_writer->write_hf_reference_question_literal(hf_q);
-    trace_writer->write_hf_official_user_segment_reference(ctx.lctx, hf_q);
-  }
-
   if (
       eval_with_external_embedding(
           ctx, params.prompt, params.image, embedding, phases, nullptr, trace_writer.get()) != 0) {
@@ -509,7 +501,7 @@ int main(int argc, char** argv) {
   int n_predict = params.n_predict < 0 ? INT32_MAX : params.n_predict;
   const std::string generated_text = generate_response(ctx, n_predict, custom.force_generation, phases, trace_writer.get());
   std::string token_io_doc =
-      streamingvlm::hybrid_bridge::build_hf_user_assistant_echo(hf_q, generated_text) + "\n";
+      std::string("User: ") + export_plain_prompt + "\nAssistant: " + generated_text + "\n";
   if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
     token_io_doc += trace_writer->format_token_io_appendix();
   }

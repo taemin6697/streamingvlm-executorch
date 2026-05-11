@@ -277,18 +277,6 @@ def _extract_generated_text_from_log(log_text: str) -> str:
     return "\n".join(out_lines).strip()
 
 
-def _internvl_hf_official_question_single_image(plain_prompt: str) -> str:
-    """Match OpenGVLab HF single-image chat: question = '<image>\\n' + text when leader missing."""
-    if plain_prompt.startswith("<image>"):
-        return plain_prompt
-    return "<image>\n" + plain_prompt
-
-
-def _hf_user_assistant_echo(hf_question: str, assistant_text: str) -> str:
-    """Same print shape as HF demo: User: {question}\\nAssistant: {response}"""
-    return f"User: {hf_question}\nAssistant: {assistant_text}"
-
-
 def _write_fallback_token_io_txt(
     result_dir: Path,
     prompt: str,
@@ -297,7 +285,7 @@ def _write_fallback_token_io_txt(
     text_only: bool = False,
     image_tokens: int = 256,
 ) -> None:
-    del image_tokens  # HF single-image path does not synthesize <IMG_CONTEXT> rows
+    del image_tokens
     token_io = result_dir / "foundation_token_io.txt"
     if token_io.exists():
         return
@@ -306,8 +294,7 @@ def _write_fallback_token_io_txt(
         text = f"<|im_start|>user\n{prompt}\n<|im_start|>assistant\n{generated}\n"
     else:
         generated = _extract_generated_text_from_log(log_text)
-        hf_q = _internvl_hf_official_question_single_image(prompt)
-        text = _hf_user_assistant_echo(hf_q, generated) + "\n"
+        text = f"User: {prompt}\nAssistant: {generated}\n"
     token_io.write_text(text, encoding="utf-8")
 
 

@@ -2996,19 +2996,13 @@ Rebuild the hybrid Android bridge (e.g. `my_research/foundation_llamacpp/build-h
   **warmup SIGSEGV**. Match `ggml_cl_flash_attn` logical K/V types (and allow F16 Q + F32 dst from
   `ggml_flash_attn_ext`) so FA stays on OpenCL. See `my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp.md`.
 
-## foundation_llamacpp: HF single-image echo + GGUF inference token trace (2026-05-06)
+## foundation_llamacpp: token_io echo + GGUF inference trace (2026-05-06)
 
-- **`foundation_token_io.txt`:** written as HF demo-style `User: {question}\nAssistant: {generated}`,
-  where `question` follows InternVL HF single-image convention `'<image>\n' + -p text` unless the CLI
-  prompt already begins with `<image>` (same logic in C++ `foundation_token_io_format.hpp` and Python
-  `run_android_hybrid_bridge.py` fallback writer).
-- **`foundation_inference_tokens.txt`:** sibling of `foundation_token_io.txt` when
-  `--token-io-path` is set (`sibling_foundation_inference_tokens_path` in `inference_trace.hpp`).
-  Contains the HF question literal block plus PREFILL (mtmd text chunk token ids + pieces) and DECODE
-  lines; for InternVL, prefill `<image>` BPE matches HF after mtmd `img_beg` fix (see section below).
+- **`foundation_token_io.txt`:** `User: {-p as passed}\nAssistant: {generated}` plus optional appendix from `inference_trace_collector` (no HF `model.chat` question rewriting).
+- **`foundation_inference_tokens.txt`:** sibling of `foundation_token_io.txt` when `--token-io-path` is set. Prefill (mtmd chunks) + decode token lines only.
 - **Android pull / cleanup:** `run_android_hybrid_bridge.py` pulls and `rm -f` includes
   `foundation_inference_tokens.txt` for hybrid and standalone `opencl_phase_mtmd` runs.
-- **`hybrid_decode`:** matches `opencl_phase_mtmd` for trace + HF echo (see `hybrid_decode.cpp`).
+- **`hybrid_decode`:** matches `opencl_phase_mtmd` for trace + `User:`/`Assistant:` lines (see `hybrid_decode.cpp`).
   **Hybrid QNN vision:** `hybrid_decode` forces **mtmd/CLIP `warmup = false`** so OpenCL does not run a dummy ViT
   warmup in `clip_init`; vision prep is QNN’s job. Text decoder `--warmup` still applies via `common_init_from_params`.
 

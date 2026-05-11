@@ -13,14 +13,6 @@ Use it to record:
 - per-stage timing, such as image encode, prefill, and decode
 - backend-specific observations for CPU, Vulkan, OpenCL, or other paths
 
-## HF parity: tokenizer token IDs are ground truth
-
-Aligned with **`my_research/foundation/docs/for_cursor_llm.md`** → section **foundation_llamacpp: ground truth = tokenizer token IDs (policy)**.
-
-- **Prefill parity** is defined by matching **integer token IDs** (HF `tokenizer.encode` vs GGUF `common_tokenize` / traces in `foundation_inference_tokens.txt`), not by eyeballing decoded strings.
-- **Vision placeholders** (`-1` / slot markers) are excluded from vocab comparison; **all text token IDs** in order must match the reference encode for the same prompt bytes.
-- **Video / multi-frame:** same rule — pick the canonical HF user string first, then match its **full encode**; extra labels only if the reference template encodes them.
-
 ## Patch Policy
 
 - This file must be updated continuously whenever `my_research/foundation_llamacpp`
@@ -49,6 +41,11 @@ follow_up:
 ```
 
 ## Recent Runs
+
+- 2026-05-11: Trace dumps: no `HF_OFFICIAL_*` blocks; `User:` echoes raw `-p`. Removed
+  `internvl_mtmd_prompt.hpp` (no HF `<image>` leader stripping on the bridge). InternVL vision wrapper in
+  **`llama.cpp/tools/mtmd/mtmd.cpp`** uses **`<img>` … `</img>`** (`PROJECTOR_TYPE_INTERNVL`).
+  Token-ID parity notes live only under **`my_research/foundation/docs/for_cursor_llm.md`** if needed.
 
 - 2026-05-08: Updated the hybrid bridge from fused QNN vision+projector to
   **QNN vision tower only + llama.cpp/OpenCL mmproj + llama.cpp/OpenCL decoder**.
