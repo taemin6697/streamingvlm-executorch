@@ -25,7 +25,11 @@ if(HYBRID_BRIDGE_BUILD_LLAMA_DECODER)
     hybrid_decode.cpp
     hybrid_embedding_file.cpp
   )
-  add_executable(opencl_phase_mtmd opencl_phase_mtmd.cpp)
+  add_executable(
+    opencl_phase_mtmd
+    opencl_phase_mtmd.cpp
+    hybrid_embedding_file.cpp
+  )
   target_include_directories(
     hybrid_decode
     PRIVATE
@@ -79,6 +83,7 @@ if(HYBRID_BRIDGE_BUILD_EXECUTORCH_VISION)
     hybrid_vision_dump
     hybrid_vision_dump.cpp
     hybrid_embedding_file.cpp
+    vision_encoder_et.cpp
     "${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/encoder.cpp"
   )
   target_include_directories(

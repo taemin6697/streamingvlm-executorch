@@ -160,10 +160,14 @@ struct clip_ctx {
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
     bool debug_output_embeddings = false;
 
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
+        cb_eval = ctx_params.cb_eval;
+        cb_eval_user_data = ctx_params.cb_eval_user_data;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -201,13 +205,7 @@ struct clip_ctx {
         backend_ptrs.push_back(backend_cpu);
         backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
-        sched.reset(
-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
-        );
-
-        if (ctx_params.cb_eval != nullptr) {
-            ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
-        }
+        reset_sched();
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
@@ -222,6 +220,15 @@ struct clip_ctx {
     // this function is added so that we don't change too much of the existing code
     projector_type proj_type() const {
         return model.proj_type;
+    }
+
+    void reset_sched() {
+        sched.reset(
+            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
+        );
+        if (cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+        }
     }
 };
 
@@ -274,6 +281,18 @@ struct clip_graph_internvl_projector_only : clip_graph_internvl {
         ggml_set_name(cur, "external_vision_features");
         ggml_set_input(cur);
         cur = build_projector(cur);
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+};
+
+struct clip_graph_internvl_preprojector_only : clip_graph_internvl {
+    clip_graph_internvl_preprojector_only(clip_ctx * ctx, const clip_image_f32 & img)
+        : clip_graph_internvl(ctx, img) {}
+
+    ggml_cgraph * build() override {
+        GGML_ASSERT(proj_type == PROJECTOR_TYPE_INTERNVL);
+        ggml_tensor * cur = build_preprojector();
         ggml_build_forward_expand(gf, cur);
         return gf;
     }
@@ -3822,7 +3841,7 @@ bool clip_project_internvl_features(clip_ctx * ctx, const int n_threads, const f
     if (ctx->buf_compute_meta.empty()) {
         ctx->buf_compute_meta.resize(ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
     }
-    ggml_backend_sched_reset(ctx->sched.get());
+    ctx->reset_sched();
     clip_graph_internvl_projector_only builder(ctx, dummy, features, n_tokens, n_feature_embd);
     ggml_cgraph * gf = builder.build();
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
@@ -3863,6 +3882,114 @@ bool clip_project_internvl_features(clip_ctx * ctx, const int n_threads, const f
     }
     ggml_backend_tensor_get(embeddings, vec, 0, ggml_nbytes(embeddings));
     return true;
+}
+
+bool clip_image_encode_internvl_split(
+        clip_ctx * ctx,
+        const int n_threads,
+        clip_image_f32 * img,
+        float * vec,
+        int64_t * vision_ms,
+        int64_t * projector_ms) {
+    if (ctx->proj_type() != PROJECTOR_TYPE_INTERNVL) {
+        LOG_ERR("%s: only InternVL projector is supported\n", __func__);
+        return false;
+    }
+    if (ctx->model.mm_0_w == nullptr || ctx->model.mm_3_w == nullptr) {
+        LOG_ERR("%s: InternVL projector tensors are missing\n", __func__);
+        return false;
+    }
+
+    clip_image_f32_batch imgs;
+    clip_image_f32_ptr img_copy(clip_image_f32_init());
+    *img_copy = *img;
+    imgs.entries.push_back(std::move(img_copy));
+
+    if (!ctx->is_allocated) {
+        clip_model_loader::warmup(*ctx, imgs);
+    }
+
+    if (ctx->buf_compute_meta.empty()) {
+        ctx->buf_compute_meta.resize(ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+    }
+
+    ggml_backend_sched_reset(ctx->sched.get());
+    clip_graph_internvl_preprojector_only builder(ctx, *img);
+    ggml_cgraph * gf = builder.build();
+    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+
+    ggml_tensor * inp = ggml_graph_get_tensor(gf, "inp_raw");
+    if (inp == nullptr) {
+        LOG_ERR("%s: failed to get inp_raw tensor\n", __func__);
+        return false;
+    }
+    GGML_ASSERT(inp->type == GGML_TYPE_F32);
+    const int nx = img->nx;
+    const int ny = img->ny;
+    const int n = nx * ny;
+    std::vector<float> inp_raw(3 * n);
+    for (int y = 0; y < ny; y++) {
+        for (int x = 0; x < nx; x++) {
+            size_t base_src = 3 * (y * nx + x);
+            size_t base_dst = y * nx + x;
+            inp_raw[base_dst] = img->buf[base_src];
+            inp_raw[n + base_dst] = img->buf[base_src + 1];
+            inp_raw[2 * n + base_dst] = img->buf[base_src + 2];
+        }
+    }
+    if (ggml_nelements(inp) != (int64_t) inp_raw.size()) {
+        LOG_ERR("%s: invalid inp_raw tensor size\n", __func__);
+        return false;
+    }
+    ggml_backend_tensor_set(inp, inp_raw.data(), 0, ggml_nbytes(inp));
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) {
+        auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (ggml_backend_set_n_threads_fn) {
+            ggml_backend_set_n_threads_fn(ctx->backend_cpu, n_threads);
+        }
+    }
+
+    const int64_t vision_start_ms = ggml_time_ms();
+    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    const int64_t vision_end_ms = ggml_time_ms();
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR("%s: pre-projector graph compute failed with error %d\n", __func__, status);
+        return false;
+    }
+
+    ggml_tensor * features_tensor = ggml_graph_node(gf, -1);
+    const int n_feature_embd = features_tensor->ne[0];
+    const int n_tokens = features_tensor->ne[1];
+    const int expected_n_tokens = clip_n_output_tokens(ctx, img);
+    const int expected_feature_embd = ctx->model.mm_0_w->ne[0];
+    if (n_tokens != expected_n_tokens || n_feature_embd != expected_feature_embd) {
+        LOG_ERR(
+            "%s: expected pre-projector output %d x %d, got %d x %d\n",
+            __func__,
+            expected_feature_embd,
+            expected_n_tokens,
+            n_feature_embd,
+            n_tokens);
+        return false;
+    }
+
+    std::vector<float> features((size_t) n_tokens * n_feature_embd);
+    ggml_backend_tensor_get(features_tensor, features.data(), 0, ggml_nbytes(features_tensor));
+
+    const int64_t projector_start_ms = ggml_time_ms();
+    const bool ok = clip_project_internvl_features(ctx, n_threads, features.data(), n_tokens, n_feature_embd, vec);
+    const int64_t projector_end_ms = ggml_time_ms();
+
+    if (vision_ms != nullptr) {
+        *vision_ms = vision_end_ms - vision_start_ms;
+    }
+    if (projector_ms != nullptr) {
+        *projector_ms = projector_end_ms - projector_start_ms;
+    }
+    return ok;
 }
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {

@@ -2,12 +2,14 @@
 #include "chat.h"
 #include "common.h"
 #include "debug.h"
+#include "hybrid_embedding_file.h"
 #include "log.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
 #include "sampling.h"
 
 #include "inference_trace.hpp"
+#include "phase_trace.hpp"
 
 #include <clocale>
 #include <cstdint>
@@ -24,6 +26,7 @@ namespace {
 struct custom_args {
   std::string phase_stats_path = "foundation_phase_stats.csv";
   std::string token_io_path;
+  std::string warmup_image_path;
   bool force_generation = false;
   std::vector<std::string> passthrough;
 };
@@ -47,6 +50,13 @@ custom_args strip_custom_args(int argc, char** argv) {
       out.token_io_path = argv[++i];
     } else if (arg.rfind("--token-io-path=", 0) == 0) {
       out.token_io_path = arg.substr(std::string("--token-io-path=").size());
+    } else if (arg == "--warmup-image") {
+      if (i + 1 >= argc) {
+        die("missing value for --warmup-image");
+      }
+      out.warmup_image_path = argv[++i];
+    } else if (arg.rfind("--warmup-image=", 0) == 0) {
+      out.warmup_image_path = arg.substr(std::string("--warmup-image=").size());
     } else if (arg == "--force-generation") {
       out.force_generation = true;
     } else {
@@ -55,40 +65,6 @@ custom_args strip_custom_args(int argc, char** argv) {
   }
   return out;
 }
-
-struct phase_recorder {
-  long origin_ms = 0;
-  std::ofstream out;
-
-  explicit phase_recorder(const std::string& path, long origin) : origin_ms(origin) {
-    if (!path.empty()) {
-      out.open(path);
-      if (!out.is_open()) {
-        die_fmt("failed to open phase stats CSV: %s", path.c_str());
-      }
-      out << "row_type,elapsed_s_start,elapsed_s_end,rss_kb_start,rss_kb_end,"
-             "col_a_ms,col_b_ms,total_ms,kv_pos,kv_total,kv_used_pct,"
-             "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
-      out << "# L_DecoderRuntimeInit: llama.cpp args/OpenCL runtime init  "
-             "L_DecoderLoad: llama.cpp text model/context/mmproj load  "
-             "ImageLoad: input image load  LayoutTokenize: mtmd text/image layout  "
-             "V_Encode: llama.cpp OpenCL vision encode/projector  "
-             "ImagePrefill: projected image embedding prefill  "
-             "T_Prefill: text prompt prefill  D: one generated-token decode\n";
-    }
-  }
-
-  void row(const char* row_type, long start_ms, long end_ms, int token_idx = 0) {
-    if (!out.is_open()) {
-      return;
-    }
-    const double start_s = static_cast<double>(start_ms - origin_ms) / 1000.0;
-    const double end_s = static_cast<double>(end_ms - origin_ms) / 1000.0;
-    const long total_ms = end_ms - start_ms;
-    out << row_type << "," << start_s << "," << end_s
-        << ",,," << total_ms << ",," << total_ms << ",,,,,,," << token_idx << "\n";
-  }
-};
 
 struct decode_context {
   mtmd::context_ptr ctx_vision;
@@ -157,6 +133,57 @@ void write_text_file(const std::string& path, const std::string& value) {
   out << value;
 }
 
+void warmup_split_encoder_with_image(decode_context& ctx, const std::string& image_path) {
+  if (image_path.empty()) {
+    return;
+  }
+  mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_file(ctx.ctx_vision.get(), image_path.c_str()));
+  if (!bmp.ptr) {
+    die_fmt("failed to load warmup image: %s", image_path.c_str());
+  }
+  bmp.set_id("warmup_image");
+  mtmd::bitmaps bitmaps;
+  bitmaps.entries.push_back(std::move(bmp));
+
+  mtmd_input_text text;
+  std::string warmup_text = mtmd_default_marker();
+  text.text = warmup_text.c_str();
+  text.add_special = true;
+  text.parse_special = true;
+  mtmd::input_chunks chunks(mtmd_input_chunks_init());
+  auto bitmaps_c_ptr = bitmaps.c_ptr();
+  if (mtmd_tokenize(
+          ctx.ctx_vision.get(),
+          chunks.ptr.get(),
+          &text,
+          bitmaps_c_ptr.data(),
+          bitmaps_c_ptr.size()) != 0) {
+    die("failed to tokenize warmup image");
+  }
+  for (size_t i = 0; i < mtmd_input_chunks_size(chunks.ptr.get()); ++i) {
+    const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
+    if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+      continue;
+    }
+    int64_t warmup_vision_ms = 0;
+    int64_t warmup_projector_ms = 0;
+    if (mtmd_encode_chunk_split_timing(
+            ctx.ctx_vision.get(),
+            chunk,
+            &warmup_vision_ms,
+            &warmup_projector_ms) != 0) {
+      die("failed to warm up split image encode");
+    }
+    LOG_INF(
+        "warmed split image encode with %s: vision=%lld ms, mmproj=%lld ms\n",
+        image_path.c_str(),
+        static_cast<long long>(warmup_vision_ms),
+        static_cast<long long>(warmup_projector_ms));
+    return;
+  }
+  die("warmup image did not produce an image chunk");
+}
+
 std::string render_chunks_with_special_tokens(decode_context& ctx, mtmd::input_chunks& chunks) {
   std::string rendered;
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
@@ -193,7 +220,7 @@ int eval_message(
     decode_context& ctx,
     common_chat_msg& msg,
     const std::vector<std::string>& images,
-    phase_recorder& phases,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
     std::string* input_special_text,
     std::size_t* out_image_placeholder_slots,
     streamingvlm::hybrid_bridge::inference_trace_collector* trace) {
@@ -201,7 +228,8 @@ int eval_message(
   auto formatted_chat = chat_add_and_format(ctx, msg);
 
   mtmd::bitmaps bitmaps;
-  for (const auto& image : images) {
+  for (size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
+    const auto& image = images[image_idx];
     const long image_load_start_ms = ggml_time_ms();
     mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_file(ctx.ctx_vision.get(), image.c_str()));
     const long image_load_end_ms = ggml_time_ms();
@@ -209,6 +237,8 @@ int eval_message(
     if (!bmp.ptr) {
       die_fmt("failed to load image: %s", image.c_str());
     }
+    const std::string bitmap_id = "image_" + std::to_string(image_idx + 1);
+    bmp.set_id(bitmap_id.c_str());
     bitmaps.entries.push_back(std::move(bmp));
   }
 
@@ -250,6 +280,7 @@ int eval_message(
 
   if (trace != nullptr && static_cast<bool>(*trace)) {
     trace->write_prefill_header();
+    size_t image_trace_idx = 0;
     for (size_t ci = 0; ci < n_chunks; ++ci) {
       const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks.ptr.get(), ci);
       const auto ctype = mtmd_input_chunk_get_type(ch);
@@ -262,30 +293,56 @@ int eval_message(
           trace->token_line(toks[ti], piece);
         }
       } else if (ctype == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-        trace->chunk_image_begin(ci, mtmd_input_chunk_get_n_tokens(ch), mtmd_input_chunk_get_id(ch));
+        trace->chunk_image_begin(
+            ci,
+            mtmd_input_chunk_get_n_tokens(ch),
+            mtmd_input_chunk_get_id(ch),
+            image_trace_idx++);
       }
     }
   }
 
   std::vector<std::vector<float>> encoded_image_embeddings(n_chunks);
   const int64_t decoder_embedding_size = llama_model_n_embd_inp(ctx.model);
+  std::vector<float> projected_embedding_dump;
+  size_t n_image_chunks = 0;
+  size_t image_tokens_per_chunk = 0;
   for (size_t i = 0; i < n_chunks; ++i) {
     const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
     const auto chunk_type = mtmd_input_chunk_get_type(chunk);
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
       const long vision_encode_start_ms = ggml_time_ms();
       LOG_INF("encoding image slice...\n");
-      if (mtmd_encode_chunk(ctx.ctx_vision.get(), chunk) != 0) {
+      int64_t vision_ms = 0;
+      int64_t projector_ms = 0;
+      if (mtmd_encode_chunk_split_timing(ctx.ctx_vision.get(), chunk, &vision_ms, &projector_ms) != 0) {
         die("failed to encode image slice");
       }
       const long vision_encode_end_ms = ggml_time_ms();
       LOG_INF("image slice encoded in %ld ms\n", vision_encode_end_ms - vision_encode_start_ms);
-      phases.row("V_Encode", vision_encode_start_ms, vision_encode_end_ms);
+      const long projector_start_ms = vision_encode_end_ms - static_cast<long>(projector_ms);
+      const long vision_end_ms = projector_start_ms;
+      phases.row("V_Encode", vision_encode_start_ms, vision_end_ms);
+      phases.row("Mmproj", projector_start_ms, vision_encode_end_ms);
 
       float* embd = mtmd_get_output_embd(ctx.ctx_vision.get());
       const size_t n_values = static_cast<size_t>(decoder_embedding_size) * mtmd_input_chunk_get_n_tokens(chunk);
       encoded_image_embeddings[i].assign(embd, embd + n_values);
+      projected_embedding_dump.insert(projected_embedding_dump.end(), embd, embd + n_values);
+      n_image_chunks += 1;
+      image_tokens_per_chunk = mtmd_input_chunk_get_n_tokens(chunk);
     }
+  }
+  if (!projected_embedding_dump.empty()) {
+    streamingvlm::hybrid_bridge::write_embedding_file(
+        "opencl_projected_embedding.svlmemb",
+        {
+            static_cast<int64_t>(n_image_chunks),
+            static_cast<int64_t>(image_tokens_per_chunk),
+            decoder_embedding_size,
+        },
+        projected_embedding_dump.data(),
+        projected_embedding_dump.size());
   }
 
   for (size_t i = 0; i < n_chunks; ++i) {
@@ -306,6 +363,7 @@ int eval_message(
               &new_n_past) != 0) {
         die("failed to eval text chunk");
       }
+      llama_synchronize(ctx.lctx);
       const long text_prefill_end_ms = ggml_time_ms();
       phases.row("T_Prefill", text_prefill_start_ms, text_prefill_end_ms);
     } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
@@ -324,6 +382,7 @@ int eval_message(
               &new_n_past) != 0) {
         die("failed to decode image chunk");
       }
+      llama_synchronize(ctx.lctx);
       const long image_prefill_end_ms = ggml_time_ms();
       phases.row("ImagePrefill", image_prefill_start_ms, image_prefill_end_ms);
     } else {
@@ -339,7 +398,7 @@ std::string generate_response(
     decode_context& ctx,
     int n_predict,
     bool force_generation,
-    phase_recorder& phases,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
     streamingvlm::hybrid_bridge::inference_trace_collector* trace) {
   std::string generated_text;
   if (trace != nullptr && static_cast<bool>(*trace)) {
@@ -366,6 +425,7 @@ std::string generate_response(
     if (llama_decode(ctx.lctx, ctx.batch)) {
       die("failed to decode generated token");
     }
+    llama_synchronize(ctx.lctx);
     const long token_decode_end_ms = ggml_time_ms();
     phases.row("D", token_decode_start_ms, token_decode_end_ms, i);
   }
@@ -410,12 +470,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  phase_recorder phases(custom.phase_stats_path, origin_ms);
+  streamingvlm::hybrid_bridge::phase_recorder phases(
+      custom.phase_stats_path,
+      origin_ms,
+      streamingvlm::hybrid_bridge::opencl_phase_description());
   phases.row("L_DecoderRuntimeInit", params_parse_start_ms, ggml_time_ms());
   const long load_start_ms = ggml_time_ms();
   decode_context ctx(params);
   const long load_end_ms = ggml_time_ms();
   phases.row("L_DecoderLoad", load_start_ms, load_end_ms);
+  warmup_split_encoder_with_image(ctx, custom.warmup_image_path);
 
   const std::string export_plain_prompt = params.prompt;
 

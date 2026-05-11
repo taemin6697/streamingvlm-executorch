@@ -1069,6 +1069,65 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
     return ok ? 0 : 1;
 }
 
+int32_t mtmd_encode_chunk_split_timing(
+        mtmd_context * ctx,
+        const mtmd_input_chunk * chunk,
+        int64_t * vision_ms,
+        int64_t * projector_ms) {
+    if (vision_ms != nullptr) {
+        *vision_ms = 0;
+    }
+    if (projector_ms != nullptr) {
+        *projector_ms = 0;
+    }
+    if (chunk->type != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        LOG_ERR("%s: only image chunks are supported\n", __func__);
+        return 1;
+    }
+    clip_ctx * ctx_clip = ctx->ctx_v;
+    if (!ctx_clip) {
+        LOG_ERR("%s: model does not support vision input\n", __func__);
+        return 1;
+    }
+    if (clip_get_projector_type(ctx_clip) != PROJECTOR_TYPE_INTERNVL) {
+        LOG_ERR("%s: only InternVL projector supports split timing\n", __func__);
+        return 1;
+    }
+
+    int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
+    ctx->image_embd_v.resize(chunk->tokens_image->n_tokens() * n_mmproj_embd);
+    bool ok = false;
+    const auto & entries = chunk->tokens_image->batch_f32.entries;
+    size_t offset = 0;
+    int64_t total_vision_ms = 0;
+    int64_t total_projector_ms = 0;
+    for (size_t i = 0; i < entries.size(); i++) {
+        int n_tokens_per_image = clip_n_output_tokens(ctx_clip, entries[i].get());
+        int64_t entry_vision_ms = 0;
+        int64_t entry_projector_ms = 0;
+        ok = clip_image_encode_internvl_split(
+            ctx_clip,
+            ctx->n_threads,
+            entries[i].get(),
+            ctx->image_embd_v.data() + offset,
+            &entry_vision_ms,
+            &entry_projector_ms);
+        if (!ok) {
+            return 1;
+        }
+        total_vision_ms += entry_vision_ms;
+        total_projector_ms += entry_projector_ms;
+        offset += (size_t) n_mmproj_embd * n_tokens_per_image;
+    }
+    if (vision_ms != nullptr) {
+        *vision_ms = total_vision_ms;
+    }
+    if (projector_ms != nullptr) {
+        *projector_ms = total_projector_ms;
+    }
+    return ok ? 0 : 1;
+}
+
 float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
 }

@@ -1,5 +1,6 @@
 #include "hybrid_embedding_file.h"
 
+#include "file_sync.hpp"
 #include "arg.h"
 #include "chat.h"
 #include "common.h"
@@ -9,22 +10,22 @@
 #include "sampling.h"
 
 #include "inference_trace.hpp"
+#include "phase_trace.hpp"
 
 #include <clocale>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
 
 struct custom_args {
   std::string embedding_path;
+  std::string warmup_embedding_path;
   std::string phase_stats_path = "decoder_phase_stats.csv";
   std::string token_io_path;
   std::string ready_path;
@@ -48,6 +49,13 @@ custom_args strip_custom_args(int argc, char** argv) {
       out.embedding_path = arg.substr(std::string("--external-embedding=").size());
     } else if (arg.rfind("--embedding-file=", 0) == 0) {
       out.embedding_path = arg.substr(std::string("--embedding-file=").size());
+    } else if (arg == "--warmup-embedding") {
+      if (i + 1 >= argc) {
+        die("missing value for --warmup-embedding");
+      }
+      out.warmup_embedding_path = argv[++i];
+    } else if (arg.rfind("--warmup-embedding=", 0) == 0) {
+      out.warmup_embedding_path = arg.substr(std::string("--warmup-embedding=").size());
     } else if (arg == "--phase-stats-path") {
       if (i + 1 >= argc) {
         die("missing value for --phase-stats-path");
@@ -86,64 +94,6 @@ custom_args strip_custom_args(int argc, char** argv) {
   }
   return out;
 }
-
-void write_text_file(const std::string& path, const std::string& value) {
-  if (path.empty()) {
-    return;
-  }
-  std::ofstream out(path);
-  if (!out.is_open()) {
-    die_fmt("failed to write file: %s", path.c_str());
-  }
-  out << value;
-}
-
-void wait_for_file(const std::string& path, int timeout_ms) {
-  const long start_ms = ggml_time_ms();
-  while (true) {
-    std::ifstream in(path);
-    if (in.good()) {
-      return;
-    }
-    if (ggml_time_ms() - start_ms > timeout_ms) {
-      die_fmt("timed out waiting for file: %s", path.c_str());
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-}
-
-struct phase_recorder {
-  long origin_ms = 0;
-  std::ofstream out;
-
-  explicit phase_recorder(const std::string& path, long origin) : origin_ms(origin) {
-    if (!path.empty()) {
-      out.open(path);
-      if (!out.is_open()) {
-        die_fmt("failed to open phase stats CSV: %s", path.c_str());
-      }
-      out << "row_type,elapsed_s_start,elapsed_s_end,rss_kb_start,rss_kb_end,"
-             "col_a_ms,col_b_ms,total_ms,kv_pos,kv_total,kv_used_pct,"
-             "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
-      out << "# L_DecoderLoad: llama.cpp model/context/mmproj load  "
-             "ExternalEmbeddingRead: .svlmemb read  LayoutTokenize: mtmd text/image layout  "
-             "Mmproj: OpenCL mmproj projection for QNN pre-projector features  "
-             "Prefill: combined text/image prompt eval  ImagePrefill: external image embedding decode  T_Prefill: text prompt eval  "
-             "D: one generated-token decode\n";
-    }
-  }
-
-  void row(const char* row_type, long start_ms, long end_ms, int token_idx = 0) {
-    if (!out.is_open()) {
-      return;
-    }
-    const double start_s = static_cast<double>(start_ms - origin_ms) / 1000.0;
-    const double end_s = static_cast<double>(end_ms - origin_ms) / 1000.0;
-    const long total_ms = end_ms - start_ms;
-    out << row_type << "," << start_s << "," << end_s
-        << ",,," << total_ms << ",," << total_ms << ",,,,,,," << token_idx << "\n";
-  }
-};
 
 struct embedding_cursor {
   streamingvlm::hybrid_bridge::EmbeddingFile& file;
@@ -271,12 +221,44 @@ std::string render_chunks_with_special_tokens(decode_context& ctx, mtmd::input_c
   return rendered;
 }
 
+void warmup_mmproj_with_embedding(decode_context& ctx, streamingvlm::hybrid_bridge::EmbeddingFile& embedding) {
+  if (embedding.shape.size() < 2) {
+    die("warmup embedding must have at least tokens and feature dimensions");
+  }
+  const int64_t n_tokens = embedding.shape[embedding.shape.size() - 2];
+  const int64_t n_feature_embd = embedding.shape.back();
+  const int32_t decoder_embedding_size = llama_model_n_embd_inp(ctx.model);
+  if (n_tokens <= 0 || n_feature_embd <= 0) {
+    die("warmup embedding has invalid shape");
+  }
+  if (n_feature_embd == decoder_embedding_size) {
+    LOG_INF("warmup embedding is already projected; skipping mmproj warmup\n");
+    return;
+  }
+  const size_t n_values = static_cast<size_t>(n_tokens) * static_cast<size_t>(n_feature_embd);
+  if (embedding.values.size() < n_values) {
+    die("warmup embedding does not contain enough values");
+  }
+  if (mtmd_project_features(
+          ctx.ctx_vision.get(),
+          embedding.values.data(),
+          static_cast<int32_t>(n_tokens),
+          static_cast<int32_t>(n_feature_embd)) != 0) {
+    die("failed to warm up external vision features with mmproj");
+  }
+  LOG_INF(
+      "warmed external mmproj with fixed embedding: tokens=%lld feature_embd=%lld projected_embd=%d\n",
+      static_cast<long long>(n_tokens),
+      static_cast<long long>(n_feature_embd),
+      decoder_embedding_size);
+}
+
 int eval_with_external_embedding(
     decode_context& ctx,
     const std::string& prompt,
     const std::vector<std::string>& image_paths,
     streamingvlm::hybrid_bridge::EmbeddingFile& embedding,
-    phase_recorder& phases,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
     std::string* input_special_text,
     streamingvlm::hybrid_bridge::inference_trace_collector* trace) {
   if (prompt.empty()) {
@@ -348,6 +330,10 @@ int eval_with_external_embedding(
   }
 
   bool used_external_embedding = false;
+  std::vector<float> projected_embedding_dump;
+  size_t n_projected_image_chunks = 0;
+  size_t projected_image_tokens_per_chunk = 0;
+  const int32_t decoder_embedding_size = llama_model_n_embd_inp(ctx.model);
   const long prefill_start_ms = ggml_time_ms();
   embedding_cursor embeddings(embedding);
   for (size_t i = 0; i < n_chunks; ++i) {
@@ -356,7 +342,7 @@ int eval_with_external_embedding(
     llama_pos new_n_past = ctx.n_past;
     if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
       const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
-      const int32_t n_embd = llama_model_n_embd_inp(ctx.model);
+      const int32_t n_embd = decoder_embedding_size;
       const int32_t n_feature_embd = embeddings.feature_dim_for_chunk(n_tokens, n_embd);
       float* image_slice = embeddings.next_slice(n_tokens, n_feature_embd);
       float* image_embedding = image_slice;
@@ -393,18 +379,28 @@ int eval_with_external_embedding(
             "mmproj output is null for image chunk with %zu tokens",
             n_tokens);
       }
+      std::vector<float> image_embedding_copy(
+          image_embedding,
+          image_embedding + static_cast<size_t>(n_tokens) * decoder_embedding_size);
+      projected_embedding_dump.insert(
+          projected_embedding_dump.end(),
+          image_embedding_copy.begin(),
+          image_embedding_copy.end());
+      n_projected_image_chunks += 1;
+      projected_image_tokens_per_chunk = n_tokens;
       const long image_prefill_start_ms = ggml_time_ms();
       if (mtmd_helper_decode_image_chunk(
               ctx.ctx_vision.get(),
               ctx.lctx,
               chunk,
-              image_embedding,
+              image_embedding_copy.data(),
               ctx.n_past,
               0,
               ctx.n_batch,
               &new_n_past) != 0) {
         die("failed to decode external image embedding");
       }
+      llama_synchronize(ctx.lctx);
       const long image_prefill_end_ms = ggml_time_ms();
       phases.row("ImagePrefill", image_prefill_start_ms, image_prefill_end_ms);
       used_external_embedding = true;
@@ -421,6 +417,7 @@ int eval_with_external_embedding(
               &new_n_past) != 0) {
         die("failed to eval text chunk");
       }
+      llama_synchronize(ctx.lctx);
       const long text_prefill_end_ms = ggml_time_ms();
       phases.row("T_Prefill", text_prefill_start_ms, text_prefill_end_ms);
     }
@@ -430,6 +427,17 @@ int eval_with_external_embedding(
     die("prompt did not produce an image chunk");
   }
   embeddings.finish();
+  if (!projected_embedding_dump.empty()) {
+    streamingvlm::hybrid_bridge::write_embedding_file(
+        "hybrid_projected_embedding.svlmemb",
+        {
+            static_cast<int64_t>(n_projected_image_chunks),
+            static_cast<int64_t>(projected_image_tokens_per_chunk),
+            decoder_embedding_size,
+        },
+        projected_embedding_dump.data(),
+        projected_embedding_dump.size());
+  }
   phases.row("Prefill", prefill_start_ms, ggml_time_ms());
   return 0;
 }
@@ -438,7 +446,7 @@ std::string generate_response(
     decode_context& ctx,
     int n_predict,
     bool force_generation,
-    phase_recorder& phases,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
     streamingvlm::hybrid_bridge::inference_trace_collector* trace) {
   std::string generated_text;
   if (trace != nullptr && static_cast<bool>(*trace)) {
@@ -465,6 +473,7 @@ std::string generate_response(
     if (llama_decode(ctx.lctx, ctx.batch)) {
       die("failed to decode generated token");
     }
+    llama_synchronize(ctx.lctx);
     const long token_decode_end_ms = ggml_time_ms();
     phases.row("D", token_decode_start_ms, token_decode_end_ms, i);
   }
@@ -513,21 +522,29 @@ int main(int argc, char** argv) {
     die("missing --mmproj");
   }
 
-  phase_recorder phases(custom.phase_stats_path, origin_ms);
+  streamingvlm::hybrid_bridge::phase_recorder phases(
+      custom.phase_stats_path,
+      origin_ms,
+      streamingvlm::hybrid_bridge::hybrid_decode_phase_description());
   phases.row("L_DecoderRuntimeInit", params_parse_start_ms, ggml_time_ms());
   const long load_start_ms = ggml_time_ms();
   decode_context ctx(params);
   const long load_end_ms = ggml_time_ms();
   phases.row("L_DecoderLoad", load_start_ms, load_end_ms);
-  write_text_file(custom.ready_path, "ready\n");
+  streamingvlm::hybrid_bridge::write_text_file(custom.ready_path, "ready\n");
   if (custom.wait_for_embedding) {
-    wait_for_file(custom.embedding_path, custom.wait_timeout_ms);
+    streamingvlm::hybrid_bridge::wait_for_file(custom.embedding_path, custom.wait_timeout_ms, ggml_time_ms);
   }
 
   const long embedding_read_start_ms = ggml_time_ms();
   auto embedding = streamingvlm::hybrid_bridge::read_embedding_file(custom.embedding_path);
   const long embedding_read_end_ms = ggml_time_ms();
   phases.row("ExternalEmbeddingRead", embedding_read_start_ms, embedding_read_end_ms);
+
+  if (!custom.warmup_embedding_path.empty()) {
+    auto warmup_embedding = streamingvlm::hybrid_bridge::read_embedding_file(custom.warmup_embedding_path);
+    warmup_mmproj_with_embedding(ctx, warmup_embedding);
+  }
 
   std::unique_ptr<streamingvlm::hybrid_bridge::inference_trace_collector> trace_writer;
   if (!custom.token_io_path.empty()) {
@@ -548,7 +565,7 @@ int main(int argc, char** argv) {
   if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
     token_io_doc += trace_writer->format_token_io_appendix();
   }
-  write_text_file(custom.token_io_path, token_io_doc);
+  streamingvlm::hybrid_bridge::write_text_file(custom.token_io_path, token_io_doc);
   LOG("\n\n");
   llama_perf_context_print(ctx.lctx);
   return 0;

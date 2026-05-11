@@ -95,6 +95,27 @@ Hybrid continue through EOS/EOG in the instrumented overlay binaries. CPU uses
 upstream `llama-mtmd-cli` with `--ignore-eos`, so it emits `N` tokens but the CPU
 token transcript is reconstructed by the Python runner from stdout.
 
+The bridge benchmark path intentionally warms the measured vision/projector
+stages before recording their steady-state timings:
+
+```text
+OpenCL standalone:
+  opencl_phase_mtmd runs one InternVL split encode + mmproj pass on
+  sample_images/golden_gate_bridge_448.jpg and discards it before recording
+  V_Encode and Mmproj.
+
+Hybrid:
+  hybrid_vision_dump runs one QNN encoder.encode() warmup on
+  sample_images/golden_gate_bridge_448.jpg and records the measured input
+  separately.
+  hybrid_decode warms mtmd_project_features() once with the fixed Golden Gate
+  QNN pre-projector feature slice before recording measured input Mmproj.
+```
+
+The runner still passes `--no-warmup` to llama.cpp by default for decoder-level
+empty-prompt warmup. The warmups above are bridge-local and target the actual
+vision/projector paths being compared.
+
 ## Result Layout
 
 Unified runner writes each run under `--results-root` using the **text GGUF stem**,
@@ -139,6 +160,18 @@ foundation_phase_stats.csv
 
 vision_phase_stats.csv / decoder_phase_stats.csv
   Raw hybrid phase CSVs emitted by the two bridge processes.
+
+opencl_projected_embedding.svlmemb
+  Standalone OpenCL decoder-side projected image embedding dump, written after
+  mtmd vision encode/mmproj and before ImagePrefill.
+
+vision_embedding.svlmemb
+  Hybrid QNN pre-projector vision feature handoff. For the current
+  vision-tower-only QNN artifact, shape is 1 x 256 x 4096 for a single image.
+
+hybrid_projected_embedding.svlmemb
+  Hybrid decoder-side projected image embedding dump, written after
+  mtmd_project_features() and before ImagePrefill.
 
 android_memory_timeline.csv
   Android memory samples. Use MemAvailable for memory plots. By default, the
@@ -326,8 +359,8 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --ubatch-size 512 \
   --gpu-layers 99 \
   --device GPUOpenCL \
-  --cache-type-k q8_0 \
-  --cache-type-v q8_0 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
   --fit off \
   --soc-model SM8750 \
   --baseline-window 5.0 \
@@ -351,7 +384,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
   --video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
-  --num-segments 4 \
+  --num-segments 8 \
   --max-num 1 \
   --prompt "Describe this video briefly." \
   --n-predict 32 \
@@ -372,8 +405,8 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 
 For this video path, check `media_manifest.json` for sampled frame indices and
 `num_patches_list`, `vision_output_stats.csv` for the merged embedding shape
-(for the command above, `4 x 256 x 4096`), and `foundation_inference_tokens.txt`
-for four frame-prefixed IMAGE chunks.
+(for the command above, `8 x 256 x 4096`), and `foundation_inference_tokens.txt`
+for eight frame-prefixed IMAGE chunks.
 
 This `--vision` artifact is the 16a8w QNN vision-tower-only export:
 `projector_included: false`, output shape `1 x 256 x 4096`. Because it stops
@@ -489,9 +522,15 @@ LayoutTokenize
   mtmd_tokenize() text/image layout construction.
 
 V_Encode
-  Vision encoder (+ projector when fused), 또는 tower-only QNN 출력 후 디코더 쪽 mmproj.
-  OpenCL: llama.cpp OpenCL vision path.
-  Hybrid: ExecuTorch QNN `.pte` (매니페스트 또는 `--vision`).
+  Vision tower / pre-projector encode.
+  OpenCL: llama.cpp/mtmd InternVL vision tower through pixel shuffle, before
+  the multi-modal projector.
+  Hybrid: ExecuTorch QNN `.pte` pre-projector vision tower output.
+
+Mmproj
+  InternVL multi-modal projector / mmproj.
+  OpenCL: split out from the llama.cpp/mtmd InternVL path.
+  Hybrid: decoder-side llama.cpp OpenCL projection of QNN pre-projector features.
 
 EmbeddingFileWrite
   Write `.svlmemb`. Hybrid only.
@@ -500,13 +539,20 @@ ExternalEmbeddingRead
   Read `.svlmemb`. Hybrid only.
 
 ImagePrefill
-  Feed projected image embeddings into llama.cpp context/KV.
+  Feed already projected image embeddings into llama.cpp context/KV using
+  llama_decode(). This is not image encoding.
+  Bridge phase rows call llama_synchronize() immediately after llama_decode();
+  otherwise OpenCL work can be asynchronous and the real image prefill cost can
+  be charged to the following T_Prefill or decode phase.
 
 T_Prefill
-  Text chunk prefill.
+  Text chunk prefill using token-id batches. The last text chunk may request
+  logits, so token count alone does not predict relative time versus ImagePrefill.
 
 D
   One generated-token llama_decode() call.
+  Bridge phase rows synchronize after each llama_decode() before recording this
+  duration.
 ```
 
 `phase_duration_stacked_bar.png` filters load/setup phases so the figure focuses
@@ -514,45 +560,107 @@ on execution. The full trace remains in `foundation_proc.csv`.
 
 ## Current Matched Results
 
-아래 숫자는 **동일 디코더 설정**(예: `n_ctx=32768`, `n_batch=2048`, `n_ubatch=512`)으로
-잡은 과거 측정값입니다. 결과 폴더 경로는 러너 버전에 따라 예전
-`results/log/opencl/<stem>/` 같은 하위 디렉터리 대신, 위 **Result Layout** 규칙의
-`..._<stem>_opencl_ctx_32768_kv16/` 형태를 씁니다.
+아래 숫자는 bridge phase timing에 `llama_synchronize()`를 포함한 최신 측정값입니다.
+결과 폴더 경로는 러너 버전에 따라 예전 `results/log/opencl/<stem>/` 같은 하위
+디렉터리 대신, 위 **Result Layout** 규칙의 `..._<stem>_<backend>_ctx_<n>_kv16/`
+형태를 씁니다.
 
-Latest standalone OpenCL precise run:
+Latest synchronized InternVL3-8B Q4_K_M OpenCL run:
+
+```text
+result:
+  my_research/foundation_llamacpp/results/log/InternVL3-8B-Instruct-Q4_K_M_opencl_ctx_1024_kv16/
+
+warmup               = fixed Golden Gate split InternVL encode + mmproj pass,
+                       discarded
+V_Encode             = 723 ms
+Mmproj               = 19 ms
+T_Prefill            = 465 ms + 624 ms
+ImagePrefill         = 3967 ms
+token decode         = mostly 124-126 ms/token
+prompt eval          = 5054.50 ms / 271 tokens
+token decode total   = 8022.07 ms / 64 runs
+llama.cpp total      = 28563.78 ms
+```
+
+Latest synchronized InternVL3-8B Q4_K_M hybrid QNN vision + OpenCL decoder run:
+
+```text
+result:
+  my_research/foundation_llamacpp/results/log/InternVL3-8B-Instruct-Q4_K_M_hybrid_ctx_1024_kv16/
+
+warmup                = fixed Golden Gate QNN encoder.encode() and fixed
+                        Golden Gate mtmd_project_features() pass, discarded
+V_Encode / QNN vision = 407 ms
+Mmproj                = 16 ms
+T_Prefill             = 460 ms + 657 ms
+ImagePrefill          = 3888 ms
+token decode          = mostly 164-176 ms/token
+prompt eval           = 5003.22 ms / 271 tokens
+token decode total    = 11074.94 ms / 64 runs
+llama.cpp total       = 34718.85 ms
+```
+
+Historical 1B Q8_0 warmed runs below were collected before bridge-level
+`llama_synchronize()` was added after each `llama_decode()`, so use them only for
+vision/mmproj smoke checks, not for final ImagePrefill/T_Prefill attribution.
+
+Latest warmed standalone OpenCL precise run:
 
 ```text
 result (representative folder name today):
   my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_opencl_ctx_32768_kv16/
 
-V_Encode             = 714 ms
-ImagePrefill         = 36 ms
-T_Prefill            = 19 ms + 214 ms
+warmup               = fixed Golden Gate split InternVL encode + mmproj pass,
+                       discarded
+V_Encode             = 726 ms
+Mmproj               = 14 ms
+ImagePrefill         = 47 ms
+T_Prefill            = 6 ms + 219 ms
 token decode         = mostly 12-16 ms/token
-prompt eval          = 269.20 ms / 271 tokens
-token decode total   = 377.38 ms / 29 runs
-llama.cpp total      = 2444.37 ms
+prompt eval          = 272.11 ms / 271 tokens
+token decode total   = 814.46 ms / 63 runs
+llama.cpp total      = 4641.92 ms
 ```
 
-Latest hybrid QNN vision + OpenCL decoder run:
+Latest warmed hybrid QNN vision + OpenCL decoder run:
 
 ```text
 result (representative folder name today):
   my_research/foundation_llamacpp/results/log/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768_kv16/
 
-V_Encode / QNN vision = 369 ms
-ImagePrefill          = 57 ms
-T_Prefill             = 10 ms + 210 ms
-token decode          = mostly 12-15 ms/token
-prompt eval           = 276.44 ms / 271 tokens
-token decode total    = 410.27 ms / 31 runs
-llama.cpp total       = 2225.85 ms
+warmup                = fixed Golden Gate QNN encoder.encode() and fixed
+                        Golden Gate mtmd_project_features() pass, discarded
+V_Encode / QNN vision = 359 ms
+Mmproj                = 48 ms
+ImagePrefill          = 6 ms
+T_Prefill             = 6 ms + 216 ms
+token decode          = mostly 13-16 ms/token
+prompt eval           = 279.73 ms / 271 tokens
+token decode total    = 819.06 ms / 63 runs
+llama.cpp total       = 3370.80 ms
 ```
 
 Interpretation:
 
 ```text
 Compare OpenCL V_Encode against hybrid QNN V_Encode.
+Both OpenCL split and hybrid external-feature projection now rebuild the
+projector-only scheduler/graph for each measured `Mmproj` call. This avoids the
+unsafe cached projector graph path and keeps the comparison on the non-cached
+`mtmd_project_features()` behavior.
+
+Hybrid `ImagePrefill` was also tested with an OpenCL-style host `std::vector`
+copy before `mtmd_helper_decode_image_chunk()`. It remained low (`6 ms`), so the
+OpenCL-vs-hybrid `ImagePrefill` gap is not explained by simply passing a copied
+host vector versus the direct `mtmd_get_output_embd()` pointer.
+After adding bridge-level llama_synchronize() after every llama_decode(), the 8B
+ctx=1024 runs showed the expected redistribution: Hybrid `ImagePrefill` changed
+from `16 ms` to `3888 ms`, while the following text prefill dropped from
+`7759 ms` to `657 ms`. OpenCL showed the same pattern with `ImagePrefill=3967 ms`
+and following `T_Prefill=624 ms`. The helper log line `image decoded ... in
+N ms` is emitted inside mtmd before the bridge-level synchronize, so use the CSV
+phase rows for synchronized timing.
 Compare ImagePrefill/T_Prefill against decoder-side prefill behavior.
 Do not compare QNN vision time against llama.cpp prompt eval directly.
 ```
@@ -588,7 +696,11 @@ my_research/foundation_llamacpp/docs/archive/executorch_vision_llamacpp_decoder.
 
 ## Document Index
 
-- `for_cursor_llm_llamacpp.md`: Append-only development log for future agents.
+- `for_cursor_llm_llamacpp_version2.md`: Active append-only development log for
+  future agents.
+- `project_structure.md`: Detailed English guide to the Python runner, C++
+  bridge, runtime flows, artifacts, and extension points.
+- `archive/for_cursor_llm_llamacpp.md`: Historical pre-refactor development log.
 - `archive/executorch_vision_llamacpp_decoder.md`: Detailed hybrid bridge and
   standalone OpenCL precise measurement guide.
 - `archive/llamacpp_android_cpu_vlm_smoke.md`: SmolVLM-500M Android CPU smoke

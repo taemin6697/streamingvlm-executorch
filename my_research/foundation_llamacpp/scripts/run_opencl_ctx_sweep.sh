@@ -31,7 +31,7 @@
 #
 # KV cache dtype (passed through as llama.cpp --cache-type-k / --cache-type-v).
 # Default f16 (baseline). For quantized KV experiments rebuild llama.cpp with OpenCL FA patch;
-# see `foundation_llamacpp/docs/for_cursor_llm_llamacpp.md` (PR #21313 cherry-pick). Example:
+# see `foundation_llamacpp/docs/for_cursor_llm_llamacpp_version2.md` (and the archived pre-refactor log). Example:
 #   CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 PROCESSOR=gpu ./my_research/foundation_llamacpp/scripts/run_opencl_ctx_sweep.sh
 # Result dirs append KV slugs after ctx, e.g. ..._opencl_ctx_1024_kv8 (q8_0), ..._kv16 (f16 KV).
 # Non-f16 KV defaults to `--fit off` (OpenCL SET_ROWS during memory-fit workaround); override with FIT=on|off.

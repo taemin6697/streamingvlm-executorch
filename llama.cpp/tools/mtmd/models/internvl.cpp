@@ -1,6 +1,16 @@
 #include "models.h"
 
 ggml_cgraph * clip_graph_internvl::build() {
+    ggml_tensor * cur = build_preprojector();
+    cur = build_projector(cur);
+
+    // build the graph
+    ggml_build_forward_expand(gf, cur);
+
+    return gf;
+}
+
+ggml_tensor * clip_graph_internvl::build_preprojector() {
     GGML_ASSERT(model.class_embedding != nullptr);
     GGML_ASSERT(model.position_embeddings != nullptr);
 
@@ -49,12 +59,7 @@ ggml_cgraph * clip_graph_internvl::build() {
             cur->ne[1] * cur->ne[2]);
     }
 
-    cur = build_projector(cur);
-
-    // build the graph
-    ggml_build_forward_expand(gf, cur);
-
-    return gf;
+    return cur;
 }
 
 ggml_tensor * clip_graph_internvl::build_projector(ggml_tensor * cur) {

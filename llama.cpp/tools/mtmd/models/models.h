@@ -59,6 +59,7 @@ struct clip_graph_minicpmv : clip_graph {
 struct clip_graph_internvl : clip_graph {
     clip_graph_internvl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
+    ggml_tensor * build_preprojector();
     ggml_tensor * build_projector(ggml_tensor * cur);
 };
 

@@ -1,7 +1,8 @@
 # for_cursor_llm_llamacpp
 
 This folder holds the llama.cpp-side runner and helper notes for the foundation work.
-The detailed cumulative log lives in `docs/for_cursor_llm_llamacpp.md`.
+The active structured refactor log lives in `docs/for_cursor_llm_llamacpp_version2.md`;
+the older cumulative log is archived at `docs/archive/for_cursor_llm_llamacpp.md`.
 The actual run outputs should be written under:
 
 ```text

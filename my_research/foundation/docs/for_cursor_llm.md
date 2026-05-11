@@ -84,6 +84,73 @@ For video prompts the runner inserts `Frame N: <__media__>` lines before the
 raw user prompt; mtmd expands each marker into InternVL `<img>` vision slots
 `</img>`.
 
+### 2026-05-11. OpenCL Multi-Frame Trace Check
+
+Standalone OpenCL video inference was checked against hybrid QNN+OpenCL after a
+16-frame run produced only `Walking.<|im_end|>`. A trace bug in the project-local
+`opencl_phase_mtmd` wrapper was fixed so each loaded bitmap gets a stable
+`image_N` id and `foundation_inference_tokens.txt` reports IMAGE
+`image_index=1..N` instead of repeating `1`.
+
+After rebuilding and rerunning, OpenCL and hybrid both showed sixteen IMAGE
+chunks and the same prompt-side token count for the 16-frame test. The remaining
+output difference is therefore not a missing-frame or prompt-layout issue; it
+comes from the vision feature path difference between llama.cpp/mtmd's full
+InternVL vision encoder+projector and the ExecuTorch/QNN pre-projector vision
+tower followed by the GGUF mmproj in `hybrid_decode`.
+
+Projected embedding dumps were then added to both paths and rerun on the same
+F16 single-image Golden Gate input. Both paths produced `1 x 256 x 896`
+decoder-side image embeddings, but the embeddings diverged strongly: global
+cosine `0.630686`, mean absolute difference `0.471819`, RMS difference
+`0.605839`, and per-token cosine mean `0.626368` with a minimum of `0.142897`.
+This confirms the issue is before decoder prefill, inside the standalone
+`llama.cpp`/`mtmd` InternVL vision path rather than in prompt construction,
+image-token count, or text decoding.
+
+### 2026-05-11. OpenCL InternVL Projector Timing Split
+
+Standalone OpenCL InternVL timing was split so `V_Encode` no longer hides the
+projector cost. The local llama.cpp/mtmd timing hook now runs the InternVL
+pre-projector graph first, then runs the existing projector-only/mmproj graph
+separately. The project-local `opencl_phase_mtmd` wrapper records these as
+`V_Encode` and `Mmproj` rows.
+
+Both OpenCL and hybrid now run the relevant path once on a fixed Golden Gate
+warmup image before timing the measured input. OpenCL warms one full split
+InternVL encode+mmproj pass. Hybrid warms QNN `encoder.encode()` with the fixed
+preprocessed Golden Gate bin and warms `mtmd_project_features()` with the fixed
+Golden Gate QNN pre-projector features before recording measured `Mmproj`. On the
+Q8_0 Golden Gate run at `ctx=32768`, fixed-warmup OpenCL produced
+`V_Encode=726 ms`, `Mmproj=14 ms`, `ImagePrefill=47 ms`; fixed-warmup hybrid
+produced QNN `V_Encode=359 ms`, `Mmproj=48 ms`, `ImagePrefill=6 ms`.
+
+Both OpenCL split and hybrid external-feature projection now rebuild the
+projector-only scheduler/graph for each measured `Mmproj` call. A cached
+projector graph attempt was removed because it aborted with a ggml layout
+mismatch across repeated calls.
+
+Hybrid `ImagePrefill` was tested with an OpenCL-style `std::vector<float>` copy
+before `mtmd_helper_decode_image_chunk()`. It stayed low (`6 ms`), so the
+OpenCL-vs-Hybrid `ImagePrefill` gap is not explained by copied host vector
+versus direct `mtmd_get_output_embd()` pointer alone.
+
+`ImagePrefill` is the LLM `llama_decode()` insertion of already projected image
+embeddings into KV cache, not the vision encoder. It is therefore not expected
+to scale simply from image-token count versus text-token count; text prefill
+uses token-id batches and the final text chunk may request logits.
+
+Bridge phase timing now calls `llama_synchronize()` immediately after every
+`llama_decode()` in image prefill, text prefill, and token decode. This is needed
+for OpenCL because `llama_decode()` can return after enqueueing work; without the
+synchronize, the actual image prefill work can be charged to the following
+`T_Prefill` or decode phase. InternVL3-8B Q4_K_M at `ctx=1024` confirmed this:
+Hybrid shifted from `ImagePrefill=16 ms` / following `T_Prefill=7759 ms` to
+`ImagePrefill=3888 ms` / following `T_Prefill=657 ms`; OpenCL similarly reported
+`ImagePrefill=3967 ms` / following `T_Prefill=624 ms`. The mtmd stdout line
+`image decoded ... in N ms` is printed before the bridge-level synchronize, so
+use CSV phase rows for synchronized timing.
+
 ### 1. Moved Foundation Out of ExecuTorch
 
 The original foundation code was treated as if it lived under:
@@ -3017,7 +3084,8 @@ Rebuild the hybrid Android bridge (e.g. `my_research/foundation_llamacpp/build-h
 - **Add-on (same build):** Without extending `ggml_opencl_supports_op` for **`GGML_OP_FLASH_ATTN_EXT`**
   + quantized K/V, the scheduler routed FA to **CPU** while K/V remained on **OpenCL** buffers →
   **warmup SIGSEGV**. Match `ggml_cl_flash_attn` logical K/V types (and allow F16 Q + F32 dst from
-  `ggml_flash_attn_ext`) so FA stays on OpenCL. See `my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp.md`.
+  `ggml_flash_attn_ext`) so FA stays on OpenCL. See `my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp_version2.md`
+  for current notes and `my_research/foundation_llamacpp/docs/archive/for_cursor_llm_llamacpp.md` for pre-refactor history.
 
 ## foundation_llamacpp: token_io echo + GGUF inference trace (2026-05-06)
 

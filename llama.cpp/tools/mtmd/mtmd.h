@@ -235,6 +235,13 @@ MTMD_API int32_t mtmd_encode(mtmd_context * ctx,
 MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
                                    const mtmd_input_chunk * chunk);
 
+// InternVL-only image encode with separate timings for the vision tower
+// pre-projector graph and the projector/mmproj graph.
+MTMD_API int32_t mtmd_encode_chunk_split_timing(mtmd_context * ctx,
+                                                const mtmd_input_chunk * chunk,
+                                                int64_t * vision_ms,
+                                                int64_t * projector_ms);
+
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)

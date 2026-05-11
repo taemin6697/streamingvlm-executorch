@@ -319,7 +319,8 @@ FIT=on FLASH_ATTN=on WARMUP=1 PROCESSOR=gpu \
 
 ## 17. 부록: 내부 노트
 
-- **`my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp.md`** — 일자별 이슈·커맨드 누적.
+- **`my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp_version2.md`** — 현재 일자별 이슈·커맨드 누적.
+- **`my_research/foundation_llamacpp/docs/archive/for_cursor_llm_llamacpp.md`** — refactor 이전 누적 로그.
 - **`my_research/foundation/docs/for_cursor_llm.md`** — foundation 레이어와 교차 참고.
 
 ---
