@@ -61,6 +61,29 @@ my_research/foundation/
 
 ## Changes Already Made
 
+### 2026-05-11. Android Hybrid Video Input
+
+`my_research/foundation_llamacpp/run_android_hybrid_bridge.py` now has a
+modular media preparation path for `--image` and `--video`. Video input is
+sampled as ordered image frames using the InternVL Python reference flow:
+uniform center-biased temporal segments, dynamic tiling controlled by
+`--max-num`, and frame/tile tensors written before the Android run starts.
+
+Hybrid execution remains upgrade-safe: ExecuTorch source was not modified.
+Project-local bridge binaries were extended instead:
+
+- `hybrid_vision_dump` accepts `--image_paths` and writes one merged
+  `.svlmemb` after encoding all frame/tile inputs in order.
+- `hybrid_decode` consumes the merged embedding file with a cursor so every
+  mtmd IMAGE chunk receives the matching vision-feature slice.
+- Token traces now label IMAGE chunks with a 1-based `image_index`, and phase
+  CSVs include a combined `Prefill` row while keeping detailed text/image
+  prefill rows.
+
+For video prompts the runner inserts `Frame N: <__media__>` lines before the
+raw user prompt; mtmd expands each marker into InternVL `<img>` vision slots
+`</img>`.
+
 ### 1. Moved Foundation Out of ExecuTorch
 
 The original foundation code was treated as if it lived under:

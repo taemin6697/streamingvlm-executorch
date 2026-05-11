@@ -42,6 +42,25 @@ follow_up:
 
 ## Recent Runs
 
+- 2026-05-11: Added first-class `--video` plumbing to the Android hybrid bridge.
+  `run_android_hybrid_bridge.py` now accepts `--video`, `--num-segments`, and
+  `--max-num` and prepares video as ordered InternVL frame/tile images. The host
+  samples frames with the same center-biased segment math used by
+  `my_research/test_python/internvl3_1b_video_chat.py`, applies the same
+  dynamic tiling rules, writes `frame_XXXX_tile_YYYY.bin` tensors plus PNG
+  layout images, and emits `media_manifest.json`. Hybrid execution still loads
+  the decoder/mmproj and QNN encoder before `start_encode.flag`; then
+  `hybrid_vision_dump --image_paths=...` encodes every frame/tile in order,
+  writes one merged `.svlmemb`, and records one `V_Encode` phase per input.
+  `hybrid_decode` now consumes external embeddings with a cursor so each mtmd
+  IMAGE chunk gets the next slice instead of reusing the first buffer. The
+  video prompt is `Frame 1: <__media__>\n...` plus the raw prompt; mtmd expands
+  each marker as InternVL `<img>` + vision slots + `</img>`. With `--max-num 1`
+  this is exactly one image block per sampled frame; with `--max-num > 1`, each
+  frame label contains multiple tile markers in frame/tile order. Phase plotting
+  now exposes a combined `Prefill` row while retaining detailed `ImagePrefill`
+  and `T_Prefill` rows in CSV traces.
+
 - 2026-05-11: Trace dumps: no `HF_OFFICIAL_*` blocks; `User:` echoes raw `-p`. Removed
   `internvl_mtmd_prompt.hpp` (no HF `<image>` leader stripping on the bridge). InternVL vision wrapper in
   **`llama.cpp/tools/mtmd/mtmd.cpp`** uses **`<img>` … `</img>`** (`PROJECTOR_TYPE_INTERNVL`).

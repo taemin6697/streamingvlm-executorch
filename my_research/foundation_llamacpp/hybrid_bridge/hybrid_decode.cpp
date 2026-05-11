@@ -128,7 +128,7 @@ struct phase_recorder {
       out << "# L_DecoderLoad: llama.cpp model/context/mmproj load  "
              "ExternalEmbeddingRead: .svlmemb read  LayoutTokenize: mtmd text/image layout  "
              "Mmproj: OpenCL mmproj projection for QNN pre-projector features  "
-             "ImagePrefill: external image embedding decode  T_Prefill: text prompt eval  "
+             "Prefill: combined text/image prompt eval  ImagePrefill: external image embedding decode  T_Prefill: text prompt eval  "
              "D: one generated-token decode\n";
     }
   }
@@ -142,6 +142,53 @@ struct phase_recorder {
     const long total_ms = end_ms - start_ms;
     out << row_type << "," << start_s << "," << end_s
         << ",,," << total_ms << ",," << total_ms << ",,,,,,," << token_idx << "\n";
+  }
+};
+
+struct embedding_cursor {
+  streamingvlm::hybrid_bridge::EmbeddingFile& file;
+  size_t offset = 0;
+
+  explicit embedding_cursor(streamingvlm::hybrid_bridge::EmbeddingFile& embedding) : file(embedding) {}
+
+  int32_t feature_dim_for_chunk(size_t n_tokens, int32_t n_embd) const {
+    if (file.shape.size() >= 2 && file.shape.back() > 0) {
+      const int64_t shape_tokens = file.shape[file.shape.size() - 2];
+      const int64_t shape_feature = file.shape.back();
+      if (shape_tokens == static_cast<int64_t>(n_tokens)) {
+        return static_cast<int32_t>(shape_feature);
+      }
+    }
+    const size_t remaining = file.values.size() - offset;
+    if (remaining >= n_tokens * static_cast<size_t>(n_embd)) {
+      return n_embd;
+    }
+    return 0;
+  }
+
+  float* next_slice(size_t n_tokens, int32_t feature_dim) {
+    const size_t n_values = n_tokens * static_cast<size_t>(feature_dim);
+    if (feature_dim <= 0 || offset + n_values > file.values.size()) {
+      die_fmt(
+          "embedding size mismatch: file has %zu floats, consumed %zu, next image chunk expects %zu x %d",
+          file.values.size(),
+          offset,
+          n_tokens,
+          feature_dim);
+    }
+    float* ptr = file.values.data() + offset;
+    offset += n_values;
+    return ptr;
+  }
+
+  void finish() const {
+    if (offset != file.values.size()) {
+      LOG_WRN(
+          "external embedding has %zu unused float32 values after prefill (consumed %zu of %zu)\n",
+          file.values.size() - offset,
+          offset,
+          file.values.size());
+    }
   }
 };
 
@@ -282,6 +329,7 @@ int eval_with_external_embedding(
 
   if (trace != nullptr && static_cast<bool>(*trace)) {
     trace->write_prefill_header();
+    size_t image_trace_idx = 0;
     for (size_t ci = 0; ci < n_chunks; ++ci) {
       const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks.ptr.get(), ci);
       const auto ctype = mtmd_input_chunk_get_type(ch);
@@ -294,12 +342,14 @@ int eval_with_external_embedding(
           trace->token_line(toks[ti], piece);
         }
       } else if (ctype == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-        trace->chunk_image_begin(ci, mtmd_input_chunk_get_n_tokens(ch), mtmd_input_chunk_get_id(ch));
+        trace->chunk_image_begin(ci, mtmd_input_chunk_get_n_tokens(ch), mtmd_input_chunk_get_id(ch), image_trace_idx++);
       }
     }
   }
 
   bool used_external_embedding = false;
+  const long prefill_start_ms = ggml_time_ms();
+  embedding_cursor embeddings(embedding);
   for (size_t i = 0; i < n_chunks; ++i) {
     const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
     const bool logits_last = i == n_chunks - 1;
@@ -307,38 +357,29 @@ int eval_with_external_embedding(
     if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
       const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
       const int32_t n_embd = llama_model_n_embd_inp(ctx.model);
-      float* image_embedding = embedding.values.data();
-      if (embedding.values.size() == n_tokens * static_cast<size_t>(n_embd)) {
+      const int32_t n_feature_embd = embeddings.feature_dim_for_chunk(n_tokens, n_embd);
+      float* image_slice = embeddings.next_slice(n_tokens, n_feature_embd);
+      float* image_embedding = image_slice;
+      if (n_feature_embd == n_embd) {
         // Already projected into the decoder input embedding dimension.
         LOG_INF(
-            "external embedding is already projected: tokens=%zu embd=%d floats=%zu\n",
+            "external embedding slice is already projected: tokens=%zu embd=%d consumed_floats=%zu/%zu\n",
             n_tokens,
             n_embd,
+            embeddings.offset,
             embedding.values.size());
       } else {
-        int32_t n_feature_embd = 0;
-        if (embedding.shape.size() >= 3 && embedding.shape[embedding.shape.size() - 2] == static_cast<int64_t>(n_tokens)) {
-          n_feature_embd = static_cast<int32_t>(embedding.shape.back());
-        } else if (embedding.shape.size() == 2 && embedding.shape[0] == static_cast<int64_t>(n_tokens)) {
-          n_feature_embd = static_cast<int32_t>(embedding.shape[1]);
-        }
-        if (n_feature_embd <= 0 || embedding.values.size() != n_tokens * static_cast<size_t>(n_feature_embd)) {
-          die_fmt(
-              "embedding size mismatch: file has %zu floats, image chunk expects %zu x %d projected embedding or valid pre-projector features",
-              embedding.values.size(),
-              n_tokens,
-              n_embd);
-        }
         LOG_INF(
-            "external embedding is pre-projector: tokens=%zu feature_embd=%d projected_embd=%d floats=%zu\n",
+            "external embedding slice is pre-projector: tokens=%zu feature_embd=%d projected_embd=%d consumed_floats=%zu/%zu\n",
             n_tokens,
             n_feature_embd,
             n_embd,
+            embeddings.offset,
             embedding.values.size());
         const long mmproj_start_ms = ggml_time_ms();
         if (mtmd_project_features(
                 ctx.ctx_vision.get(),
-                embedding.values.data(),
+                image_slice,
                 static_cast<int32_t>(n_tokens),
                 n_feature_embd) != 0) {
           die("failed to project external vision features with mmproj");
@@ -388,6 +429,8 @@ int eval_with_external_embedding(
   if (!used_external_embedding) {
     die("prompt did not produce an image chunk");
   }
+  embeddings.finish();
+  phases.row("Prefill", prefill_start_ms, ggml_time_ms());
   return 0;
 }
 

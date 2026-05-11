@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -21,11 +22,25 @@ from my_research.foundation.host.android_timeline_memory_summary import (
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 FOUNDATION_LLAMA = Path(__file__).resolve().parent
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+MEDIA_MARKER = "<__media__>"
+
+
+@dataclass
+class PreparedMedia:
+    frame_bins: list[Path]
+    layout_images: list[Path]
+    prompt: str
+    metadata_path: Path
+    num_patches_list: list[int]
+    frame_indices: list[int]
+    source_kind: str
 
 
 def _standalone_completion_mode(args: argparse.Namespace) -> bool:
-    """--processor cpu|gpu and no --image → text-only llama-completion (no mmproj/vision)."""
-    return args.processor in ("cpu", "gpu") and getattr(args, "image", None) is None
+    """--processor cpu|gpu and no media → text-only llama-completion (no mmproj/vision)."""
+    return args.processor in ("cpu", "gpu") and getattr(args, "image", None) is None and getattr(args, "video", None) is None
 
 
 def _run(cmd: list[str], *, check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
@@ -44,17 +59,76 @@ def _normalize_image_to_bin(image, output_path: Path, image_size: int = 448) -> 
 
     if not isinstance(image, Image.Image):
         image = Image.fromarray(image)
-    image = image.convert("RGB").resize((image_size, image_size))
+    resampling = getattr(Image, "Resampling", Image).BICUBIC
+    image = image.convert("RGB").resize((image_size, image_size), resampling)
     arr = np.asarray(image).astype("float32") / 255.0
-    mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+    mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
+    std = np.asarray(IMAGENET_STD, dtype=np.float32)
     arr = (arr - mean) / std
     arr = np.transpose(arr, (2, 0, 1))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     arr.astype("float32").tofile(output_path)
 
 
-def _prepare_inputs(image: Path, work_dir: Path) -> tuple[Path, Path]:
+def _find_closest_aspect_ratio(
+    aspect_ratio: float,
+    target_ratios: list[tuple[int, int]],
+    width: int,
+    height: int,
+    image_size: int,
+) -> tuple[int, int]:
+    best_ratio_diff = float("inf")
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+
+def _dynamic_preprocess_tiles(image, *, image_size: int = 448, max_num: int = 1, use_thumbnail: bool = True) -> list:
+    from PIL import Image
+
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image)
+    image = image.convert("RGB")
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+    target_ratios = {
+        (i, j)
+        for n in range(1, max_num + 1)
+        for i in range(1, n + 1)
+        for j in range(1, n + 1)
+        if 1 <= i * j <= max_num
+    }
+    sorted_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+    target_ratio = _find_closest_aspect_ratio(aspect_ratio, sorted_ratios, orig_width, orig_height, image_size)
+    target_width = image_size * target_ratio[0]
+    target_height = image_size * target_ratio[1]
+    blocks = target_ratio[0] * target_ratio[1]
+    resampling = getattr(Image, "Resampling", Image).BICUBIC
+    resized_img = image.resize((target_width, target_height), resampling)
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size,
+        )
+        processed_images.append(resized_img.crop(box))
+    if use_thumbnail and len(processed_images) != 1:
+        processed_images.append(image.resize((image_size, image_size), resampling))
+    return processed_images
+
+
+def _prepare_image_media(image: Path, work_dir: Path, prompt: str) -> PreparedMedia:
     load_image = importlib.import_module("transformers.image_utils").load_image
 
     frame_bin = work_dir / "frame_0000.bin"
@@ -62,7 +136,110 @@ def _prepare_inputs(image: Path, work_dir: Path) -> tuple[Path, Path]:
     _normalize_image_to_bin(load_image(str(image)), frame_bin)
     if image.resolve() != layout_image.resolve():
         layout_image.write_bytes(image.read_bytes())
-    return frame_bin, layout_image
+    metadata = {
+        "source_kind": "image",
+        "source": str(image),
+        "num_patches_list": [1],
+        "frame_indices": [0],
+        "frame_bins": [frame_bin.name],
+        "layout_images": [layout_image.name],
+        "prompt": prompt,
+    }
+    metadata_path = work_dir / "media_manifest.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return PreparedMedia(
+        frame_bins=[frame_bin],
+        layout_images=[layout_image],
+        prompt=prompt,
+        metadata_path=metadata_path,
+        num_patches_list=[1],
+        frame_indices=[0],
+        source_kind="image",
+    )
+
+
+def _prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segments: int, max_num: int) -> PreparedMedia:
+    from PIL import Image
+
+    decord = importlib.import_module("decord")
+    vr = decord.VideoReader(str(video), ctx=decord.cpu(0), num_threads=1)
+    max_frame = len(vr) - 1
+    fps = float(vr.get_avg_fps())
+    seg_size = float(max_frame) / num_segments
+    frame_indices = [int((seg_size / 2) + np.round(seg_size * idx)) for idx in range(num_segments)]
+
+    frame_bins: list[Path] = []
+    layout_images: list[Path] = []
+    num_patches_list: list[int] = []
+    frame_records: list[dict[str, object]] = []
+    for frame_i, frame_index in enumerate(frame_indices):
+        image = Image.fromarray(vr[int(frame_index)].asnumpy()).convert("RGB")
+        tiles = _dynamic_preprocess_tiles(image, image_size=448, max_num=max_num, use_thumbnail=True)
+        num_patches_list.append(len(tiles))
+        tile_records: list[dict[str, object]] = []
+        for tile_i, tile in enumerate(tiles):
+            stem = f"frame_{frame_i:04d}_tile_{tile_i:04d}"
+            frame_bin = work_dir / f"{stem}.bin"
+            layout_image = work_dir / f"{stem}.png"
+            _normalize_image_to_bin(tile, frame_bin)
+            tile.save(layout_image)
+            frame_bins.append(frame_bin)
+            layout_images.append(layout_image)
+            tile_records.append({"bin": frame_bin.name, "layout_image": layout_image.name})
+        frame_records.append(
+            {
+                "frame": frame_i + 1,
+                "video_frame_index": int(frame_index),
+                "num_patches": len(tiles),
+                "tiles": tile_records,
+            }
+        )
+
+    prefix_parts: list[str] = []
+    for frame_i, n_patches in enumerate(num_patches_list):
+        prefix_parts.append(f"Frame {frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
+    media_prompt = "".join(prefix_parts) + prompt
+
+    metadata = {
+        "source_kind": "video",
+        "source": str(video),
+        "fps": fps,
+        "max_frame": max_frame,
+        "num_segments": num_segments,
+        "max_num": max_num,
+        "frame_indices": [int(i) for i in frame_indices],
+        "num_patches_list": num_patches_list,
+        "frame_bins": [p.name for p in frame_bins],
+        "layout_images": [p.name for p in layout_images],
+        "frames": frame_records,
+        "prompt": media_prompt,
+        "raw_prompt": prompt,
+    }
+    metadata_path = work_dir / "media_manifest.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return PreparedMedia(
+        frame_bins=frame_bins,
+        layout_images=layout_images,
+        prompt=media_prompt,
+        metadata_path=metadata_path,
+        num_patches_list=num_patches_list,
+        frame_indices=[int(i) for i in frame_indices],
+        source_kind="video",
+    )
+
+
+def _prepare_media(args: argparse.Namespace, work_dir: Path) -> PreparedMedia:
+    if args.video is not None:
+        return _prepare_video_media(
+            args.video,
+            work_dir,
+            args.prompt,
+            num_segments=args.num_segments,
+            max_num=args.max_num,
+        )
+    if args.image is None:
+        raise SystemExit("media preparation requires --image or --video")
+    return _prepare_image_media(args.image, work_dir, args.prompt)
 
 
 def _load_manifest(manifest_path: Path) -> dict:
@@ -356,8 +533,8 @@ def _write_phase_csv(path: Path, rows: list[dict[str, str]]) -> None:
             "V_Encode: QNN projected vision embedding  EmbeddingFileWrite: .svlmemb write  "
             "L_DecoderRuntimeInit: llama.cpp args/OpenCL runtime init  ExternalEmbeddingRead: .svlmemb read  "
             "L_DecoderLoad: llama.cpp model/mmproj load  "
-            "LayoutTokenize: mtmd layout  ImagePrefill: image embedding prefill  "
-            "T_Prefill: text prompt prefill  D: one generated-token decode"
+            "LayoutTokenize: mtmd layout  Prefill: combined text/image prefill  "
+            "ImagePrefill: image embedding prefill  T_Prefill: text prompt prefill  D: one generated-token decode"
         })
         writer.writerows(rows)
 
@@ -426,6 +603,7 @@ def _phase_colors() -> dict[str, str]:
         "L_DecoderRuntimeInit": "#a29bfe",
         "L_DecoderLoad": "#6c5ce7",
         "LayoutTokenize": "#fdcb6e",
+        "Prefill": "#2d98da",
         "ImagePrefill": "#0984e3",
         "T_Prefill": "#e17055",
         "D": "#ff7675",
@@ -475,7 +653,7 @@ def _write_png_memory_timeline(
         ax.axvline(start, color=color, linestyle="--", linewidth=1.1, alpha=0.9)
         ax.axvline(end, color=color, linestyle="--", linewidth=1.1, alpha=0.9)
         phase_count[name] = phase_count.get(name, 0) + 1
-        label = f"{name}{phase_count[name]}" if name in {"T_Prefill"} else name
+        label = f"{name}{phase_count[name]}" if name in {"T_Prefill", "V_Encode"} else name
         ax.text(
             (start + end) / 2.0,
             0.045,
@@ -576,6 +754,8 @@ def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[
         "L_DecoderRuntimeInit",
         "L_VisionLoad",
         "LayoutTokenize",
+        "ImagePrefill",
+        "T_Prefill",
     }
     durations: dict[str, float] = {}
     first_start_s: dict[str, float] = {}
@@ -675,6 +855,7 @@ def _finalize_hybrid_outputs(result_dir: Path) -> None:
         {"metric": "wall_time_s", "value": round(wall_s, 3), "unit": "s"},
         {"metric": "return_code", "value": return_code, "unit": ""},
         {"metric": "vision_output_dims", "value": raw_vision_stats.get("output_dims", ""), "unit": ""},
+        {"metric": "vision_input_count", "value": raw_vision_stats.get("input_count", ""), "unit": "frames_or_tiles"},
     ]
     for key, value in perf.items():
         unit = "ms" if key.endswith("_ms") else "tok/s" if key.endswith("_tok_s") else "tokens" if "tokens" in key else "runs" if "runs" in key else ""
@@ -928,6 +1109,15 @@ def _rope_shell_suffix(args: argparse.Namespace) -> str:
     return (" " + " ".join(parts)) if parts else ""
 
 
+def _media_image_arg(args: argparse.Namespace) -> str:
+    images = getattr(args, "remote_layout_images", None)
+    if images:
+        return ",".join(images)
+    if args.image is None:
+        raise SystemExit("--image is required for multimodal standalone mode.")
+    return args.image.name
+
+
 def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: bool) -> list[str]:
     selected_gpu_layers = 0 if args.processor == "cpu" else args.gpu_layers
     selected_device = args.device
@@ -941,9 +1131,9 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
         "--mmproj",
         args.mmproj.name,
         "--image",
-        args.image.name,
+        _media_image_arg(args),
         "-p",
-        args.prompt,
+        getattr(args, "remote_prompt", args.prompt),
         "-n",
         str(n_predict),
         "-t",
@@ -1078,8 +1268,11 @@ def _remote_llama_env_exports(args: argparse.Namespace) -> str:
     return "\n".join(lines)
 
 
-def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, layout_image: Path) -> str:
-    prompt = shlex.quote(args.prompt)
+def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, media: PreparedMedia) -> str:
+    prompt = shlex.quote(media.prompt)
+    image_arg = ",".join(path.name for path in media.layout_images)
+    image_paths_arg = ",".join(path.name for path in media.frame_bins)
+    group_sizes_arg = ",".join(str(n) for n in media.num_patches_list)
     device_arg = f"--device {shlex.quote(args.device)}" if args.device else ""
     remote_memory_csv = f"{args.remote_root}/android_memory_timeline.csv"
     baseline_loop = _baseline_sampling_shell(remote_memory_csv, args.sample_interval, args.baseline_window)
@@ -1107,7 +1300,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 {baseline_loop}
 
 ./hybrid_decode -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} \\
-  --image {shlex.quote(layout_image.name)} --external-embedding vision_embedding.svlmemb \\
+  --image {shlex.quote(image_arg)} --external-embedding vision_embedding.svlmemb \\
   --phase-stats-path decoder_phase_stats.csv --ready-path decoder_ready.flag \\
   --wait-for-embedding --wait-timeout-ms 120000 \\
   --token-io-path foundation_token_io.txt {('--force-generation' if args.force_generation else '')} \\
@@ -1116,7 +1309,8 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 decoder_pid=$!
 
 ./hybrid_vision_dump --encoder_path={shlex.quote(encoder_pte.name)} \\
-  --image_path=frame_0000.bin --output_path=vision_embedding.svlmemb \\
+  --image_paths={shlex.quote(image_paths_arg)} --output_path=vision_embedding.svlmemb \\
+  --group_sizes={shlex.quote(group_sizes_arg)} \\
   --stats_path=vision_output_stats.csv --phase_stats_path=vision_phase_stats.csv \\
   --ready_path=vision_ready.flag --wait_path=start_encode.flag --wait_timeout_ms=120000 \\
   > hybrid_vision_stdout.txt 2>&1 &
@@ -1244,8 +1438,16 @@ def main() -> int:
         "--image",
         type=Path,
         default=None,
-        help="Input image for vision. Omit on cpu/gpu for text-only generation (llama-completion). Required for hybrid.",
+        help="Input image for vision. Omit on cpu/gpu for text-only generation (llama-completion). Mutually exclusive with --video.",
     )
+    parser.add_argument(
+        "--video",
+        type=Path,
+        default=None,
+        help="Input video for vision. Sampled as multiple image frames; mutually exclusive with --image.",
+    )
+    parser.add_argument("--num-segments", type=int, default=8, help="Uniform temporal samples for --video.")
+    parser.add_argument("--max-num", type=int, default=1, help="Max InternVL dynamic-preprocess tiles per sampled video frame.")
     parser.add_argument("--prompt", default="Describe this image briefly.")
     parser.add_argument("--n-predict", "--max-new-tokens", dest="n_predict", type=int, default=32)
     parser.add_argument(
@@ -1422,34 +1624,49 @@ def main() -> int:
     if args.vision_encoder is not None:
         args.vision_encoder = args.vision_encoder.resolve()
     args.llama_build_dir = args.llama_build_dir.resolve()
+    if args.num_segments <= 0:
+        raise SystemExit("--num-segments must be positive.")
+    if args.max_num <= 0:
+        raise SystemExit("--max-num must be positive.")
+    if args.image is not None and args.video is not None:
+        raise SystemExit("--image and --video are mutually exclusive.")
     if args.vision_build_dir is None:
         args.vision_build_dir = args.llama_build_dir
     else:
         args.vision_build_dir = args.vision_build_dir.resolve()
 
     if args.processor == "hybrid":
-        if args.image is None:
-            raise SystemExit("--processor hybrid requires --image.")
+        if args.image is None and args.video is None:
+            raise SystemExit("--processor hybrid requires --image or --video.")
         if args.mmproj is None:
             raise SystemExit("--processor hybrid requires --mmproj.")
         args.mmproj = args.mmproj.resolve()
-        args.image = args.image.resolve()
+        if args.image is not None:
+            args.image = args.image.resolve()
+        if args.video is not None:
+            args.video = args.video.resolve()
     elif _standalone_completion_mode(args):
         args.mmproj = None
         args.image = None
+        args.video = None
     else:
         if args.mmproj is None:
             raise SystemExit(
-                "--mmproj is required when --image is set. Omit --image on cpu/gpu for text-only (llama-completion)."
+                "--mmproj is required when --image/--video is set. Omit media on cpu/gpu for text-only (llama-completion)."
             )
         args.mmproj = args.mmproj.resolve()
-        args.image = args.image.resolve()
+        if args.image is not None:
+            args.image = args.image.resolve()
+        if args.video is not None:
+            args.video = args.video.resolve()
 
     exist_paths: list[Path] = [args.llama_build_dir, args.model]
     if args.mmproj is not None:
         exist_paths.append(args.mmproj)
     if args.image is not None:
         exist_paths.append(args.image)
+    if args.video is not None:
+        exist_paths.append(args.video)
     if args.vision_encoder is not None:
         exist_paths.append(args.vision_encoder)
     for required in exist_paths:
@@ -1492,7 +1709,7 @@ def main() -> int:
 
     encoder_pte: Path | None = None
     with tempfile.TemporaryDirectory(prefix="streamingvlm_android_inputs_") as tmp:
-        layout_image = args.image
+        media: PreparedMedia | None = None
         if args.processor == "hybrid":
             if args.vision_encoder is not None:
                 encoder_pte = args.vision_encoder
@@ -1503,16 +1720,25 @@ def main() -> int:
             decode_bin = _find_executable(args.llama_build_dir, "hybrid_decode")
             if not vision_bin.exists() or not decode_bin.exists():
                 raise SystemExit("Missing hybrid_vision_dump or hybrid_decode. Build hybrid_bridge first.")
-            frame_bin, layout_image = _prepare_inputs(args.image, Path(tmp))
+            media = _prepare_media(args, Path(tmp))
             _push(adb, vision_bin, args.remote_root)
             _push(adb, decode_bin, args.remote_root)
             _push_model_cached(adb, encoder_pte, args.remote_root, force=args.model_push)
-            _push(adb, frame_bin, args.remote_root)
-            if layout_image.resolve() != args.image.resolve():
+            _push(adb, media.metadata_path, args.remote_root)
+            for frame_bin in media.frame_bins:
+                _push(adb, frame_bin, args.remote_root)
+            pushed_layouts: set[Path] = set()
+            for layout_image in media.layout_images:
+                resolved_layout = layout_image.resolve()
+                if args.image is not None and resolved_layout == args.image.resolve():
+                    continue
+                if resolved_layout in pushed_layouts:
+                    continue
                 _push(adb, layout_image, args.remote_root)
+                pushed_layouts.add(resolved_layout)
             _push_qnn_libs(adb, args.remote_root, Path(qnn_sdk), args.executorch_build_dir, args.soc_model)
             _run(adb + ["shell", f"chmod +x {shlex.quote(args.remote_root)}/hybrid_vision_dump {shlex.quote(args.remote_root)}/hybrid_decode"])
-            script_text = _build_hybrid_remote_script(args, encoder_pte=encoder_pte, layout_image=layout_image)
+            script_text = _build_hybrid_remote_script(args, encoder_pte=encoder_pte, media=media)
             pull_names = (
                 "hybrid_vision_stdout.txt",
                 "hybrid_decode_stdout.txt",
@@ -1522,6 +1748,7 @@ def main() -> int:
                 "foundation_token_io.txt",
                 "foundation_inference_tokens.txt",
                 "vision_embedding.svlmemb",
+                "media_manifest.json",
                 "foundation_exit_code.txt",
                 "vision_exit_code.txt",
                 "decoder_exit_code.txt",
@@ -1529,6 +1756,13 @@ def main() -> int:
             )
         else:
             completion_mode = _standalone_completion_mode(args)
+            if not completion_mode:
+                media = _prepare_media(args, Path(tmp))
+                args.remote_prompt = media.prompt
+                args.remote_layout_images = [path.name for path in media.layout_images]
+                _push(adb, media.metadata_path, args.remote_root)
+                for layout_image in media.layout_images:
+                    _push(adb, layout_image, args.remote_root)
             if completion_mode:
                 completion_bin = _find_executable(args.llama_build_dir, "llama-completion")
                 if not completion_bin.exists():

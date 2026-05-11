@@ -78,8 +78,13 @@ struct inference_trace_collector {
   }
 
   void chunk_image_begin(std::size_t idx, std::size_t n_tok, const char* cid) {
+    chunk_image_begin(idx, n_tok, cid, 0);
+  }
+
+  void chunk_image_begin(std::size_t idx, std::size_t n_tok, const char* cid, std::size_t image_idx) {
     if (!out.is_open()) return;
-    out << "## CHUNK " << idx << " IMAGE n_placeholder_tokens=" << n_tok;
+    out << "## CHUNK " << idx << " IMAGE image_index=" << (image_idx + 1)
+        << " n_placeholder_tokens=" << n_tok;
     if (cid != nullptr && cid[0]) {
       out << " mtmd_chunk_id=" << cid;
     }

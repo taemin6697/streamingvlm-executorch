@@ -337,6 +337,44 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --model-push
 ```
 
+Video input uses the same hybrid path, but samples the video into ordered
+InternVL image frames. The example below samples four frames (`--num-segments 4`)
+and uses one tile per frame (`--max-num 1`), so the prompt layout becomes
+`Frame 1: <img>...</img>` through `Frame 4: <img>...</img>` before the text
+question.
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
+  --num-segments 4 \
+  --max-num 1 \
+  --prompt "Describe this video briefly." \
+  --n-predict 32 \
+  --ctx-size 32768 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --soc-model SM8750 \
+  --baseline-window 5.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log \
+  --force-push
+```
+
+For this video path, check `media_manifest.json` for sampled frame indices and
+`num_patches_list`, `vision_output_stats.csv` for the merged embedding shape
+(for the command above, `4 x 256 x 4096`), and `foundation_inference_tokens.txt`
+for four frame-prefixed IMAGE chunks.
+
 This `--vision` artifact is the 16a8w QNN vision-tower-only export:
 `projector_included: false`, output shape `1 x 256 x 4096`. Because it stops
 before InternVL3 `multi_modal_projector`, the decoder bridge must apply mmproj
