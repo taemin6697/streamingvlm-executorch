@@ -557,6 +557,8 @@ def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[
     except Exception:
         return
     excluded_from_plot = {
+        "EmbeddingFileWrite",
+        "ExternalEmbeddingRead",
         "ImageLoad",
         "L_DecoderLoad",
         "L_DecoderRuntimeInit",
