@@ -381,14 +381,14 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --processor hybrid \
   --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
-  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
-  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q4_K_M.gguf \
+  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
   --video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
   --num-segments 8 \
   --max-num 1 \
   --prompt "Describe this video briefly." \
   --n-predict 32 \
-  --ctx-size 32768 \
+  --ctx-size 4096 \
   --batch-size 2048 \
   --ubatch-size 512 \
   --gpu-layers 99 \
