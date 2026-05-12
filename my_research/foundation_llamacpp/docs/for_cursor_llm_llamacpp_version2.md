@@ -233,3 +233,188 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - warmup responsibilities of `opencl_phase_mtmd`, `hybrid_vision_dump`, and
     `hybrid_decode`,
   - `Mmproj` phase semantics and projected embedding artifacts.
+
+## 2026-05-12: Single-Buffer Streaming Video Mode
+
+- Implemented file-backed streaming video simulation for `--streaming-video`
+  with `--single-buffer`.
+- Semantics:
+  - host samples the input video at `--sampling-fps` and writes a streaming
+    `media_manifest.json`;
+  - Android-side runner replays sampled frames according to their stream
+    timestamps;
+  - `SingleBufferUpdate` replaces the current frame pointer with the latest
+    sampled frame;
+  - prompt events from `--time '[...]'` and `--prompt '["...", "..."]'` are
+    captured at their stream timestamps and answered with the frame buffered at
+    prompt arrival;
+  - prompt execution is serialized, so later prompts can wait behind earlier
+    prefill/decode, but their selected frame remains the one captured at arrival.
+- `runner/media.py` now prepares `source_kind: streaming_video` manifests. In
+  single-buffer mode it writes both:
+  - `stream_frame_<idx>.png` for mtmd layout/tokenization;
+  - `stream_frame_<idx>.bin` for QNN hybrid vision encoding.
+- Streaming-specific manifest fields include:
+  - `source_fps`,
+  - `sampling_fps`,
+  - `duration_s`,
+  - `effective_duration_s`,
+  - `max_video_time`,
+  - `stream_mode: single_buffer`,
+  - `prompt_events`,
+  - per-frame `timestamp_s`, `video_frame_index`, and tile metadata.
+- `runner/cli.py` validates streaming arguments:
+  - `--streaming-video` is mutually exclusive with `--image` and `--video`;
+  - `--sampling-fps` must be positive;
+  - `--time` and JSON-list `--prompt` must have matching lengths;
+  - `--max-video-time` / `--max_video_time` caps sampled duration.
+- Result folder names now include `_streaming` for streaming runs, e.g.
+  `InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_kv16`.
+- Streaming artifacts:
+  - `stream_events.csv`: frame enqueue, `SingleBufferUpdate`, prompt arrival,
+    and prompt decode spans.
+  - `streaming_phase_stats.csv`: setup, frame-buffer, vision, mmproj, prefill,
+    and decode phase rows.
+  - `foundation_proc.csv`: normalized copy of streaming phase rows.
+  - `streaming_phase_timeline.png`: prompt timeline plot.
+  - `stream_response_<idx>.txt`, `stream_token_io_<idx>.txt`,
+    `stream_inference_tokens_<idx>.txt`: per-prompt output and token traces.
+- Initial Q8 2B hybrid streaming validation:
+  - command used `InternVL3-2B-Instruct-Q8_0.gguf`,
+    `mmproj-InternVL3-2B-Instruct-Q8_0.gguf`,
+    `--streaming-video sample_images/surveil_8.mp4`,
+    `--single-buffer`, `--sampling-fps 1.0`, `--max_video_time 15`,
+    prompts at `5s` and `8s`;
+  - result:
+    `my_research/foundation_llamacpp/results/log/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_kv16/`;
+  - `foundation_exit_code.txt=0`;
+  - QNN `V_Encode` rows were about `376 ms` and `373 ms`;
+  - Q8 produced normal text, unlike the Q4 2B run that repeated `</quad>`.
+
+## 2026-05-12: Streaming Hybrid Uses QNN Vision Encoder
+
+- The first single-buffer streaming prototype used the llama.cpp/OpenCL
+  multimodal path for prompt handling. The hybrid processor path has now been
+  corrected so `--processor hybrid --streaming-video --single-buffer` uses
+  ExecuTorch/QNN vision encoding.
+- Added reusable `VisionEncoderSession` in `vision_encoder_et.{hpp,cpp}`:
+  - loads the ExecuTorch/QNN module once;
+  - exposes `encode()` for per-frame image bin paths;
+  - exposes `encode_with_optional_warmup()` for a single startup warmup;
+  - preserves the existing `encode_images_with_executorch()` helper by
+    implementing it through the session.
+- `hybrid_streaming_decode` now:
+  - loads QNN `VisionEncoderSession` once at stream startup;
+  - warms it with the fixed Golden Gate bin when provided;
+  - loads the llama.cpp/mmproj decode context once;
+  - keeps chat history and KV state across prompt events;
+  - for each prompt, QNN-encodes only the selected buffered `.bin` frame;
+  - feeds the resulting pre-projector embedding through `eval_with_external_embedding()`;
+  - then calls `generate_response()` without clearing chat/KV state.
+- Timing bug fixed:
+  - raw ExecuTorch/QNN phase timestamps used a different timer origin, causing
+    very large values such as `1777880000` in `foundation_proc.csv`;
+  - streaming now rebases QNN `L_VisionLoad`, `ImageLoad`, and `V_Encode`
+    durations onto the llama.cpp `ggml_time_ms()` origin used by the rest of the
+    run.
+- Verified Q8/QNN streaming after the fix:
+  - `L_VisionLoad` appears near `0s`;
+  - prompt `ImageLoad` and `V_Encode` rows appear on the same stream execution
+    timeline as `LayoutTokenize`, `Mmproj`, `ImagePrefill`, `T_Prefill`, and `D`;
+  - no absolute-timestamp rows remain.
+
+## 2026-05-12: Streaming Multi-Turn Chat And Token Traces
+
+- Multi-turn streaming state:
+  - `hybrid_streaming_decode` no longer clears llama memory, sampler state,
+    `ctx.chat_history`, or `ctx.n_past` between prompts;
+  - assistant messages are appended in the shared generation helpers, matching
+    llama.cpp/mtmd multi-turn behavior;
+  - validation prompt 1 `What did I ask earlier???` answered that prompt 0 was
+    about the situation in the image.
+- Raw token tracing bug fixed:
+  - initial streaming trace code opened `foundation_inference_tokens.txt` for
+    each prompt, so later prompts truncated earlier raw token traces;
+  - streaming now writes per-turn raw traces to
+    `stream_inference_tokens_<idx>.txt`;
+  - `foundation_inference_tokens.txt` aggregates all per-turn raw traces with
+    `===== stream prompt <idx> @ <time>s =====` headers.
+- Follow-up flush/close fix:
+  - the first aggregate implementation copied `stream_inference_tokens_<idx>.txt`
+    while the trace writer still had the file open, so aggregate sections could
+    be truncated even when per-turn files were complete;
+  - `hybrid_streaming_decode` now closes the trace writer before reading the raw
+    trace into the aggregate.
+- `runner/cli.py::_pull_outputs()` now expands remote wildcard artifact names
+  such as `stream_inference_tokens_*.txt`, so per-turn token traces are pulled
+  into host result directories.
+
+## 2026-05-12: OpenCL Single-Buffer Streaming
+
+- Added OpenCL streaming support for
+  `--processor gpu --streaming-video ... --single-buffer`.
+- New C++ target:
+  - `opencl_streaming_decode`, built from `hybrid_streaming_decode.cpp`;
+  - compiles with `STREAMINGVLM_OPENCL_PHASE_MTMD_NO_MAIN=1`;
+  - includes `opencl_phase_mtmd.cpp` in-process;
+  - reuses llama.cpp/mtmd OpenCL full-vision encode, mmproj, prefill, and
+    decode while preserving the same streaming event model as hybrid.
+- Existing QNN target remains:
+  - `hybrid_streaming_decode` compiles with
+    `STREAMINGVLM_STREAMING_DECODE_USE_QNN=1` and
+    `STREAMINGVLM_HYBRID_DECODE_NO_MAIN=1`;
+  - it uses `VisionEncoderSession` and `hybrid_decode.cpp` in-process.
+- Runner changes:
+  - `--streaming-video` is now accepted for `--processor gpu` and
+    `--processor hybrid`;
+  - GPU streaming pushes/runs `opencl_streaming_decode`;
+  - Hybrid streaming pushes/runs `hybrid_streaming_decode`;
+  - both paths share `stream_events.csv`, `streaming_phase_stats.csv`,
+    `foundation_proc.csv`, `streaming_phase_timeline.png`, and per-turn token
+    trace finalization;
+  - `HYBRID_STREAMING_PULL_ARTIFACTS` includes both
+    `hybrid_streaming_stdout.txt` and `opencl_streaming_stdout.txt`.
+- Build validation:
+  - reconfigured `build-hybrid-android-opencl` after adding the new target;
+  - built `opencl_streaming_decode` and `hybrid_streaming_decode` successfully.
+- OpenCL streaming smoke:
+  - command used Q8 2B, `--max_video_time 10`, prompts at `5s` and `8s`;
+  - result:
+    `my_research/foundation_llamacpp/results/log/InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_streaming_kv16/`;
+  - `foundation_exit_code.txt=0`;
+  - `foundation_proc.csv` contains OpenCL `V_Encode`, `Mmproj`,
+    `ImagePrefill`, `T_Prefill`, and `D`;
+  - second-answer quality did not recall the earlier question as cleanly as the
+    hybrid QNN run, but execution and logs are correct.
+
+## 2026-05-12: Streaming Timeline Plot Uses Stream Time
+
+- Updated `runner/cli.py::_write_png_streaming_phase_timeline()` so the x-axis
+  is stream/video time rather than first-prompt-relative time.
+- The function reads `stream_events.csv`, derives the elapsed-time to video-time
+  offset from the first frame/buffer event, and converts all phase rows before
+  plotting.
+- Prompt markers are labeled like `Prompt 0 @ 5.0s`.
+- This avoids the confusing previous behavior where a prompt arriving at stream
+  time `3s` or `5s` was displayed at x-axis `0s`.
+- Regenerated current 2B Q8 hybrid and OpenCL streaming plots.
+
+## 2026-05-12: 8B Hybrid Streaming Validation
+
+- Ran hybrid single-buffer streaming with the available 8B weights:
+  - text model:
+    `llama.cpp/models/InternVL3-8B-Instruct-GGUF/InternVL3-8B-Instruct-Q4_K_M.gguf`;
+  - mmproj:
+    `llama.cpp/models/InternVL3-8B-Instruct-GGUF/mmproj-InternVL3-8B-Instruct-Q8_0.gguf`;
+  - QNN vision:
+    `my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte`;
+  - `--ctx-size 4096`, f16 KV, prompts at `5s` and `8s`.
+- Result:
+  `my_research/foundation_llamacpp/results/log/InternVL3-8B-Instruct-Q4_K_M_hybrid_ctx_4096_streaming_kv16/`.
+- Validation:
+  - `foundation_exit_code.txt=0`;
+  - QNN `V_Encode`: prompt 0 about `415 ms`, prompt 1 about `371 ms`;
+  - `ImagePrefill`: prompt 0 about `3973 ms`, prompt 1 about `4800 ms`;
+  - decode tokens mostly about `160-188 ms/token`;
+  - prompt 1 answered that the earlier question asked about the situation in the
+    image, confirming multi-turn state was preserved.

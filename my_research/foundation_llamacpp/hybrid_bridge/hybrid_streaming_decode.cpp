@@ -12,7 +12,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+#include "vision_encoder_et.hpp"
+#include "hybrid_decode.cpp"
+#else
 #include "opencl_phase_mtmd.cpp"
+#endif
 
 namespace {
 
@@ -254,6 +259,8 @@ class EventWriter {
 
 struct Args {
   std::string manifest = "media_manifest.json";
+  std::string encoder_path;
+  std::string warmup_image_path;
   std::string runner = "./opencl_phase_mtmd";
   std::string model;
   std::string mmproj;
@@ -309,7 +316,9 @@ Args parse_args(int argc, char** argv) {
     if (read_string("--stream-manifest", args.manifest) || read_string("--stream_manifest", args.manifest)) {
       continue;
     }
-    if (read_string("--runner", args.runner) || read_string("-m", args.model) || read_string("--model", args.model) ||
+    if (read_string("--encoder-path", args.encoder_path) || read_string("--encoder_path", args.encoder_path) ||
+        read_string("--warmup-image-path", args.warmup_image_path) || read_string("--warmup_image_path", args.warmup_image_path) ||
+        read_string("--runner", args.runner) || read_string("-m", args.model) || read_string("--model", args.model) ||
         read_string("--mmproj", args.mmproj) || read_string("--stream-events-path", args.stream_events_path) ||
         read_string("--stream_events_path", args.stream_events_path) || read_string("--phase-stats-path", args.phase_stats_path) ||
         read_string("--phase_stats_path", args.phase_stats_path) || read_string("--output", args.output_path) ||
@@ -390,6 +399,14 @@ std::vector<std::string> split_csv_line(const std::string& line) {
 
 std::string prompt_phase_path(int prompt_idx) {
   return "stream_prompt_phase_" + std::to_string(prompt_idx) + ".csv";
+}
+
+void write_stream_text_file(const std::string& path, const std::string& value) {
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+  streamingvlm::hybrid_bridge::write_text_file(path, value);
+#else
+  write_text_file(path, value);
+#endif
 }
 
 void append_phase_file(std::ofstream& out, const std::string& path) {
@@ -484,7 +501,7 @@ std::vector<char*> mutable_argv(std::vector<std::string>& args) {
   return out;
 }
 
-std::unique_ptr<decode_context> load_single_buffer_context(
+std::unique_ptr<decode_context> load_single_buffer_decoder_context(
     const Args& args,
     const Manifest& manifest,
     std::vector<PhaseTiming>& setup_phases) {
@@ -516,10 +533,114 @@ std::unique_ptr<decode_context> load_single_buffer_context(
   const long load_start_ms = now_ms();
   auto ctx = std::make_unique<decode_context>(params);
   setup_phases.push_back({"L_DecoderLoad", load_start_ms, now_ms()});
-  warmup_split_encoder_with_image(*ctx, warm_image);
   return ctx;
 }
 
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+std::unique_ptr<streamingvlm::hybrid_bridge::VisionEncoderSession> load_single_buffer_encoder_context(
+    const Args& args,
+    std::vector<PhaseTiming>& setup_phases) {
+  if (args.encoder_path.empty()) {
+    std::fprintf(stderr, "--encoder-path is required for QNN single-buffer streaming\n");
+    std::exit(2);
+  }
+  const long load_start_ms = now_ms();
+  auto encoder = std::make_unique<streamingvlm::hybrid_bridge::VisionEncoderSession>(args.encoder_path);
+  setup_phases.push_back({"L_VisionLoad", load_start_ms, now_ms()});
+  if (!args.warmup_image_path.empty()) {
+    (void)encoder->encode_with_optional_warmup({}, args.warmup_image_path);
+  }
+  return encoder;
+}
+#endif
+
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+int run_single_buffer_prompt(
+    const Args& args,
+    decode_context& ctx,
+    streamingvlm::hybrid_bridge::VisionEncoderSession& encoder,
+    const FrameRecord& frame,
+    const PromptEvent& prompt,
+    int prompt_idx,
+    long origin_ms) {
+  const std::string bin = frame.tiles.empty() ? "" : frame.tiles.front().bin;
+  const std::string image = frame.tiles.empty() ? "" : frame.tiles.front().layout_image;
+  if (bin.empty()) {
+    std::fprintf(stderr, "frame %d has no QNN input bin for single-buffer mode\n", frame.index);
+    return 2;
+  }
+  if (image.empty()) {
+    std::fprintf(stderr, "frame %d has no layout image for single-buffer mode\n", frame.index);
+    return 2;
+  }
+  const std::string token_io = "stream_token_io_" + std::to_string(prompt_idx) + ".txt";
+  const std::string inference_tokens = "stream_inference_tokens_" + std::to_string(prompt_idx) + ".txt";
+  const std::string phase_path = prompt_phase_path(prompt_idx);
+
+  streamingvlm::hybrid_bridge::phase_recorder prompt_phases(
+      phase_path,
+      origin_ms,
+      streamingvlm::hybrid_bridge::hybrid_decode_phase_description());
+  common_chat_msg msg;
+  std::string prompt_text = prompt.prompt;
+  if (prompt_text.find(mtmd_default_marker()) == std::string::npos) {
+    prompt_text = std::string(mtmd_default_marker()) + prompt_text;
+  }
+  msg.role = "user";
+  msg.content = prompt_text;
+
+  std::unique_ptr<streamingvlm::hybrid_bridge::inference_trace_collector> trace_writer;
+  if (!token_io.empty()) {
+    trace_writer = std::make_unique<streamingvlm::hybrid_bridge::inference_trace_collector>(
+        inference_tokens);
+  }
+
+  const long vision_start_ms = now_ms();
+  auto vision = encoder.encode({bin});
+  long cursor_ms = vision_start_ms;
+  const long image_load_ms = vision.image_load_end_ms - vision.image_load_start_ms;
+  if (image_load_ms > 0) {
+    prompt_phases.row("ImageLoad", cursor_ms, cursor_ms + image_load_ms);
+    cursor_ms += image_load_ms;
+  }
+  for (const auto& range : vision.encode_ranges) {
+    const long encode_ms = range.second - range.first;
+    if (encode_ms > 0) {
+      prompt_phases.row("V_Encode", cursor_ms, cursor_ms + encode_ms);
+      cursor_ms += encode_ms;
+    }
+  }
+  streamingvlm::hybrid_bridge::EmbeddingFile embedding;
+  embedding.shape = vision.output_shape;
+  embedding.values = std::move(vision.values);
+
+  int rc = 0;
+  if (eval_with_external_embedding(ctx, prompt_text, {image}, embedding, prompt_phases, nullptr, trace_writer.get()) != 0) {
+    rc = 1;
+  } else {
+    const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
+    const std::string generated_text =
+        generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
+    write_stream_text_file("stream_response_" + std::to_string(prompt_idx) + ".txt", generated_text);
+    std::string token_io_doc = std::string("User: ") + prompt.prompt + "\nAssistant: " + generated_text + "\n";
+    if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+      token_io_doc += trace_writer->format_token_io_appendix();
+    }
+    write_stream_text_file(token_io, token_io_doc);
+    trace_writer.reset();
+    std::ofstream aggregate("foundation_inference_tokens.txt", std::ios::app);
+    std::ifstream raw_trace(inference_tokens);
+    if (aggregate && raw_trace) {
+      aggregate << "\n===== stream prompt " << prompt_idx << " @ " << prompt.timestamp_s << "s =====\n";
+      aggregate << "image: " << image << "\n";
+      aggregate << "user: " << prompt.prompt << "\n\n";
+      aggregate << raw_trace.rdbuf();
+      aggregate << "\n";
+    }
+  }
+  return rc;
+}
+#else
 int run_single_buffer_prompt(
     const Args& args,
     decode_context& ctx,
@@ -529,16 +650,12 @@ int run_single_buffer_prompt(
     long origin_ms) {
   const std::string image = frame.tiles.empty() ? "" : frame.tiles.front().layout_image;
   if (image.empty()) {
-    std::fprintf(stderr, "frame %d has no layout image for single-buffer mode\n", frame.index);
+    std::fprintf(stderr, "frame %d has no layout image for OpenCL single-buffer mode\n", frame.index);
     return 2;
   }
   const std::string token_io = "stream_token_io_" + std::to_string(prompt_idx) + ".txt";
+  const std::string inference_tokens = "stream_inference_tokens_" + std::to_string(prompt_idx) + ".txt";
   const std::string phase_path = prompt_phase_path(prompt_idx);
-
-  llama_memory_clear(llama_get_memory(ctx.lctx), true);
-  common_sampler_reset(ctx.smpl);
-  ctx.chat_history.clear();
-  ctx.n_past = 0;
 
   streamingvlm::hybrid_bridge::phase_recorder prompt_phases(
       phase_path,
@@ -555,7 +672,7 @@ int run_single_buffer_prompt(
   std::unique_ptr<streamingvlm::hybrid_bridge::inference_trace_collector> trace_writer;
   if (!token_io.empty()) {
     trace_writer = std::make_unique<streamingvlm::hybrid_bridge::inference_trace_collector>(
-        streamingvlm::hybrid_bridge::sibling_foundation_inference_tokens_path(token_io));
+        inference_tokens);
   }
 
   int rc = 0;
@@ -565,15 +682,26 @@ int run_single_buffer_prompt(
     const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
     const std::string generated_text =
         generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
-    write_text_file("stream_response_" + std::to_string(prompt_idx) + ".txt", generated_text);
+    write_stream_text_file("stream_response_" + std::to_string(prompt_idx) + ".txt", generated_text);
     std::string token_io_doc = std::string("User: ") + prompt.prompt + "\nAssistant: " + generated_text + "\n";
     if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
       token_io_doc += trace_writer->format_token_io_appendix();
     }
-    write_text_file(token_io, token_io_doc);
+    write_stream_text_file(token_io, token_io_doc);
+    trace_writer.reset();
+    std::ofstream aggregate("foundation_inference_tokens.txt", std::ios::app);
+    std::ifstream raw_trace(inference_tokens);
+    if (aggregate && raw_trace) {
+      aggregate << "\n===== stream prompt " << prompt_idx << " @ " << prompt.timestamp_s << "s =====\n";
+      aggregate << "image: " << image << "\n";
+      aggregate << "user: " << prompt.prompt << "\n\n";
+      aggregate << raw_trace.rdbuf();
+      aggregate << "\n";
+    }
   }
   return rc;
 }
+#endif
 
 void append_file_to_output(
     const std::string& output_path,
@@ -620,7 +748,10 @@ int main(int argc, char** argv) {
 
   const long origin_ms = now_ms();
   std::vector<PhaseTiming> setup_phases;
-  auto decode_ctx = load_single_buffer_context(args, manifest, setup_phases);
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+  auto encoder_ctx = load_single_buffer_encoder_context(args, setup_phases);
+#endif
+  auto decode_ctx = load_single_buffer_decoder_context(args, manifest, setup_phases);
 
   EventWriter events(args.stream_events_path);
   std::ofstream phases(args.phase_stats_path);
@@ -731,7 +862,11 @@ int main(int argc, char** argv) {
         job.prompt.prompt);
     append_phase_row(phases, "StreamPromptPrefill", job.event_ms, job.event_ms, origin_ms);
     const long decode_start_ms = now_ms();
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+    const int rc = run_single_buffer_prompt(args, *decode_ctx, *encoder_ctx, job.frame, job.prompt, job.prompt_idx, origin_ms);
+#else
     const int rc = run_single_buffer_prompt(args, *decode_ctx, job.frame, job.prompt, job.prompt_idx, origin_ms);
+#endif
     const long decode_end_ms = now_ms();
     append_phase_file(phases, prompt_phase_path(job.prompt_idx));
     const std::string response_path = "stream_response_" + std::to_string(job.prompt_idx) + ".txt";

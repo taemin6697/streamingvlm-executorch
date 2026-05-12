@@ -20,11 +20,13 @@ HYBRID_PULL_ARTIFACTS = (
 
 HYBRID_STREAMING_PULL_ARTIFACTS = (
     "hybrid_streaming_stdout.txt",
+    "opencl_streaming_stdout.txt",
     "foundation_output.txt",
     "stream_events.csv",
     "streaming_phase_stats.csv",
     "foundation_token_io.txt",
     "foundation_inference_tokens.txt",
+    "stream_inference_tokens_*.txt",
     "media_manifest.json",
     "foundation_exit_code.txt",
     "android_memory_timeline.csv",

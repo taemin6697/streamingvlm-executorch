@@ -241,8 +241,11 @@ def prepare_streaming_video_media(
         timestamp_s = frame_index / source_fps
         image = Image.fromarray(vr[int(frame_index)].asnumpy()).convert("RGB")
         if single_buffer:
+            frame_bin = work_dir / f"stream_frame_{stream_i:04d}.bin"
             layout_image = work_dir / f"stream_frame_{stream_i:04d}.png"
+            normalize_image_to_bin(image, frame_bin)
             image.save(layout_image)
+            frame_bins.append(frame_bin)
             layout_images.append(layout_image)
             num_patches_list.append(1)
             frame_records.append(
@@ -251,7 +254,7 @@ def prepare_streaming_video_media(
                     "timestamp_s": round(timestamp_s, 6),
                     "video_frame_index": int(frame_index),
                     "num_patches": 1,
-                    "tiles": [{"layout_image": layout_image.name}],
+                    "tiles": [{"bin": frame_bin.name, "layout_image": layout_image.name}],
                 }
             )
             continue

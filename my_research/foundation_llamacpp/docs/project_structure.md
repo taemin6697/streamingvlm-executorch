@@ -34,7 +34,7 @@ The current refactor separates three axes that were previously mixed together:
 
 ```text
 media mode:
-  text, image, video_file, future streaming
+  text, image, video_file, streaming
 
 backend mode:
   cpu, opencl, hybrid_qnn_opencl
@@ -167,11 +167,11 @@ frame_indices:
   source video frame indices for video_file mode
 
 source_kind:
-  "image" or "video"
+  "image", "video", or "streaming_video"
 ```
-
-`MediaMode.STREAMING` is reserved for later incremental frame ingestion. The
-current video mode is offline sampling from a video file.
+`MediaMode.STREAMING` is the file-backed streaming simulator path. It is
+separate from `MediaMode.VIDEO_FILE`, which still means offline sampled frames
+that are all presented to the model at once.
 
 ### `runner/media.py`
 
@@ -189,7 +189,7 @@ input image
   -> write media_manifest.json
 ```
 
-For video mode:
+For video-file mode:
 
 ```text
 input video
@@ -227,6 +227,46 @@ embedding shape is:
 8 x 256 x 4096
 ```
 
+For streaming video mode:
+
+```text
+input video
+  -> decord.VideoReader
+  -> sample frames at --sampling-fps up to optional --max-video-time
+  -> write stream_frame_<idx>.png layout images
+  -> in hybrid single-buffer mode, also write stream_frame_<idx>.bin QNN tensors
+  -> record prompt events from --time and JSON-list --prompt
+  -> write media_manifest.json with source_kind: streaming_video
+```
+
+Streaming manifest fields include:
+
+```text
+source_fps:
+  source video FPS read by decord
+
+sampling_fps:
+  replay/sample FPS requested by CLI
+
+duration_s / effective_duration_s / max_video_time:
+  original and clipped stream duration
+
+stream_mode:
+  currently "single_buffer"
+
+frames:
+  stream_frame index, timestamp_s, video_frame_index, num_patches, and tile files
+
+prompt_events:
+  prompt timestamp_s and prompt text
+```
+
+In `--single-buffer`, `SingleBufferUpdate` means the current frame pointer is
+replaced with the latest sampled frame. It does not pop from an accumulated
+queue. Prompt events capture the buffered frame at arrival time; the actual
+prompt execution lane is serialized, so a prompt may wait behind an earlier
+decode.
+
 ### `runner/remote.py`
 
 `remote.py` contains small adb and shell helpers:
@@ -262,6 +302,22 @@ media_manifest.json
 foundation_exit_code.txt
 vision_exit_code.txt
 decoder_exit_code.txt
+android_memory_timeline.csv
+```
+
+Streaming pulls:
+
+```text
+hybrid_streaming_stdout.txt
+opencl_streaming_stdout.txt
+foundation_output.txt
+stream_events.csv
+streaming_phase_stats.csv
+foundation_token_io.txt
+foundation_inference_tokens.txt
+stream_inference_tokens_*.txt
+media_manifest.json
+foundation_exit_code.txt
 android_memory_timeline.csv
 ```
 
@@ -325,6 +381,7 @@ my_research/foundation_llamacpp/hybrid_bridge/
   CMakeLists.txt
   hybrid_decode.cpp
   opencl_phase_mtmd.cpp
+  hybrid_streaming_decode.cpp
   hybrid_vision_dump.cpp
   hybrid_embedding_file.h
   hybrid_embedding_file.cpp
@@ -398,6 +455,61 @@ Responsibilities:
   concatenate output features
   write `vision_embedding.svlmemb`
   write vision stats and phase rows
+```
+
+`hybrid_streaming_decode`
+
+```text
+Purpose:
+  hybrid QNN single-buffer streaming runner.
+
+Compile mode:
+  STREAMINGVLM_STREAMING_DECODE_USE_QNN=1
+  STREAMINGVLM_HYBRID_DECODE_NO_MAIN=1
+
+Inputs:
+  text GGUF
+  mmproj GGUF
+  QNN/ExecuTorch vision PTE
+  streaming media_manifest.json
+  stream_frame_<idx>.bin / stream_frame_<idx>.png files
+
+Responsibilities:
+  load QNN VisionEncoderSession once
+  optionally warm QNN vision once with fixed warmup bin
+  load llama.cpp/mmproj decode context once
+  replay sampled frame arrivals according to manifest timestamps
+  maintain a single latest-frame buffer
+  capture prompt events against the current buffered frame
+  QNN-encode only the selected frame per prompt
+  run decoder-side mmproj, prefill, and decode
+  preserve chat history and KV state across prompts
+  write stream events, phase rows, output, and per-turn token traces
+```
+
+`opencl_streaming_decode`
+
+```text
+Purpose:
+  standalone OpenCL single-buffer streaming runner.
+
+Compile mode:
+  STREAMINGVLM_OPENCL_PHASE_MTMD_NO_MAIN=1
+
+Inputs:
+  text GGUF
+  mmproj GGUF
+  streaming media_manifest.json
+  stream_frame_<idx>.png files
+
+Responsibilities:
+  include opencl_phase_mtmd.cpp in-process
+  load llama.cpp/mtmd OpenCL context once
+  replay sampled frame arrivals with the same single-buffer event model
+  capture prompt events against the current buffered frame
+  run llama.cpp/mtmd OpenCL vision encode + mmproj + prefill + decode
+  preserve chat history and KV state across prompts
+  write the same streaming artifacts as hybrid
 ```
 
 ### Shared C++ Helpers
@@ -500,6 +612,9 @@ T_Prefill:
 Owns ExecuTorch/QNN vision encode logic:
 
 ```text
+VisionEncoderSession:
+  reusable ExecuTorch/QNN module session for streaming
+
 parse comma-separated image paths
 validate group sizes
 load ExecuTorch module
@@ -513,6 +628,8 @@ write vision_output_stats.csv
 ```
 
 `hybrid_vision_dump.cpp` should remain a thin CLI wrapper around this module.
+Streaming code should use `VisionEncoderSession` instead of constructing a new
+ExecuTorch module per prompt.
 
 ## Runtime Flows
 
@@ -574,6 +691,48 @@ Frame 2 marker -> embedding slice 1
 Frame N marker -> embedding slice N - 1
 ```
 
+### Streaming Single-Buffer OpenCL
+
+```text
+run_android_hybrid_bridge.py --processor gpu --streaming-video ... --single-buffer
+  -> runner.media.prepare_streaming_video_media
+  -> push streaming media_manifest.json and stream_frame_<idx>.png layout images
+  -> run opencl_streaming_decode
+  -> opencl_streaming_decode loads llama.cpp/mtmd OpenCL context once
+  -> producer thread replays sampled frame timestamps
+  -> SingleBufferUpdate replaces current frame pointer
+  -> prompt job records current frame at arrival time
+  -> consumer lane serially runs eval_message() and generate_response()
+  -> output stream_events.csv, streaming_phase_stats.csv, per-turn token traces
+  -> runner finalizes foundation_proc.csv and streaming_phase_timeline.png
+```
+
+OpenCL streaming uses llama.cpp/mtmd for `V_Encode` and `Mmproj`. It is useful
+as a direct full-OpenCL baseline for the hybrid QNN streaming path.
+
+### Streaming Single-Buffer Hybrid
+
+```text
+run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --single-buffer
+  -> runner.media.prepare_streaming_video_media
+  -> push media_manifest.json, stream_frame_<idx>.png, stream_frame_<idx>.bin
+  -> run hybrid_streaming_decode
+  -> hybrid_streaming_decode loads VisionEncoderSession once
+  -> hybrid_streaming_decode loads llama.cpp/mmproj context once
+  -> producer thread replays sampled frame timestamps
+  -> SingleBufferUpdate replaces current frame pointer
+  -> prompt job records current frame at arrival time
+  -> consumer lane serially QNN-encodes the selected .bin frame
+  -> eval_with_external_embedding() runs decoder-side mmproj and prefill
+  -> generate_response() decodes with preserved chat/KV state
+  -> output stream_events.csv, streaming_phase_stats.csv, per-turn token traces
+  -> runner finalizes foundation_proc.csv and streaming_phase_timeline.png
+```
+
+Hybrid streaming QNN phase timing is rebased onto the llama.cpp `ggml_time_ms()`
+timeline. This avoids mixing ExecuTorch absolute timestamps with llama.cpp
+elapsed timestamps.
+
 ## Result Artifacts
 
 Each run writes under:
@@ -616,6 +775,32 @@ memory_timeline_plot.png:
   memory timeline plot when matplotlib is available
 ```
 
+Streaming artifacts:
+
+```text
+stream_events.csv:
+  frame enqueue, SingleBufferUpdate, prompt arrival, and prompt decode spans
+
+streaming_phase_stats.csv:
+  setup, buffer update, vision, mmproj, prefill, and decode phase rows
+
+streaming_phase_timeline.png:
+  horizontal prompt timeline plot. X-axis is stream/video time, not first-prompt
+  relative time.
+
+stream_response_<idx>.txt:
+  assistant response for one prompt event
+
+stream_token_io_<idx>.txt:
+  compact per-turn user/assistant and token appendix
+
+stream_inference_tokens_<idx>.txt:
+  raw per-turn mtmd/GGUF token trace
+
+foundation_inference_tokens.txt:
+  aggregate of all streaming turns with prompt headers
+```
+
 Hybrid-only artifacts:
 
 ```text
@@ -645,7 +830,7 @@ Build the Android bridge from the active Android build directory:
 
 ```bash
 cmake --build my_research/foundation_llamacpp/build-hybrid-android-opencl \
-  --target hybrid_decode opencl_phase_mtmd hybrid_vision_dump -j2
+  --target hybrid_decode opencl_phase_mtmd opencl_streaming_decode hybrid_streaming_decode hybrid_vision_dump -j2
 ```
 
 Use temporary host build directories for host compile checks. Do not rely on or
@@ -655,10 +840,11 @@ The CMake options are:
 
 ```text
 HYBRID_BRIDGE_BUILD_LLAMA_DECODER:
-  builds hybrid_decode and opencl_phase_mtmd against llama.cpp
+  builds hybrid_decode, opencl_phase_mtmd, opencl_streaming_decode, and the
+  llama.cpp side of hybrid_streaming_decode
 
 HYBRID_BRIDGE_BUILD_EXECUTORCH_VISION:
-  builds hybrid_vision_dump against ExecuTorch/QNN
+  builds hybrid_vision_dump and links QNN support into hybrid_streaming_decode
 ```
 
 ## Extension Guidelines
@@ -700,15 +886,20 @@ When changing C++ bridge behavior:
 7. Run at least one image or video smoke test when prompt/media layout changes.
 ```
 
-When adding streaming later:
+When changing streaming:
 
 ```text
-1. Do not overload video_file semantics. Video_file is offline sampled frames.
-2. Streaming should have an explicit state model for append/evict behavior.
-3. Manifest schema should add timestamps or stream sequence ids.
-4. Decoder context retention/eviction must be explicit; do not hide it inside
-   image/video preparation helpers.
-5. Start with interfaces and artifact contracts before optimizing scheduling.
+1. Keep video_file and streaming semantics separate. Video_file is offline
+   sampled frames; streaming is timestamped replay with prompt events.
+2. Preserve the explicit state model. Current mode is single latest-frame buffer.
+3. Keep prompt arrival timestamp, selected buffered frame, and actual execution
+   start distinguishable in stream_events.csv.
+4. Decoder context retention/eviction must remain explicit. Current streaming
+   mode preserves chat history and KV across prompt events.
+5. Keep OpenCL and Hybrid streaming artifacts aligned so their timelines can be
+   compared.
+6. If adding persistent prefill or vision-encoder-only streaming, add new mode
+   flags instead of changing --single-buffer semantics silently.
 ```
 
 ## Known Current Gaps

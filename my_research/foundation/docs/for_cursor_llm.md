@@ -105,6 +105,20 @@ inside every prompt latency.
 for `--streaming-video`. Media preparation samples only up to that many seconds
 and records both `duration_s` and `effective_duration_s` in `media_manifest.json`.
 
+Follow-up: streaming prompt handling follows llama.cpp `mtmd-cli` multi-turn
+semantics. `hybrid_streaming_decode` keeps llama KV state and `chat_history`
+across prompt events; `opencl_phase_mtmd`'s shared `generate_response()` appends
+the generated assistant message back into `chat_history`, matching
+`llama.cpp/tools/mtmd/mtmd-cli.cpp`.
+
+Correction: `--processor hybrid --streaming-video --single-buffer` must use the
+hybrid QNN vision path, not llama.cpp OpenCL vision encode. The streaming media
+manifest now includes QNN input `.bin` files for each sampled frame, and
+`hybrid_streaming_decode` accepts `--encoder-path`, loads an ExecuTorch/QNN
+`VisionEncoderSession` once at startup, encodes the current buffered frame with
+QNN at prompt time, and feeds that external embedding through the same
+decoder-side mmproj/image-prefill path as `hybrid_decode`.
+
 ### 2026-05-12. Streaming video understanding survey archive
 
 Added `docs/archive/awesome_streaming_video_understanding_survey.md`: curated snapshot of
@@ -3269,3 +3283,70 @@ segment; only after IDs match is it worthwhile to blame sampling, KV dtype, or k
   `.svlmemb` stats were non-zero (`mean -0.1406`, `std 1.0058`, `norm 1039.9`) and the caption was
   correct: two cats on a pink blanket with remote controls. Use both `--force-push` and
   `--model-push` when swapping PTE artifacts because remote filenames are identical.
+
+## foundation_llamacpp: streaming token trace aggregation fix (2026-05-12)
+
+- Fixed `hybrid_streaming_decode` raw token tracing for multi-turn single-buffer streaming. Previously
+  each prompt constructed an `inference_trace_collector` pointing at the shared
+  `foundation_inference_tokens.txt`, so later turns truncated earlier raw token traces even though
+  multi-turn chat state was preserved.
+- Streaming now writes per-turn raw traces as `stream_inference_tokens_<idx>.txt` and appends them to
+  `foundation_inference_tokens.txt` with `stream prompt <idx>` headers. This keeps both the aggregate
+  trace and turn-specific raw files.
+- `runner/cli.py` now pulls wildcard artifacts by expanding remote filenames, and the streaming pull
+  artifact list includes `stream_inference_tokens_*.txt`. The remote cleanup also removes stale
+  `stream_inference_tokens_*.txt` before each run.
+- Verified with Q8/QNN single-buffer streaming prompts `What is this situation?` and
+  `What did I ask earlier???`; `foundation_inference_tokens.txt` contains both prompt 0 and prompt 1
+  sections, and the result directory includes `stream_inference_tokens_0.txt` and
+  `stream_inference_tokens_1.txt`.
+- Follow-up fix: the first aggregate implementation copied each per-turn raw trace while its
+  `inference_trace_collector` still had the file open, so `foundation_inference_tokens.txt` could
+  contain truncated prompt sections even though `stream_inference_tokens_<idx>.txt` was complete.
+  `hybrid_streaming_decode` now resets the trace writer before reading the raw trace into the
+  aggregate. Re-verified that the aggregate contains complete prompt 0 and prompt 1 prefill/decode
+  sections.
+
+## foundation_llamacpp: README run guide restructure (2026-05-12)
+
+- Rewrote `my_research/foundation_llamacpp/docs/README.md` around execution modes requested by the
+  user: single text, image, offline video, streaming video, vision tower export, phase names, and
+  miscellaneous runtime notes.
+- Each input section now lists CPU/GPU/Hybrid support explicitly. Text-only documents CPU/GPU only;
+  streaming video documents hybrid-only because runner validation rejects `--streaming-video` for
+  CPU/GPU.
+- Updated examples to use the current Q8 2B model paths for active image/video/streaming smoke tests,
+  the QNN realweights pre-projector PTE, `--single-buffer`, `--sampling-fps`, `--max_video_time`,
+  multi-turn streaming prompts, and the per-turn streaming token trace artifacts.
+
+## foundation_llamacpp: OpenCL single-buffer streaming support (2026-05-12)
+
+- Added `opencl_streaming_decode`, built from `hybrid_streaming_decode.cpp` with
+  `STREAMINGVLM_OPENCL_PHASE_MTMD_NO_MAIN=1`. It includes `opencl_phase_mtmd.cpp` in-process and
+  reuses llama.cpp/mtmd OpenCL full-vision encode + mmproj + decode while preserving the same
+  `--single-buffer` streaming event semantics as hybrid QNN streaming.
+- Kept `hybrid_streaming_decode` as the QNN path via `STREAMINGVLM_STREAMING_DECODE_USE_QNN=1` and
+  `STREAMINGVLM_HYBRID_DECODE_NO_MAIN=1`; QNN streaming still loads/warmups
+  `VisionEncoderSession` once and encodes the selected buffered frame per prompt.
+- Updated `run_android_hybrid_bridge.py` validation/orchestration so `--processor gpu
+  --streaming-video ... --single-buffer` is accepted. GPU streaming pushes/runs
+  `opencl_streaming_decode`, pulls `opencl_streaming_stdout.txt`, and finalizes with the same
+  streaming CSV/plot artifacts as hybrid.
+- Reconfigured and rebuilt `build-hybrid-android-opencl`; `opencl_streaming_decode` and
+  `hybrid_streaming_decode` both build successfully.
+- Smoke tested OpenCL streaming with Q8 2B, `--max_video_time 10`, prompts at 5s and 8s. Result:
+  `my_research/foundation_llamacpp/results/log/InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_streaming_kv16/`,
+  `foundation_exit_code.txt=0`, `foundation_proc.csv` includes OpenCL `V_Encode`/`Mmproj`/prefill/decode,
+  and `foundation_output.txt` is produced. The second answer quality differed from hybrid QNN
+  multi-turn, but execution and logging succeeded.
+
+## foundation_llamacpp: streaming timeline uses stream time (2026-05-12)
+
+- Updated `runner/cli.py::_write_png_streaming_phase_timeline` so
+  `streaming_phase_timeline.png` uses stream/video time on the x-axis instead of rebasing the first
+  prompt arrival to `0s`. The function now reads `stream_events.csv`, derives the elapsed-to-video
+  time offset from the first frame/buffer event, and plots prompt markers as `Prompt <idx> @ <time>s`.
+- Regenerated timeline plots for the current Q8 hybrid and OpenCL streaming result directories.
+  A prompt at stream time 3s/5s/8s should now appear at 3s/5s/8s on the plot rather than at 0s.
+- Updated `my_research/foundation_llamacpp/docs/README.md` to state that streaming timeline x-axis
+  labels are stream/video time, not first-prompt-relative time.

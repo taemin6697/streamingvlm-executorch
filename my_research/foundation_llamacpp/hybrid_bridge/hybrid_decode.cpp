@@ -477,6 +477,10 @@ std::string generate_response(
     const long token_decode_end_ms = ggml_time_ms();
     phases.row("D", token_decode_start_ms, token_decode_end_ms, i);
   }
+  common_chat_msg msg;
+  msg.role = "assistant";
+  msg.content = generated_text;
+  ctx.chat_history.push_back(std::move(msg));
   return generated_text;
 }
 
@@ -489,6 +493,7 @@ void show_usage(int, char** argv) {
 
 } // namespace
 
+#ifndef STREAMINGVLM_HYBRID_DECODE_NO_MAIN
 int main(int argc, char** argv) {
   std::setlocale(LC_NUMERIC, "C");
   ggml_time_init();
@@ -570,3 +575,4 @@ int main(int argc, char** argv) {
   llama_perf_context_print(ctx.lctx);
   return 0;
 }
+#endif

@@ -10,6 +10,7 @@
 
 #include <cinttypes>
 #include <fstream>
+#include <memory>
 #include <sstream>
 
 namespace streamingvlm::hybrid_bridge {
@@ -81,57 +82,59 @@ void validate_group_sizes(const std::vector<size_t>& group_sizes, size_t n_input
       n_inputs);
 }
 
-VisionEncodeResult encode_images_with_executorch(
-    const std::string& encoder_path,
-    const std::vector<std::string>& image_paths,
-    const std::string& warmup_image_path) {
-  VisionEncodeResult result;
-  result.load_start_ms = executorch::extension::llm::time_in_ms();
-  Module encoder_module(
-      encoder_path, Module::LoadMode::MmapUseMlockIgnoreErrors);
-  example::EncoderRunner encoder(&encoder_module);
-  ET_CHECK_MSG(
-      encoder.load() == executorch::runtime::Error::Ok,
-      "Failed to load encoder module.");
-  result.load_end_ms = executorch::extension::llm::time_in_ms();
+struct VisionEncoderSession::Impl {
+  Module encoder_module;
+  example::EncoderRunner encoder;
+  std::vector<int32_t> expected_size;
+  ScalarType expected_dtype;
+  std::vector<int64_t> input_shape;
+  long load_start_ms = 0;
+  long load_end_ms = 0;
 
-  Result<MethodMeta> method_meta = encoder_module.method_meta("forward");
-  ET_CHECK_MSG(method_meta.ok(), "Failed to read encoder method metadata.");
-  auto input_meta = method_meta->input_tensor_meta(0);
-  ET_CHECK_MSG(input_meta.ok(), "Failed to read encoder input metadata.");
-  std::vector<int32_t> expected_size(
-      input_meta->sizes().begin(), input_meta->sizes().end());
-  result.input_shape.assign(input_meta->sizes().begin(), input_meta->sizes().end());
-  const ScalarType expected_dtype = input_meta->scalar_type();
+  explicit Impl(const std::string& encoder_path)
+      : encoder_module(encoder_path, Module::LoadMode::MmapUseMlockIgnoreErrors),
+        encoder(&encoder_module) {
+    load_start_ms = executorch::extension::llm::time_in_ms();
+    ET_CHECK_MSG(
+        encoder.load() == executorch::runtime::Error::Ok,
+        "Failed to load encoder module.");
+    load_end_ms = executorch::extension::llm::time_in_ms();
+
+    Result<MethodMeta> method_meta = encoder_module.method_meta("forward");
+    ET_CHECK_MSG(method_meta.ok(), "Failed to read encoder method metadata.");
+    auto input_meta = method_meta->input_tensor_meta(0);
+    ET_CHECK_MSG(input_meta.ok(), "Failed to read encoder input metadata.");
+    expected_size.assign(input_meta->sizes().begin(), input_meta->sizes().end());
+    input_shape.assign(input_meta->sizes().begin(), input_meta->sizes().end());
+    expected_dtype = input_meta->scalar_type();
+  }
+};
+
+VisionEncoderSession::VisionEncoderSession(const std::string& encoder_path)
+    : impl_(std::make_unique<Impl>(encoder_path)) {}
+
+VisionEncoderSession::~VisionEncoderSession() = default;
+
+long VisionEncoderSession::load_start_ms() const {
+  return impl_->load_start_ms;
+}
+
+long VisionEncoderSession::load_end_ms() const {
+  return impl_->load_end_ms;
+}
+
+VisionEncodeResult VisionEncoderSession::encode(const std::vector<std::string>& image_paths) {
+  VisionEncodeResult result;
+  result.load_start_ms = impl_->load_start_ms;
+  result.load_end_ms = impl_->load_end_ms;
+  result.input_shape = impl_->input_shape;
 
   result.image_load_start_ms = executorch::extension::llm::time_in_ms();
   std::vector<executorch::extension::llm::Image> images(image_paths.size());
   for (size_t i = 0; i < image_paths.size(); ++i) {
-    example::load_image(image_paths[i], images[i], expected_size, expected_dtype);
-  }
-  executorch::extension::llm::Image warmup_image;
-  bool has_warmup_image = !warmup_image_path.empty();
-  if (has_warmup_image) {
-    example::load_image(warmup_image_path, warmup_image, expected_size, expected_dtype);
+    example::load_image(image_paths[i], images[i], impl_->expected_size, impl_->expected_dtype);
   }
   result.image_load_end_ms = executorch::extension::llm::time_in_ms();
-
-  if (has_warmup_image) {
-    auto warmup_tensor_res = warmup_image.toTensor(/*with_batch=*/true);
-    auto warmup_res = encoder.encode(warmup_tensor_res.get());
-    ET_CHECK_MSG(warmup_res.ok(), "Encoder warmup execution failed for %s.", warmup_image_path.c_str());
-    Tensor warmup_output = warmup_res.get();
-    ET_CHECK_MSG(
-        warmup_output.scalar_type() == ScalarType::Float,
-        "Hybrid bridge expects float32 warmup encoder output.");
-    result.warmup_output_shape = tensor_shape(warmup_output);
-    const size_t warmup_values = product(result.warmup_output_shape);
-    const float* warmup_output_data = warmup_output.const_data_ptr<float>();
-    result.warmup_values.insert(
-        result.warmup_values.end(),
-        warmup_output_data,
-        warmup_output_data + warmup_values);
-  }
 
   std::vector<int64_t> per_input_shape;
   int64_t feature_dim = 0;
@@ -141,7 +144,7 @@ VisionEncodeResult encode_images_with_executorch(
     auto image_tensor_res = images[i].toTensor(/*with_batch=*/true);
     auto image_tensor_ptr = image_tensor_res.get();
     const long start_ms = executorch::extension::llm::time_in_ms();
-    auto encode_res = encoder.encode(image_tensor_ptr);
+    auto encode_res = impl_->encoder.encode(image_tensor_ptr);
     ET_CHECK_MSG(encode_res.ok(), "Encoder execution failed for input %zu.", i);
     const long end_ms = executorch::extension::llm::time_in_ms();
     result.encode_total_ms += end_ms - start_ms;
@@ -184,6 +187,42 @@ VisionEncodeResult encode_images_with_executorch(
     result.output_shape = {static_cast<int64_t>(image_paths.size()), tokens_per_input, feature_dim};
   }
   return result;
+}
+
+VisionEncodeResult VisionEncoderSession::encode_with_optional_warmup(
+    const std::vector<std::string>& image_paths,
+    const std::string& warmup_image_path) {
+  VisionEncodeResult result;
+  if (!warmup_image_path.empty()) {
+    executorch::extension::llm::Image warmup_image;
+    example::load_image(warmup_image_path, warmup_image, impl_->expected_size, impl_->expected_dtype);
+    auto warmup_tensor_res = warmup_image.toTensor(/*with_batch=*/true);
+    auto warmup_res = impl_->encoder.encode(warmup_tensor_res.get());
+    ET_CHECK_MSG(warmup_res.ok(), "Encoder warmup execution failed for %s.", warmup_image_path.c_str());
+    Tensor warmup_output = warmup_res.get();
+    ET_CHECK_MSG(
+        warmup_output.scalar_type() == ScalarType::Float,
+        "Hybrid bridge expects float32 warmup encoder output.");
+    result.warmup_output_shape = tensor_shape(warmup_output);
+    const size_t warmup_values = product(result.warmup_output_shape);
+    const float* warmup_output_data = warmup_output.const_data_ptr<float>();
+    result.warmup_values.insert(
+        result.warmup_values.end(),
+        warmup_output_data,
+        warmup_output_data + warmup_values);
+  }
+  VisionEncodeResult measured = encode(image_paths);
+  measured.warmup_output_shape = std::move(result.warmup_output_shape);
+  measured.warmup_values = std::move(result.warmup_values);
+  return measured;
+}
+
+VisionEncodeResult encode_images_with_executorch(
+    const std::string& encoder_path,
+    const std::vector<std::string>& image_paths,
+    const std::string& warmup_image_path) {
+  VisionEncoderSession session(encoder_path);
+  return session.encode_with_optional_warmup(image_paths, warmup_image_path);
 }
 
 void write_vision_stats(

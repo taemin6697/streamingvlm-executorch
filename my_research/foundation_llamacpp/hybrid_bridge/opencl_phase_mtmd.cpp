@@ -429,6 +429,10 @@ std::string generate_response(
     const long token_decode_end_ms = ggml_time_ms();
     phases.row("D", token_decode_start_ms, token_decode_end_ms, i);
   }
+  common_chat_msg msg;
+  msg.role = "assistant";
+  msg.content = generated_text;
+  ctx.chat_history.push_back(std::move(msg));
   return generated_text;
 }
 

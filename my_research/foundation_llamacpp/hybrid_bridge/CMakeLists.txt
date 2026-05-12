@@ -35,6 +35,11 @@ if(HYBRID_BRIDGE_BUILD_LLAMA_DECODER)
     hybrid_streaming_decode.cpp
     hybrid_embedding_file.cpp
   )
+  add_executable(
+    opencl_streaming_decode
+    hybrid_streaming_decode.cpp
+    hybrid_embedding_file.cpp
+  )
   target_include_directories(
     hybrid_decode
     PRIVATE
@@ -68,13 +73,32 @@ if(HYBRID_BRIDGE_BUILD_LLAMA_DECODER)
       "${LLAMA_CPP_ROOT}/ggml/include"
       "${LLAMA_CPP_ROOT}/ggml/src"
   )
+  target_include_directories(
+    opencl_streaming_decode
+    PRIVATE
+      "${CMAKE_CURRENT_LIST_DIR}"
+      "${LLAMA_CPP_ROOT}/common"
+      "${LLAMA_CPP_ROOT}/include"
+      "${LLAMA_CPP_ROOT}/tools/mtmd"
+      "${LLAMA_CPP_ROOT}/vendor"
+      "${LLAMA_CPP_ROOT}/ggml/include"
+      "${LLAMA_CPP_ROOT}/ggml/src"
+  )
   target_link_libraries(hybrid_decode PRIVATE llama-common mtmd Threads::Threads)
   target_link_libraries(opencl_phase_mtmd PRIVATE llama-common mtmd Threads::Threads)
   target_link_libraries(hybrid_streaming_decode PRIVATE llama-common mtmd Threads::Threads)
-  target_compile_definitions(hybrid_streaming_decode PRIVATE STREAMINGVLM_OPENCL_PHASE_MTMD_NO_MAIN=1)
+  target_link_libraries(opencl_streaming_decode PRIVATE llama-common mtmd Threads::Threads)
+  target_compile_definitions(
+    hybrid_streaming_decode
+    PRIVATE
+      STREAMINGVLM_HYBRID_DECODE_NO_MAIN=1
+      STREAMINGVLM_STREAMING_DECODE_USE_QNN=1
+  )
+  target_compile_definitions(opencl_streaming_decode PRIVATE STREAMINGVLM_OPENCL_PHASE_MTMD_NO_MAIN=1)
   target_compile_features(hybrid_decode PRIVATE cxx_std_17)
   target_compile_features(opencl_phase_mtmd PRIVATE cxx_std_17)
   target_compile_features(hybrid_streaming_decode PRIVATE cxx_std_17)
+  target_compile_features(opencl_streaming_decode PRIVATE cxx_std_17)
 endif()
 
 if(HYBRID_BRIDGE_BUILD_EXECUTORCH_VISION)
@@ -105,10 +129,23 @@ if(HYBRID_BRIDGE_BUILD_EXECUTORCH_VISION)
     vision_encoder_et.cpp
     "${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/encoder.cpp"
   )
+  target_sources(
+    hybrid_streaming_decode
+    PRIVATE
+      vision_encoder_et.cpp
+      "${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/encoder.cpp"
+  )
   target_include_directories(
     hybrid_vision_dump
     PRIVATE
       "${CMAKE_CURRENT_LIST_DIR}"
+      "${STREAMINGVLM_ROOT}"
+      "${EXECUTORCH_ROOT}/.."
+      "${EXECUTORCH_ROOT}/third-party/json/include"
+  )
+  target_include_directories(
+    hybrid_streaming_decode
+    PRIVATE
       "${STREAMINGVLM_ROOT}"
       "${EXECUTORCH_ROOT}/.."
       "${EXECUTORCH_ROOT}/third-party/json/include"
@@ -125,18 +162,34 @@ if(HYBRID_BRIDGE_BUILD_EXECUTORCH_VISION)
       extension_tensor
       gflags
   )
+  target_link_libraries(
+    hybrid_streaming_decode
+    PRIVATE
+      executorch
+      executorch_core
+      extension_data_loader
+      extension_flat_tensor
+      extension_llm_runner
+      extension_module
+      extension_tensor
+  )
   if(TARGET qnn_executorch_backend)
     target_link_libraries(hybrid_vision_dump PRIVATE qnn_executorch_backend)
+    target_link_libraries(hybrid_streaming_decode PRIVATE qnn_executorch_backend)
     target_compile_definitions(hybrid_vision_dump PRIVATE FOUNDATION_ENABLE_QNN=1)
+    target_compile_definitions(hybrid_streaming_decode PRIVATE FOUNDATION_ENABLE_QNN=1)
   else()
     message(WARNING "qnn_executorch_backend target was not found; QNN delegated PTEs may not run.")
   endif()
   if(TARGET portable_ops_lib)
     target_link_libraries(hybrid_vision_dump PRIVATE portable_ops_lib portable_kernels)
+    target_link_libraries(hybrid_streaming_decode PRIVATE portable_ops_lib portable_kernels)
   endif()
   if(TARGET quantized_ops_lib)
     target_link_libraries(hybrid_vision_dump PRIVATE quantized_ops_lib quantized_kernels)
+    target_link_libraries(hybrid_streaming_decode PRIVATE quantized_ops_lib quantized_kernels)
   endif()
   target_compile_options(hybrid_vision_dump PRIVATE -Wno-deprecated-declarations -fPIC)
+  target_compile_options(hybrid_streaming_decode PRIVATE -Wno-deprecated-declarations -fPIC)
   target_compile_features(hybrid_vision_dump PRIVATE cxx_std_17)
 endif()
