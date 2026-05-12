@@ -781,6 +781,7 @@ int main(int argc, char** argv) {
             "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
   phases << "# StreamFrameEnqueue: sampled frame enters buffer  SingleBufferUpdate: current image buffer update  "
             "StreamPromptPrefill/StreamDecode: prompt handled against current buffered image\n";
+  phases << "# clock_origin_ms: " << origin_ms << "\n";
   for (const auto& setup : setup_phases) {
     append_phase_row(phases, setup.name, setup.start_ms, setup.end_ms, origin_ms);
   }

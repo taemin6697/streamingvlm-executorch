@@ -3390,3 +3390,13 @@ segment; only after IDs match is it worthwhile to blame sampling, KV dtype, or k
 - Added `my_research/foundation_llamacpp/docs/archive/dynamic_kv_cache_implementation.md`
   to document the modified files, extended functions, grow path, artifacts, and
   validation runs.
+- Updated dynamic grow instrumentation so new runs log grow start/end with
+  `ggml_time_ms()` and `streaming_phase_stats.csv` records `clock_origin_ms`.
+  The finalizer can now align `DynamicKVGrow` with the same phase timer clock
+  and split retry-side prefill timing away from grow/retry overhead.
+- Extended the timing to the full grow/retry window in `llama_context::decode()`
+  through scheduler reserve completion. Five-prompt validation showed P4
+  `DynamicKVGrow=394 ms`, retry-side `ImagePrefill=2215 ms` vs init-16384
+  `2144 ms`, and P5 grow/no-grow parity (`2886` vs `2851 ms`), supporting that
+  grow causes a one-time prompt spike rather than persistent graph-cache
+  slowdown.

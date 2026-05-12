@@ -355,6 +355,18 @@ def _read_phase_rows(path: Path, *, offset_s: float = 0.0) -> list[dict[str, str
     return rows
 
 
+def _phase_clock_origin_ms(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            match = re.match(r"#\s*clock_origin_ms:\s*(-?\d+)", line)
+            if match:
+                return int(match.group(1))
+    return None
+
+
 def _write_phase_csv(path: Path, rows: list[dict[str, str]]) -> None:
     fieldnames = [
         "row_type",
@@ -381,7 +393,7 @@ def _write_phase_csv(path: Path, rows: list[dict[str, str]]) -> None:
             "V_Encode: vision tower encode (QNN hybrid or llama.cpp OpenCL)  EmbeddingFileWrite: .svlmemb write  "
             "L_DecoderRuntimeInit: llama.cpp args/OpenCL runtime init  ExternalEmbeddingRead: .svlmemb read  "
             "L_DecoderLoad: llama.cpp model/mmproj load  "
-            "LayoutTokenize: mtmd layout  Prefill: combined text/image prefill  "
+            "LayoutTokenize: mtmd layout  Prefill: combined text/image prefill split to exclude DynamicKVGrow  "
             "ImagePrefill: image embedding prefill  T_Prefill: text prompt prefill  "
             "DynamicKVGrow: KV cache capacity grow  D: one generated-token decode"
         })
@@ -396,7 +408,7 @@ def _parse_stdout_uptime_s(line: str) -> float | None:
     return int(hh) * 3600 + int(mm) * 60 + int(ss) + float(f"0.{frac}")
 
 
-def _dynamic_kv_rows_from_stdout(stdout_path: Path) -> list[dict[str, str]]:
+def _dynamic_kv_rows_from_stdout(stdout_path: Path, *, clock_origin_ms: int | None = None) -> list[dict[str, str]]:
     if not stdout_path.exists():
         return []
     lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -412,33 +424,53 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path) -> list[dict[str, str]]:
 
     rows: list[dict[str, str]] = []
     for idx, line in enumerate(lines):
-        grow = re.search(r"grow_to: growing dynamic KV cache: old = (\d+), new = (\d+), logical = (\d+)", line)
+        grow = re.search(r"grow_to: growing dynamic KV cache: old = (\d+), new = (\d+), logical = (\d+)(?:, clock_ms = (-?\d+))?", line)
         if not grow:
-            continue
-        start_abs = _parse_stdout_uptime_s(line)
-        if start_abs is None:
-            for prev in reversed(lines[max(0, idx - 8) : idx]):
-                start_abs = _parse_stdout_uptime_s(prev)
-                if start_abs is not None:
-                    break
-        if start_abs is None:
             continue
 
         old_cells, new_cells, logical_cells = (int(grow.group(1)), int(grow.group(2)), int(grow.group(3)))
+        start_clock_ms = int(grow.group(4)) if grow.group(4) is not None else None
         duration_ms = 0.0
         new_mib = 0.0
-        for follow in lines[idx + 1 : idx + 8]:
+        end_clock_ms: int | None = None
+        retry_start_clock_ms: int | None = None
+        retry_end_clock_ms: int | None = None
+        for follow in lines[idx + 1 : idx + 32]:
             size = re.search(r"reset_capacity: size =\s*([0-9.]+) MiB", follow)
             if size:
                 new_mib = float(size.group(1))
-            done = re.search(r"dynamic KV grow completed in\s*([0-9.]+) ms", follow)
+            done = re.search(r"dynamic KV grow completed in\s*([0-9.]+) ms(?:, clock_ms = (-?\d+))?", follow)
             if done:
                 duration_ms = float(done.group(1))
+                end_clock_ms = int(done.group(2)) if done.group(2) is not None else None
+            retry_window = re.search(
+                r"dynamic KV grow retry window: old = (\d+), new = (\d+), logical = (\d+), clock_start_ms = (-?\d+), clock_end_ms = (-?\d+)",
+                follow,
+            )
+            if retry_window:
+                retry_start_clock_ms = int(retry_window.group(4))
+                retry_end_clock_ms = int(retry_window.group(5))
                 break
 
         old_mib = new_mib * old_cells / new_cells if new_cells and new_mib else 0.0
-        start = start_abs - load_origin
-        end = start + duration_ms / 1000.0
+        if clock_origin_ms is not None and start_clock_ms is not None:
+            start = ((retry_start_clock_ms if retry_start_clock_ms is not None else start_clock_ms) - clock_origin_ms) / 1000.0
+            if retry_end_clock_ms is not None:
+                end = (retry_end_clock_ms - clock_origin_ms) / 1000.0
+                duration_ms = (end - start) * 1000.0
+            else:
+                end = (end_clock_ms - clock_origin_ms) / 1000.0 if end_clock_ms is not None else start + duration_ms / 1000.0
+        else:
+            start_abs = _parse_stdout_uptime_s(line)
+            if start_abs is None:
+                for prev in reversed(lines[max(0, idx - 8) : idx]):
+                    start_abs = _parse_stdout_uptime_s(prev)
+                    if start_abs is not None:
+                        break
+            if start_abs is None:
+                continue
+            start = start_abs - load_origin
+            end = start + duration_ms / 1000.0
         detail = f"{old_cells}->{new_cells}/{logical_cells} cells; {old_mib:.2f}->{new_mib:.2f} MiB"
         rows.append({
             "row_type": "DynamicKVGrow",
@@ -458,6 +490,96 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path) -> list[dict[str, str]]:
             "token_idx": detail,
         })
     return rows
+
+
+def _split_phase_around_intervals(row: dict[str, str], intervals: list[tuple[float, float]]) -> list[dict[str, str]]:
+    start = _phase_float(row, "elapsed_s_start")
+    end = _phase_float(row, "elapsed_s_end")
+    if end <= start:
+        return [row]
+
+    segments = [(start, end)]
+    for cut_start, cut_end in intervals:
+        if cut_end <= cut_start:
+            continue
+        next_segments: list[tuple[float, float]] = []
+        for seg_start, seg_end in segments:
+            if cut_end <= seg_start or cut_start >= seg_end:
+                next_segments.append((seg_start, seg_end))
+                continue
+            if seg_start < cut_start:
+                next_segments.append((seg_start, cut_start))
+            if cut_end < seg_end:
+                next_segments.append((cut_end, seg_end))
+        segments = next_segments
+
+    if not segments:
+        return []
+
+    out: list[dict[str, str]] = []
+    for seg_start, seg_end in segments:
+        new_row = dict(row)
+        duration_ms = max((seg_end - seg_start) * 1000.0, 0.0)
+        new_row["elapsed_s_start"] = f"{seg_start:.6f}"
+        new_row["elapsed_s_end"] = f"{seg_end:.6f}"
+        new_row["col_a_ms"] = f"{duration_ms:.0f}"
+        new_row["total_ms"] = f"{duration_ms:.0f}"
+        detail = new_row.get("token_idx", "")
+        suffix = "split_excluding_dynamic_kv_grow"
+        new_row["token_idx"] = f"{detail}; {suffix}" if detail else suffix
+        out.append(new_row)
+    return out
+
+
+def _clip_phase_retry_start(row: dict[str, str], intervals: list[tuple[float, float]]) -> dict[str, str]:
+    start = _phase_float(row, "elapsed_s_start")
+    end = _phase_float(row, "elapsed_s_end")
+    if end <= start:
+        return row
+
+    new_start = start
+    for cut_start, cut_end in intervals:
+        if cut_start < new_start < cut_end < end:
+            new_start = cut_end
+        elif new_start <= cut_start < cut_end < end and row.get("row_type") in {"ImagePrefill", "T_Prefill", "Mmproj"}:
+            new_start = cut_end
+
+    if new_start <= start:
+        return row
+
+    new_row = dict(row)
+    duration_ms = max((end - new_start) * 1000.0, 0.0)
+    new_row["elapsed_s_start"] = f"{new_start:.6f}"
+    new_row["col_a_ms"] = f"{duration_ms:.0f}"
+    new_row["total_ms"] = f"{duration_ms:.0f}"
+    detail = new_row.get("token_idx", "")
+    suffix = "retry_start_after_dynamic_kv_grow"
+    new_row["token_idx"] = f"{detail}; {suffix}" if detail else suffix
+    return new_row
+
+
+def _separate_dynamic_kv_grow_overlaps(phase_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    grow_rows = [row for row in phase_rows if row.get("row_type") == "DynamicKVGrow"]
+    if not grow_rows:
+        return phase_rows
+
+    intervals = sorted(
+        (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end"))
+        for row in grow_rows
+    )
+    # Split the aggregate Prefill wrapper, and clip fine-grained rows that
+    # partially overlap grow so the visible duration starts from the retry.
+    split_phase_names = {"Prefill"}
+    retry_clip_phase_names = {"ImagePrefill", "T_Prefill", "Mmproj"}
+    separated: list[dict[str, str]] = []
+    for row in phase_rows:
+        if row.get("row_type") in split_phase_names:
+            separated.extend(_split_phase_around_intervals(row, intervals))
+        elif row.get("row_type") in retry_clip_phase_names:
+            separated.append(_clip_phase_retry_start(row, intervals))
+        else:
+            separated.append(row)
+    return sorted(separated, key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end"), row.get("row_type", "")))
 
 
 def _phase_rows_from_artifacts(result_dir: Path) -> list[dict[str, str]]:
@@ -1097,7 +1219,9 @@ def _finalize_hybrid_streaming_outputs(result_dir: Path) -> None:
 
     phase_rows = _read_phase_rows(result_dir / "streaming_phase_stats.csv")
     if phase_rows:
-        phase_rows.extend(_dynamic_kv_rows_from_stdout(stdout_path))
+        phase_clock_origin_ms = _phase_clock_origin_ms(result_dir / "streaming_phase_stats.csv")
+        phase_rows.extend(_dynamic_kv_rows_from_stdout(stdout_path, clock_origin_ms=phase_clock_origin_ms))
+        phase_rows = _separate_dynamic_kv_grow_overlaps(phase_rows)
         phase_rows.sort(key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end")))
         _write_phase_csv(result_dir / "foundation_proc.csv", phase_rows)
         plot_phase_rows = _read_phase_rows(result_dir / "foundation_proc.csv")

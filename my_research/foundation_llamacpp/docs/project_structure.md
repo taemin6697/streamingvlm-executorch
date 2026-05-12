@@ -128,6 +128,10 @@ Important responsibilities still in `cli.py`:
 - memory timeline shell snippets.
 - summary extraction from logs.
 - final artifact pulling and post-processing.
+- dynamic KV grow post-processing for streaming runs: parse llama.cpp grow logs,
+  align them to the `streaming_phase_stats.csv` `clock_origin_ms`, split the
+  aggregate `Prefill` row around `DynamicKVGrow`, and clip retry-side
+  `ImagePrefill` timing so grow/retry overhead is shown as the black grow bar.
 
 ### `runner/config.py`
 
@@ -782,11 +786,23 @@ stream_events.csv:
   frame enqueue, SingleBufferUpdate, prompt arrival, and prompt decode spans
 
 streaming_phase_stats.csv:
-  setup, buffer update, vision, mmproj, prefill, and decode phase rows
+  setup, buffer update, vision, mmproj, prefill, and decode phase rows. New
+  hybrid streaming runs include a `clock_origin_ms` comment so stdout
+  `DynamicKVGrow` logs can be aligned to the same `ggml_time_ms()` source.
 
 streaming_phase_timeline.png:
   horizontal prompt timeline plot. X-axis is stream/video time, not first-prompt
   relative time.
+
+DynamicKVGrow:
+  synthetic dynamic KV expansion row inserted during finalization. New runs use
+  the full grow/retry window from `llama_context::decode()`, including
+  `grow_to()`, KV copy/restore, scheduler reserve, and retry preparation.
+
+retry-side ImagePrefill:
+  if an `ImagePrefill` row overlaps the grow window, finalization clips the row
+  start to the grow window end. This keeps image prefill compute in the blue bar
+  and grow/retry overhead in the black `DynamicKVGrow` bar.
 
 stream_response_<idx>.txt:
   assistant response for one prompt event

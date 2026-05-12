@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cinttypes>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -724,15 +725,18 @@ bool llama_kv_cache::grow_to(uint32_t new_size) {
     }
 
     const int64_t t_start_us = ggml_time_us();
-    LLAMA_LOG_INFO("%s: growing dynamic KV cache: old = %u, new = %u, logical = %u\n",
-            __func__, old_size, new_size, logical_kv_size);
+    const int64_t t_start_ms = ggml_time_ms();
+    LLAMA_LOG_INFO("%s: growing dynamic KV cache: old = %u, new = %u, logical = %u, clock_ms = %" PRId64 "\n",
+            __func__, old_size, new_size, logical_kv_size, t_start_ms);
 
     if (!reset_capacity(new_size, true)) {
         return false;
     }
 
     const int64_t t_end_us = ggml_time_us();
-    LLAMA_LOG_INFO("%s: dynamic KV grow completed in %.3f ms\n", __func__, (t_end_us - t_start_us) / 1000.0);
+    const int64_t t_end_ms = ggml_time_ms();
+    LLAMA_LOG_INFO("%s: dynamic KV grow completed in %.3f ms, clock_ms = %" PRId64 "\n",
+            __func__, (t_end_us - t_start_us) / 1000.0, t_end_ms);
     return true;
 }
 

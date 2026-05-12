@@ -483,3 +483,30 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - Added `docs/archive/dynamic_kv_cache_implementation.md` with file/function
     level implementation notes, artifact schema, plotting changes, and
     validation results including the `1024 -> 16384` grow test.
+
+## 2026-05-12: Dynamic KV Full Grow/Retry Window Timing
+
+- Refined dynamic KV instrumentation so the black `DynamicKVGrow` phase covers
+  the full grow/retry window, not only `llama_kv_cache::grow_to()`.
+  `llama_context::decode()` now logs
+  `dynamic KV grow retry window: ... clock_start_ms=..., clock_end_ms=...`
+  after `sched_reserve()` completes. `llama_kv_cache::grow_to()` still logs
+  internal allocation/copy time with `clock_ms` for debugging.
+- `hybrid_streaming_decode.cpp` writes `# clock_origin_ms: <ggml_time_ms>` into
+  `streaming_phase_stats.csv`, and `runner/cli.py` aligns stdout grow logs to
+  that same clock. The finalizer splits aggregate `Prefill` around
+  `DynamicKVGrow` and clips retry-side `ImagePrefill` to start after the grow
+  window.
+- Validation with five prompts compared `--kv-init-size 16384` against
+  `--kv-init-size 1024 --kv-grow-step 15360`:
+  - no-grow init-16384 P4: `ImagePrefill=2144 ms`, `Prefill=2647 ms`,
+    decode average `57.0 ms/token`.
+  - grow full-window P4: `DynamicKVGrow=394 ms`, retry-side
+    `ImagePrefill=2215 ms`, retry-side `Prefill=2480 ms`, decode average
+    `57.0 ms/token`.
+  - P5 after grow: grow run `ImagePrefill=2886 ms`, no-grow init run
+    `ImagePrefill=2851 ms`; decode averages were `60.9` vs `60.8 ms/token`.
+- Conclusion: the one-time latency spike belongs to the prompt where KV grows
+  and is now separated into `DynamicKVGrow`. Subsequent prompts match the
+  init-16384 run closely, so the grow path does not appear to poison graph or
+  scheduler caching across later prompts.

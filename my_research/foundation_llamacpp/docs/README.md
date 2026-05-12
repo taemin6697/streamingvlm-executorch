@@ -126,7 +126,8 @@ foundation_proc.csv
   physical KV capacity increases. For these rows, `kv_pos` is the old cell
   count, `kv_total` is the new cell count, `kv_estimated_used_kb` is the old
   KV MiB converted to KiB, and `kv_physical_committed_kb` is the new committed
-  KV size.
+  KV size. New runs record the full grow/retry window, including scheduler
+  reserve, so retry-side `ImagePrefill` timing starts after `DynamicKVGrow`.
 
 streaming_phase_stats.csv / stream_events.csv
   Streaming-only timing and event logs.
@@ -631,6 +632,9 @@ same marker should appear in `streaming_phase_timeline.png` and
   while initially allocating only 1024 KV cells, then grows by 1024 cells when
   the used KV no longer fits. Growth reallocates/restores KV buffers and can
   introduce a latency spike; it reduces reserved KV memory, not attention work.
+  New builds write grow timestamps with the same `ggml_time_ms()` clock used by
+  streaming phase timers, so retry-side prefill rows can be separated from grow
+  time in `foundation_proc.csv` and `streaming_phase_timeline.png`.
 
 stream_events.csv
   Frame arrival, `SingleBufferUpdate`, prompt arrival, and prompt decode events.

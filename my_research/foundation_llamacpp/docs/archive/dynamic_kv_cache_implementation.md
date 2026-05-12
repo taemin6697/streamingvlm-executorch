@@ -343,16 +343,34 @@ InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic
 `runner/cli.py`에 `_dynamic_kv_rows_from_stdout()`를 추가했다. 이 함수는 `hybrid_streaming_stdout.txt` 또는 hybrid stdout에서 아래 log를 찾는다.
 
 ```text
-grow_to: growing dynamic KV cache: old = <old>, new = <new>, logical = <logical>
+grow_to: growing dynamic KV cache: old = <old>, new = <new>, logical = <logical>, clock_ms = <ggml_time_ms>
 reset_capacity: size = <MiB> MiB
-grow_to: dynamic KV grow completed in <ms> ms
+grow_to: dynamic KV grow completed in <ms> ms, clock_ms = <ggml_time_ms>
 ```
 
-stdout의 `grow_to` line 자체에는 Android log timestamp가 없을 수 있다. 그래서 parser는 주변 line에서 `I HH:MM:SS.frac` 또는 `E HH:MM:SS.frac` 형태의 timestamp를 찾아 elapsed time으로 변환한다.
+`hybrid_streaming_decode.cpp`는 `streaming_phase_stats.csv` header comment에
+`clock_origin_ms`를 쓴다. 새 빌드에서 생성되는 grow log의 `clock_ms`는 같은
+`ggml_time_ms()` clock이다. 따라서 `_dynamic_kv_rows_from_stdout()`는
+`clock_origin_ms`가 있으면 grow start/end를 phase recorder와 같은 clock으로
+변환한다.
 
-`load_tensors:` timestamp를 origin으로 잡고, grow start/end를 `foundation_proc.csv`의 `elapsed_s_start`, `elapsed_s_end`로 기록한다.
+기존 결과처럼 `clock_ms`가 없는 stdout은 fallback으로 주변 Android log
+timestamp와 `load_tensors:` timestamp를 사용한다. 이 경우 phase timer와 clock
+source가 달라서 retry 경계가 약간 어긋나 보일 수 있다.
 
-### 12.2 CSV row schema
+### 12.2 retry 기준 prefill 분리
+
+Dynamic KV grow는 llama.cpp 내부에서 prefill batch를 넣으려다가 physical KV
+capacity가 부족할 때 발생한다. 성공한 prefill은 grow 이후 scheduler reserve를
+다시 수행한 뒤 같은 batch를 retry하면서 진행된다.
+
+그래서 finalizer는 `DynamicKVGrow`와 겹치는 aggregate `Prefill` row를 grow
+구간과 겹치지 않게 split한다. fine-grained `ImagePrefill`/`T_Prefill`/`Mmproj`
+row가 grow window와 걸치면, 새 clock 기반 결과에서는 retry 가능한 grow end
+시각부터 시작하도록 clip한다. 완전히 grow window 안에 찍힌 legacy row는 failed
+attempt 계측일 수 있으므로 해석에 주의해야 한다.
+
+### 12.3 CSV row schema
 
 `_write_phase_csv()`의 header 설명에 `DynamicKVGrow`를 추가했다.
 
@@ -380,6 +398,14 @@ DynamicKVGrow,41.154632,41.427575,,,273,,273,1024,16384,,28672,458752,458752,102
 `runner/cli.py`의 `_phase_colors()`에 `DynamicKVGrow` 색을 추가했다.
 
 `_write_png_streaming_phase_timeline()`의 visible phase list에도 `DynamicKVGrow`를 넣었다. 이 plot에서는 grow duration을 `KV +<ms>ms` 형태로 표시한다.
+
+최신 구현에서는 `DynamicKVGrow`가 단순 `llama_kv_cache::grow_to()` 시간만
+뜻하지 않는다. `llama_context::decode()`가 `memory->grow_to()` 성공 후
+`sched_reserve()`를 완료한 시점까지 `dynamic KV grow retry window`로 기록하고,
+finalizer는 이 full window를 검정색 grow bar로 사용한다. 따라서 검정색에는
+slot 부족 후 KV grow, 기존 KV copy/restore, backend scheduler reserve, retry
+준비 비용이 포함된다. 파란색 `ImagePrefill`은 이 window 이후부터 시작하도록
+clip되어 retry-side 실제 image prefill 계산에 가깝게 표시된다.
 
 `_write_png_memory_timeline_decode_window()`를 새로 추가했다. 이 plot은 기존 `memory_timeline_plot.png`와 별개로 생성된다.
 
@@ -469,6 +495,50 @@ grow_to: dynamic KV grow completed in 272.943 ms
 - grow latency: 약 `273 ms`
 
 `android_memory_timeline.csv`에서도 grow 직후 `MemAvailable` 하락 구간이 더 명확하게 보인다. 다만 Android 전체 memory metric은 allocator/cache/driver 영향이 섞이므로, 정확한 KV allocation 크기는 `foundation_proc.csv`의 `kv_physical_committed_kb`와 stdout의 `reset_capacity` log를 기준으로 해석하는 것이 좋다.
+
+### 14.3 five-prompt full grow/retry window validation
+
+목적: grow가 발생한 prompt 이후에도 graph/scheduler caching이 계속 느려지는지,
+또는 grow prompt에서만 일회성 spike가 생기는지 분리한다.
+
+비교 조건:
+
+- no-grow baseline: `--dynamic-kv-cache --kv-init-size 16384 --kv-grow-step 15360`
+- grow run: `--dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 15360`
+- prompts: 5 turns at `5s/8s/11s/14s/17s`
+- video: `surveil_8_20sec.mp4`
+
+결과:
+
+```text
+init-16384 P4:
+  ImagePrefill = 2144 ms
+  Prefill      = 2647 ms
+  Decode avg   = 57.0 ms/token
+
+grow full-window P4:
+  DynamicKVGrow = 394 ms
+  ImagePrefill  = 2215 ms
+  Prefill       = 2480 ms after grow + 223 ms before grow
+  Decode avg    = 57.0 ms/token
+
+init-16384 P5:
+  ImagePrefill = 2851 ms
+  Prefill      = 3430 ms
+  Decode avg   = 60.8 ms/token
+
+grow full-window P5:
+  ImagePrefill = 2886 ms
+  Prefill      = 3457 ms
+  Decode avg   = 60.9 ms/token
+```
+
+해석:
+
+- P4의 one-time grow/retry 비용은 `DynamicKVGrow=394 ms`로 분리된다.
+- P4의 retry-side `ImagePrefill=2215 ms`는 init-16384의 `2144 ms`와 가까워졌다.
+- P5는 no-grow와 grow run이 거의 동일하다. 따라서 dynamic grow가 이후 prompt의
+  graph/scheduler cache를 지속적으로 망가뜨리는 현상은 관찰되지 않았다.
 
 ## 15. 성능 해석
 

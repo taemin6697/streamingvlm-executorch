@@ -1665,6 +1665,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
 
                     if (cparams.dynamic_kv_cache && memory->can_grow()) {
+                        const int64_t grow_full_start_ms = ggml_time_ms();
                         const uint32_t old_size = memory->get_physical_size();
                         const uint32_t logical_size = memory->get_logical_size();
                         const uint32_t requested = std::min(
@@ -1672,10 +1673,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                 old_size + std::max(cparams.kv_grow_step, (uint32_t) balloc->get_n_tokens()));
 
                         if (requested > old_size && memory->grow_to(requested)) {
-                            LLAMA_LOG_INFO("%s: retrying batch after dynamic KV grow (%u -> %u)\n",
-                                    __func__, old_size, memory->get_physical_size());
                             sched_need_reserve = true;
                             sched_reserve();
+                            const int64_t grow_full_end_ms = ggml_time_ms();
+                            LLAMA_LOG_INFO("%s: dynamic KV grow retry window: old = %u, new = %u, logical = %u, clock_start_ms = %" PRId64 ", clock_end_ms = %" PRId64 "\n",
+                                    __func__, old_size, memory->get_physical_size(), logical_size, grow_full_start_ms, grow_full_end_ms);
+                            LLAMA_LOG_INFO("%s: retrying batch after dynamic KV grow (%u -> %u)\n",
+                                    __func__, old_size, memory->get_physical_size());
                             did_optimize = false;
                             continue;
                         }
