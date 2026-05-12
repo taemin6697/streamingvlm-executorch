@@ -53,6 +53,9 @@ llama_context::llama_context(
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
+    cparams.dynamic_kv_cache = params.dynamic_kv_cache;
+    cparams.kv_init_size     = params.kv_init_size;
+    cparams.kv_grow_step     = params.kv_grow_step;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -196,9 +199,24 @@ llama_context::llama_context(
         }
     }
 
+    if (cparams.dynamic_kv_cache) {
+        if (cparams.n_seq_max != 1 || cparams.kv_unified) {
+            throw std::runtime_error("dynamic KV cache prototype supports only one non-unified sequence");
+        }
+        if (cparams.kv_init_size == 0 || cparams.kv_grow_step == 0) {
+            throw std::runtime_error("dynamic KV cache requires --kv-init-size and --kv-grow-step");
+        }
+        cparams.kv_init_size = GGML_PAD(std::min(cparams.kv_init_size, cparams.n_ctx_seq), 256);
+        cparams.kv_grow_step = GGML_PAD(cparams.kv_grow_step, 256);
+    }
+
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
+    if (cparams.dynamic_kv_cache) {
+        LLAMA_LOG_INFO("%s: dynamic_kv   = true (init = %u, grow = %u, logical = %u)\n",
+                __func__, cparams.kv_init_size, cparams.kv_grow_step, cparams.n_ctx_seq);
+    }
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
@@ -1642,6 +1660,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         if (memory_update(true)) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
+                            continue;
+                        }
+                    }
+
+                    if (cparams.dynamic_kv_cache && memory->can_grow()) {
+                        const uint32_t old_size = memory->get_physical_size();
+                        const uint32_t logical_size = memory->get_logical_size();
+                        const uint32_t requested = std::min(
+                                logical_size,
+                                old_size + std::max(cparams.kv_grow_step, (uint32_t) balloc->get_n_tokens()));
+
+                        if (requested > old_size && memory->grow_to(requested)) {
+                            LLAMA_LOG_INFO("%s: retrying batch after dynamic KV grow (%u -> %u)\n",
+                                    __func__, old_size, memory->get_physical_size());
+                            sched_need_reserve = true;
+                            sched_reserve();
+                            did_optimize = false;
                             continue;
                         }
                     }
@@ -3139,6 +3174,8 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.kv_init_size                =*/ 0,
+        /*.kv_grow_step                =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -3165,6 +3202,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.dynamic_kv_cache            =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

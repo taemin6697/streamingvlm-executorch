@@ -276,6 +276,8 @@ struct Args {
   std::string rope_suffix;
   int n_predict = 32;
   int ctx_size = 4096;
+  int kv_init_size = 0;
+  int kv_grow_step = 0;
   int batch_size = 2048;
   int ubatch_size = 512;
   int gpu_layers = 99;
@@ -285,6 +287,7 @@ struct Args {
   bool realtime = true;
   bool force_generation = false;
   bool single_buffer = false;
+  bool dynamic_kv_cache = false;
   bool no_kv_offload = false;
   bool no_warmup = false;
 };
@@ -332,6 +335,10 @@ Args parse_args(int argc, char** argv) {
       args.n_predict = std::atoi(tmp.c_str());
     } else if (read_string("-c", tmp) || read_string("--ctx-size", tmp)) {
       args.ctx_size = std::atoi(tmp.c_str());
+    } else if (read_string("--kv-init-size", tmp)) {
+      args.kv_init_size = std::atoi(tmp.c_str());
+    } else if (read_string("--kv-grow-step", tmp)) {
+      args.kv_grow_step = std::atoi(tmp.c_str());
     } else if (read_string("-b", tmp) || read_string("--batch-size", tmp)) {
       args.batch_size = std::atoi(tmp.c_str());
     } else if (read_string("-ub", tmp) || read_string("--ubatch-size", tmp)) {
@@ -346,6 +353,8 @@ Args parse_args(int argc, char** argv) {
       args.play_speed = std::atof(tmp.c_str());
     } else if (a == "--single-buffer" || a == "--single_buffer") {
       args.single_buffer = true;
+    } else if (a == "--dynamic-kv-cache") {
+      args.dynamic_kv_cache = true;
     } else if (a == "--force-generation") {
       args.force_generation = true;
     } else if (a == "--no-kv-offload") {
@@ -451,8 +460,6 @@ std::vector<std::string> build_llama_args(const Args& args, const std::string& i
       std::to_string(args.threads),
       "--n-gpu-layers",
       std::to_string(args.gpu_layers),
-      "--ctx-size",
-      std::to_string(args.ctx_size),
       "--batch-size",
       std::to_string(args.batch_size),
       "--ubatch-size",
@@ -460,6 +467,20 @@ std::vector<std::string> build_llama_args(const Args& args, const std::string& i
       "--temp",
       std::to_string(args.temperature),
   };
+  if (!args.dynamic_kv_cache) {
+    out.push_back("--ctx-size");
+    out.push_back(std::to_string(args.ctx_size));
+  } else {
+    out.push_back("--dynamic-kv-cache");
+    if (args.kv_init_size > 0) {
+      out.push_back("--kv-init-size");
+      out.push_back(std::to_string(args.kv_init_size));
+    }
+    if (args.kv_grow_step > 0) {
+      out.push_back("--kv-grow-step");
+      out.push_back(std::to_string(args.kv_grow_step));
+    }
+  }
   if (!args.device.empty()) {
     out.push_back("--device");
     out.push_back(args.device);

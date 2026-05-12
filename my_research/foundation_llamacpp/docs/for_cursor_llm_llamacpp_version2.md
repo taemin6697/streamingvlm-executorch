@@ -435,3 +435,51 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - QNN `VisionEncoderSession`, OpenCL prompt execution, multi-turn state,
     token trace aggregation, phase CSVs, timeline plotting, validation results,
     known limits, and future modification checklists.
+
+## 2026-05-12: Dynamic KV Cache Prototype
+
+- Implemented project-local dynamic KV flags:
+  `--dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024`.
+  The common llama.cpp parser maps these through `common_params` into
+  `llama_context_params`; the foundation Android runner and
+  `hybrid_streaming_decode` pass them through to the decoder.
+- In dynamic mode, `llama_context` keeps the logical context at the model max
+  (`n_ctx_train`, 32768 for the current InternVL3/Qwen2 models) while the
+  standard non-SWA `llama_kv_cache` starts with the requested physical KV
+  capacity. Recurrent, hybrid-memory, SWA/iSWA, multi-sequence, and unified-KV
+  configurations are rejected for this prototype.
+- Added standard KV grow support in `llama_kv_cache`: on prepare failure,
+  `llama_context::decode()` grows physical capacity by the configured step,
+  snapshots existing KV through the existing state read/write path, recreates
+  K/V tensors and backend buffers, restores the snapshot, marks the scheduler
+  for reserve, and retries the batch.
+- Android build validation succeeded for `hybrid_streaming_decode`,
+  `opencl_streaming_decode`, `opencl_phase_mtmd`, and `hybrid_decode` in
+  `build-hybrid-android-opencl`.
+- Runtime validation used 2B Q8 hybrid single-buffer streaming with four prompts
+  at 5s/8s/11s/14s:
+  - fixed KV result:
+    `results/log/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_kv16`,
+    `foundation_exit_code.txt=0`, initial OpenCL KV buffer `112 MiB`
+    (`4096/4096` cells).
+  - dynamic KV result:
+    `results/log/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic`,
+    `foundation_exit_code.txt=0`, logical context `32768`, initial OpenCL KV
+    buffer `28 MiB` (`1024/32768` cells), one grow to `2048` cells / `56 MiB`,
+    grow time `78.029 ms`.
+  - `runner/cli.py` now backfills dynamic grow events from
+    `hybrid_streaming_stdout.txt` into `foundation_proc.csv` as
+    `DynamicKVGrow` rows. The validated row records `kv_pos=1024`,
+    `kv_total=2048`, `kv_estimated_used_kb=28672`,
+    `kv_physical_committed_kb=57344`, and token detail
+    `1024->2048/32768 cells; 28.00->56.00 MiB`. The streaming timeline plot
+    includes this row as a visible KV grow marker. The runner also writes
+    `memory_timeline_decode_window.png`, a zoomed memory plot from the first
+    `V_Encode` start to the final decode end with `DynamicKVGrow` annotated.
+  - Prompt-level `ImagePrefill` fixed KV: `1081, 1421, 1761, 2115 ms`.
+    Dynamic KV: `1077, 1427, 1769, 2386 ms`; the last prompt includes the
+    one-time grow/re-reserve overhead. Decode token latency still increases
+    with actual accumulated KV length, as expected.
+  - Added `docs/archive/dynamic_kv_cache_implementation.md` with file/function
+    level implementation notes, artifact schema, plotting changes, and
+    validation results including the `1024 -> 16384` grow test.

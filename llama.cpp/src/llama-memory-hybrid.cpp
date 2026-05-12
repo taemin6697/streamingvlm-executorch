@@ -38,6 +38,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         offload,
         unified,
         kv_size,
+        kv_size,
         n_seq_max,
         n_pad,
         n_swa,

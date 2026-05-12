@@ -556,6 +556,24 @@ Q8 2B OpenCL streaming:
 - `ImagePrefill` 약 3973ms / 4800ms
 - prompt 1이 이전 질문 내용을 기억함
 
+Dynamic KV prototype validation:
+
+- flags: `--dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024`
+- target: standard llama.cpp KV cache path used by 2B Q8 hybrid streaming
+- fixed baseline: `InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_kv16`
+  - `foundation_exit_code.txt = 0`
+  - OpenCL KV buffer `112 MiB`, `4096/4096` cells
+  - `ImagePrefill`: `1081, 1421, 1761, 2115 ms`
+- dynamic run: `InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic`
+  - `foundation_exit_code.txt = 0`
+  - logical context `32768`
+  - initial OpenCL KV buffer `28 MiB`, `1024/32768` cells
+  - one grow: `1024 -> 2048` cells, OpenCL KV `56 MiB`
+  - grow log: `dynamic KV grow completed in 78.029 ms`
+  - `ImagePrefill`: `1077, 1427, 1769, 2386 ms`
+- Dynamic KV reduces reserved KV memory. It does not reduce attention compute;
+  decode/prefill latency still grows with the actual accumulated `n_kv`.
+
 ## 20. 현재 한계
 
 현재 구현은 intentional baseline이다.

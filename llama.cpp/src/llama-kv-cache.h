@@ -101,6 +101,7 @@ public:
                          bool   offload,
                          bool   unified,
                      uint32_t   kv_size,
+                 uint32_t   logical_kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_pad,
                      uint32_t   n_swa,
@@ -137,6 +138,11 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    bool can_grow() const override;
+    bool grow_to(uint32_t new_size) override;
+    uint32_t get_physical_size() const override;
+    uint32_t get_logical_size() const override;
 
     // state write/load
 
@@ -225,12 +231,18 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+    bool offload = false;
+
+    ggml_type cache_type_k = GGML_TYPE_F16;
+    ggml_type cache_type_v = GGML_TYPE_F16;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
 
     // required padding
     const uint32_t n_pad = 1;
+
+    uint32_t logical_kv_size = 0;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -273,6 +285,9 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    layer_filter_cb filter_cb;
+    layer_reuse_cb reuse_cb;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -304,6 +319,8 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    bool reset_capacity(uint32_t new_size, bool copy_existing);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

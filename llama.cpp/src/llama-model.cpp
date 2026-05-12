@@ -1938,6 +1938,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 if (llm_arch_is_recurrent(arch)) {
+                    if (cparams.dynamic_kv_cache) {
+                        throw std::runtime_error("dynamic KV cache prototype does not support recurrent memory");
+                    }
                     res = new llama_memory_recurrent(
                             *this,
                             GGML_TYPE_F32,
@@ -1947,6 +1950,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch)) {
+                    if (cparams.dynamic_kv_cache) {
+                        throw std::runtime_error("dynamic KV cache prototype does not support hybrid memory");
+                    }
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
@@ -2015,6 +2021,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        if (cparams.dynamic_kv_cache) {
+                            throw std::runtime_error("dynamic KV cache prototype does not support SWA/iSWA memory");
+                        }
                         GGML_ASSERT(hparams.is_swa_any());
 
                         res = new llama_kv_cache_iswa(
@@ -2041,6 +2050,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
+                                cparams.dynamic_kv_cache ? cparams.kv_init_size : cparams.n_ctx_seq,
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
                                 1,

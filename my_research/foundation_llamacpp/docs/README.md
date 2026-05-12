@@ -3,7 +3,8 @@
 This directory contains the Android runner and bridge binaries used for
 llama.cpp / ExecuTorch hybrid VLM experiments. This document is the quick run
 guide. Build internals and historical notes live in
-`archive/executorch_vision_llamacpp_decoder.md`.
+`archive/executorch_vision_llamacpp_decoder.md`. Dynamic KV implementation
+details live in `archive/dynamic_kv_cache_implementation.md`.
 
 ## Common Setup
 
@@ -47,7 +48,14 @@ Common arguments used by most runs:
   Optional. Force exactly N generated tokens in instrumented OpenCL/hybrid paths.
 
 --ctx-size N
-  llama.cpp context length. This changes KV-cache allocation.
+  llama.cpp context length. In fixed-KV mode this also sets KV-cache allocation.
+
+--dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024
+  Project-local prototype for the standard llama.cpp KV cache path. Logical
+  context uses the model max context (`--ctx-size 0` internally), while physical
+  KV starts at `kv-init-size` cells and grows by `kv-grow-step` cells on demand.
+  First validation is scoped to the OpenCL/hybrid streaming path and non-SWA
+  single-sequence models.
 
 --batch-size N / --ubatch-size N
   llama.cpp batch and micro-batch sizes.
@@ -114,7 +122,11 @@ stream_inference_tokens_<idx>.txt
   Per-turn raw token traces for streaming mode.
 
 foundation_proc.csv
-  Canonical phase timing CSV.
+  Canonical phase timing CSV. Dynamic KV runs add `DynamicKVGrow` rows when
+  physical KV capacity increases. For these rows, `kv_pos` is the old cell
+  count, `kv_total` is the new cell count, `kv_estimated_used_kb` is the old
+  KV MiB converted to KiB, and `kv_physical_committed_kb` is the new committed
+  KV size.
 
 streaming_phase_stats.csv / stream_events.csv
   Streaming-only timing and event logs.
@@ -124,6 +136,10 @@ streaming_phase_timeline.png
 
 memory_usage_summary.txt / memory_timeline_plot.png
   Android system memory summary and plot.
+
+memory_timeline_decode_window.png
+  Zoomed memory plot from first `V_Encode` start to final decode end. Dynamic
+  KV runs mark `DynamicKVGrow` with the cell and MiB growth detail.
 ```
 
 ## Single Text Input
@@ -508,6 +524,82 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --force-push
 ```
 
+### Hybrid With Dynamic KV Cache
+
+Normal dynamic grow run (`1024 -> 2048 -> ...` cells):
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
+  --single-buffer \
+  --sampling-fps 1.0 \
+  --max_video_time 15 \
+  --time '[5.0, 8.0, 11.0, 14.0]' \
+  --prompt '["What is this situation?", "What did I ask earlier???", "What changed in the scene?", "Summarize the full situation so far."]' \
+  --max-num 1 \
+  --n-predict 64 \
+  --dynamic-kv-cache \
+  --kv-init-size 1024 \
+  --kv-grow-step 1024 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --soc-model SM8750 \
+  --baseline-window 5.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log \
+  --force-push
+```
+
+Large one-shot grow test (`1024 -> 16384` cells) to make the memory increase
+easy to see:
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
+  --single-buffer \
+  --sampling-fps 1.0 \
+  --max_video_time 15 \
+  --time '[5.0, 8.0, 11.0, 14.0]' \
+  --prompt '["What is this situation?", "What did I ask earlier???", "What changed in the scene?", "Summarize the full situation so far."]' \
+  --max-num 1 \
+  --n-predict 64 \
+  --dynamic-kv-cache \
+  --kv-init-size 1024 \
+  --kv-grow-step 15360 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --soc-model SM8750 \
+  --baseline-window 5.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log/dynamic_grow_16384 \
+  --force-push
+```
+
+The second run should report a `DynamicKVGrow` row like
+`1024->16384/32768 cells; 28.00->448.00 MiB` in `foundation_proc.csv`, and the
+same marker should appear in `streaming_phase_timeline.png` and
+`memory_timeline_decode_window.png`.
+
 ### Streaming Extra Arguments
 
 ```text
@@ -533,6 +625,12 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 
 --max-num N
   Current single-buffer mode uses one image per frame; keep this at `1` for now.
+
+--dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024
+  Optional project prototype. The decoder advertises model-max logical context
+  while initially allocating only 1024 KV cells, then grows by 1024 cells when
+  the used KV no longer fits. Growth reallocates/restores KV buffers and can
+  introduce a latency spike; it reduces reserved KV memory, not attention work.
 
 stream_events.csv
   Frame arrival, `SingleBufferUpdate`, prompt arrival, and prompt decode events.

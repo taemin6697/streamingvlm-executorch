@@ -111,6 +111,13 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
+    // [PROJECT] Dynamic KV cache prototype. Default implementations keep
+    // non-standard memory types explicitly unsupported.
+    virtual bool can_grow() const { return false; }
+    virtual bool grow_to(uint32_t /* new_size */) { return false; }
+    virtual uint32_t get_physical_size() const { return 0; }
+    virtual uint32_t get_logical_size() const { return 0; }
+
     //
     // state write/read
     //

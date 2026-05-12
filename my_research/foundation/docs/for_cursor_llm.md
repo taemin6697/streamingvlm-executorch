@@ -3361,3 +3361,32 @@ segment; only after IDs match is it worthwhile to blame sampling, KV dtype, or k
 - It also records the single-buffer semantics, Android producer/consumer scheduling,
   QNN vs OpenCL prompt execution paths, token trace aggregation fix, stream-time timeline plot,
   validation results, current limits, and future modification checklist.
+
+## foundation_llamacpp: dynamic KV cache prototype (2026-05-12)
+
+- Added a project-local llama.cpp dynamic KV prototype exposed as
+  `--dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024`.
+- The foundation runner and `hybrid_streaming_decode` pass these flags through
+  to llama.cpp. In dynamic mode the decoder uses model-max logical context
+  (`32768` for InternVL3/Qwen2) while the standard non-SWA KV cache physically
+  starts at `kv-init-size` and grows on prepare failure.
+- The first implementation is intentionally guarded: recurrent/hybrid memory,
+  SWA/iSWA, unified KV, and multi-sequence modes are unsupported.
+- Android build passed for `hybrid_streaming_decode`, `opencl_streaming_decode`,
+  `opencl_phase_mtmd`, and `hybrid_decode`.
+- Validation with 2B Q8 hybrid streaming four prompts succeeded:
+  fixed `ctx=4096` used `112 MiB` OpenCL KV (`4096/4096` cells);
+  dynamic used logical `32768`, initial `28 MiB` OpenCL KV (`1024/32768`
+  cells), grew once to `56 MiB` (`2048` cells), and reported grow time
+  `78.029 ms`. Both runs produced `foundation_exit_code.txt=0`.
+- Added dynamic KV grow rows to streaming `foundation_proc.csv` by parsing the
+  stdout grow logs during result finalization. The current dynamic result has
+  `DynamicKVGrow, ..., kv_pos=1024, kv_total=2048,
+  kv_estimated_used_kb=28672, kv_physical_committed_kb=57344`, and the
+  regenerated `streaming_phase_timeline.png` shows the grow marker.
+- Added `memory_timeline_decode_window.png`, which zooms Android memory from
+  the first `V_Encode` start through the final decode end and annotates any
+  `DynamicKVGrow` event with the KV cell/MiB growth detail.
+- Added `my_research/foundation_llamacpp/docs/archive/dynamic_kv_cache_implementation.md`
+  to document the modified files, extended functions, grow path, artifacts, and
+  validation runs.

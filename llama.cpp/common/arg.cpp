@@ -1264,6 +1264,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        {"--dynamic-kv-cache"},
+        "[PROJECT] lazily allocate/grow the standard KV cache up to the logical context size",
+        [](common_params & params) {
+            params.dynamic_kv_cache = true;
+            params.n_ctx = 0;
+            params.fit_params_min_ctx = UINT32_MAX;
+        }
+    ).set_env("LLAMA_ARG_DYNAMIC_KV_CACHE"));
+    add_opt(common_arg(
+        {"--kv-init-size"}, "N",
+        "[PROJECT] initial physical KV capacity when --dynamic-kv-cache is enabled",
+        [](common_params & params, int value) {
+            params.kv_init_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_INIT_SIZE"));
+    add_opt(common_arg(
+        {"--kv-grow-step"}, "N",
+        "[PROJECT] physical KV grow step when --dynamic-kv-cache is enabled",
+        [](common_params & params, int value) {
+            params.kv_grow_step = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GROW_STEP"));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

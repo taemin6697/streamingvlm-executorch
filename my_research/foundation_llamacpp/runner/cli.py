@@ -382,9 +382,82 @@ def _write_phase_csv(path: Path, rows: list[dict[str, str]]) -> None:
             "L_DecoderRuntimeInit: llama.cpp args/OpenCL runtime init  ExternalEmbeddingRead: .svlmemb read  "
             "L_DecoderLoad: llama.cpp model/mmproj load  "
             "LayoutTokenize: mtmd layout  Prefill: combined text/image prefill  "
-            "ImagePrefill: image embedding prefill  T_Prefill: text prompt prefill  D: one generated-token decode"
+            "ImagePrefill: image embedding prefill  T_Prefill: text prompt prefill  "
+            "DynamicKVGrow: KV cache capacity grow  D: one generated-token decode"
         })
         writer.writerows(rows)
+
+
+def _parse_stdout_uptime_s(line: str) -> float | None:
+    match = re.search(r"\b[IE]\s+(\d+):(\d+):(\d+)\.(\d+)", line)
+    if not match:
+        return None
+    hh, mm, ss, frac = match.groups()
+    return int(hh) * 3600 + int(mm) * 60 + int(ss) + float(f"0.{frac}")
+
+
+def _dynamic_kv_rows_from_stdout(stdout_path: Path) -> list[dict[str, str]]:
+    if not stdout_path.exists():
+        return []
+    lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    load_origin: float | None = None
+    for line in lines:
+        if "load_tensors:" in line:
+            load_origin = _parse_stdout_uptime_s(line)
+            if load_origin is not None:
+                break
+    if load_origin is None:
+        load_origin = 0.0
+
+    rows: list[dict[str, str]] = []
+    for idx, line in enumerate(lines):
+        grow = re.search(r"grow_to: growing dynamic KV cache: old = (\d+), new = (\d+), logical = (\d+)", line)
+        if not grow:
+            continue
+        start_abs = _parse_stdout_uptime_s(line)
+        if start_abs is None:
+            for prev in reversed(lines[max(0, idx - 8) : idx]):
+                start_abs = _parse_stdout_uptime_s(prev)
+                if start_abs is not None:
+                    break
+        if start_abs is None:
+            continue
+
+        old_cells, new_cells, logical_cells = (int(grow.group(1)), int(grow.group(2)), int(grow.group(3)))
+        duration_ms = 0.0
+        new_mib = 0.0
+        for follow in lines[idx + 1 : idx + 8]:
+            size = re.search(r"reset_capacity: size =\s*([0-9.]+) MiB", follow)
+            if size:
+                new_mib = float(size.group(1))
+            done = re.search(r"dynamic KV grow completed in\s*([0-9.]+) ms", follow)
+            if done:
+                duration_ms = float(done.group(1))
+                break
+
+        old_mib = new_mib * old_cells / new_cells if new_cells and new_mib else 0.0
+        start = start_abs - load_origin
+        end = start + duration_ms / 1000.0
+        detail = f"{old_cells}->{new_cells}/{logical_cells} cells; {old_mib:.2f}->{new_mib:.2f} MiB"
+        rows.append({
+            "row_type": "DynamicKVGrow",
+            "elapsed_s_start": f"{start:.6f}",
+            "elapsed_s_end": f"{end:.6f}",
+            "rss_kb_start": "",
+            "rss_kb_end": "",
+            "col_a_ms": f"{duration_ms:.0f}",
+            "col_b_ms": "",
+            "total_ms": f"{duration_ms:.0f}",
+            "kv_pos": str(old_cells),
+            "kv_total": str(new_cells),
+            "kv_used_pct": "",
+            "kv_estimated_used_kb": str(int(round(old_mib * 1024))) if old_mib else "",
+            "kv_total_kb": str(int(round(new_mib * 1024))) if new_mib else "",
+            "kv_physical_committed_kb": str(int(round(new_mib * 1024))) if new_mib else "",
+            "token_idx": detail,
+        })
+    return rows
 
 
 def _phase_rows_from_artifacts(result_dir: Path) -> list[dict[str, str]]:
@@ -456,6 +529,7 @@ def _phase_colors() -> dict[str, str]:
         "ImagePrefill": "#0984e3",
         "T_Prefill": "#e17055",
         "Mmproj": "#00cec9",
+        "DynamicKVGrow": "#2d3436",
         "D": "#ff7675",
         "Decode": "#d63031",
     }
@@ -534,6 +608,98 @@ def _write_png_memory_timeline(
     ax.set_xlim(left=min(xs), right=max(xs))
     fig.tight_layout()
     fig.savefig(output_dir / "memory_timeline_plot.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_png_memory_timeline_decode_window(
+    output_dir: Path,
+    rows: list[dict[str, str]],
+    phase_rows: list[dict[str, str]] | None = None,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    phase_rows = phase_rows or []
+    vision_starts = [_phase_float(row, "elapsed_s_start") for row in phase_rows if row.get("row_type") == "V_Encode"]
+    decode_ends = [_phase_float(row, "elapsed_s_end") for row in phase_rows if row.get("row_type") in {"D", "Decode"}]
+    if not vision_starts or not decode_ends:
+        return
+    window_start = min(vision_starts)
+    window_end = max(decode_ends)
+    if window_end <= window_start:
+        return
+
+    usable: list[dict[str, str]] = []
+    for row in rows:
+        if not row.get("elapsed_s") or not row.get("mem_available_kb"):
+            continue
+        try:
+            elapsed = float(row["elapsed_s"])
+        except ValueError:
+            continue
+        if window_start <= elapsed <= window_end:
+            usable.append(row)
+    if not usable:
+        return
+
+    xs = [float(r["elapsed_s"]) for r in usable]
+    mem_available = [float(r["mem_available_kb"]) / 1024.0 for r in usable]
+    kgsl = [float(r.get("kgsl_shmem_usage_kb") or 0) / 1024.0 for r in usable]
+
+    fig, ax = plt.subplots(figsize=(19, 8), dpi=160)
+    ax.plot(xs, mem_available, label="MemAvailable (MiB)", linewidth=2.4, marker="o", markersize=3.0, color="#0984e3")
+    if any(value > 0 for value in kgsl):
+        ax.plot(xs, kgsl, label="KgslShmemUsage (MiB)", linewidth=2.0, marker="s", markersize=2.5, color="#6c5ce7")
+
+    colors = _phase_colors()
+    phase_labels: dict[str, object] = {}
+    for phase in phase_rows:
+        name = phase.get("row_type", "")
+        if name not in {"V_Encode", "ImagePrefill", "T_Prefill", "Mmproj", "DynamicKVGrow"}:
+            continue
+        start = _phase_float(phase, "elapsed_s_start")
+        end = _phase_float(phase, "elapsed_s_end")
+        if end <= start or end < window_start or start > window_end:
+            continue
+        color = colors.get(name, "#636e72")
+        phase_alpha = 0.14 if name == "DynamicKVGrow" else 0.06
+        span = ax.axvspan(start, end, color=color, alpha=phase_alpha)
+        if name not in phase_labels:
+            phase_labels[name] = span
+        ax.axvline(start, color=color, linestyle="--", linewidth=1.1, alpha=0.85)
+        if name == "DynamicKVGrow":
+            detail = phase.get("token_idx", "")
+            label = f"KV grow\n{detail}" if detail else "KV grow"
+            ax.text(
+                start,
+                0.98,
+                label,
+                transform=ax.get_xaxis_transform(),
+                ha="left",
+                va="top",
+                fontsize=8,
+                color=color,
+                bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": color, "alpha": 0.85},
+            )
+
+    ax.set_title(f"Memory Timeline From Vision Encode To Decode End: {output_dir.name}")
+    ax.set_xlabel("Elapsed Time (s)")
+    ax.set_ylabel("Memory (MiB)")
+    ax.set_xlim(left=window_start, right=window_end)
+    ax.grid(True, linestyle=":", alpha=0.35)
+    handles, labels = ax.get_legend_handles_labels()
+    for name in ["V_Encode", "ImagePrefill", "T_Prefill", "Mmproj", "DynamicKVGrow"]:
+        if name in phase_labels:
+            handles.append(phase_labels[name])
+            labels.append(name)
+    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0, fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(output_dir / "memory_timeline_decode_window.png", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -738,6 +904,7 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
         "Mmproj",
         "T_Prefill",
         "ImagePrefill",
+        "DynamicKVGrow",
         "D",
     ]
     y_for = {name: idx for idx, name in enumerate(visible)}
@@ -765,6 +932,8 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
             label = f"{duration_ms:.0f}ms"
             if name in {"V_Encode", "ImagePrefill", "T_Prefill"}:
                 label = f"P{idx} {label}"
+            if name == "DynamicKVGrow":
+                label = f"KV +{duration_ms:.0f}ms"
             ax.text(
                 start + (end - start) / 2.0,
                 y,
@@ -863,6 +1032,8 @@ def _finalize_hybrid_outputs(result_dir: Path) -> None:
 
     phase_rows = _phase_rows_from_artifacts(result_dir)
     if phase_rows:
+        phase_rows.extend(_dynamic_kv_rows_from_stdout(stdout_path))
+        phase_rows.sort(key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end")))
         _write_phase_csv(result_dir / "foundation_proc.csv", phase_rows)
         plot_phase_rows = _read_phase_rows(result_dir / "foundation_proc.csv")
     else:
@@ -926,6 +1097,8 @@ def _finalize_hybrid_streaming_outputs(result_dir: Path) -> None:
 
     phase_rows = _read_phase_rows(result_dir / "streaming_phase_stats.csv")
     if phase_rows:
+        phase_rows.extend(_dynamic_kv_rows_from_stdout(stdout_path))
+        phase_rows.sort(key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end")))
         _write_phase_csv(result_dir / "foundation_proc.csv", phase_rows)
         plot_phase_rows = _read_phase_rows(result_dir / "foundation_proc.csv")
     else:
@@ -933,6 +1106,7 @@ def _finalize_hybrid_streaming_outputs(result_dir: Path) -> None:
         plot_phase_rows = []
     _write_memory_usage_txt(result_dir, memory_rows)
     _write_png_memory_timeline(result_dir, memory_rows, plot_phase_rows)
+    _write_png_memory_timeline_decode_window(result_dir, memory_rows, plot_phase_rows)
     if plot_phase_rows:
         _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
         _write_png_streaming_phase_timeline(result_dir, plot_phase_rows)
@@ -1039,11 +1213,13 @@ def _result_model_name(
     *,
     text_only: bool = False,
     streaming: bool = False,
+    dynamic_kv_cache: bool = False,
 ) -> str:
     suffix = "opencl" if processor == "gpu" else processor
     kv = _result_kv_suffix(cache_type_k, cache_type_v)
     mid = "_streaming" if streaming else "_text" if text_only else ""
-    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}"
+    dynamic = "_dynamic" if dynamic_kv_cache else ""
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}"
 
 
 def _find_executable(build_dir: Path, name: str) -> Path:
@@ -1306,6 +1482,17 @@ def _flash_attn_kv_shell_suffix(args: argparse.Namespace) -> str:
     return (" " + " ".join(parts)) if parts else ""
 
 
+def _ctx_dynamic_kv_shell_suffix(args: argparse.Namespace) -> str:
+    if getattr(args, "dynamic_kv_cache", False):
+        parts = ["--dynamic-kv-cache"]
+        if getattr(args, "kv_init_size", None):
+            parts.extend(["--kv-init-size", str(args.kv_init_size)])
+        if getattr(args, "kv_grow_step", None):
+            parts.extend(["--kv-grow-step", str(args.kv_grow_step)])
+        return " " + " ".join(parts)
+    return f" -c {args.ctx_size}"
+
+
 def _remote_llama_env_exports(args: argparse.Namespace) -> str:
     """Lines emitted after cd ... || exit 1 (LD_LIBRARY_PATH + optional experiment vars)."""
     lines: list[str] = []
@@ -1338,6 +1525,7 @@ def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, 
     fit_suffix = _fit_shell_suffix(args)
     rope_suffix = _rope_shell_suffix(args)
     flash_kv_suffix = _flash_attn_kv_shell_suffix(args)
+    ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     env_exports = _remote_llama_env_exports(args)
     return f"""#!/system/bin/sh
 cd {shlex.quote(args.remote_root)} || exit 1
@@ -1357,7 +1545,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
   --phase-stats-path decoder_phase_stats.csv --ready-path decoder_ready.flag \\
   --wait-for-embedding --wait-timeout-ms 120000 \\
   --token-io-path foundation_token_io.txt {('--force-generation' if args.force_generation else '')} \\
-  -p {prompt} -n {args.force_generation or args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} \\
+  -p {prompt} -n {args.force_generation or args.n_predict}{ctx_dynamic_kv_suffix} -b {args.batch_size} -ub {args.ubatch_size} \\
   -ngl {args.gpu_layers} {device_arg}{cache_suffix}{fit_suffix}{rope_suffix}{flash_kv_suffix} > hybrid_decode_stdout.txt 2>&1 &
 decoder_pid=$!
 
@@ -1415,6 +1603,7 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
     fit_suffix = _fit_shell_suffix(args)
     rope_suffix = _rope_shell_suffix(args)
     flash_kv_suffix = _flash_attn_kv_shell_suffix(args)
+    ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     force_arg = "--force-generation" if args.force_generation else ""
     single_buffer_arg = "--single-buffer" if args.single_buffer else ""
     is_hybrid = args.processor == "hybrid"
@@ -1442,7 +1631,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
   --stream-manifest media_manifest.json \\
   --stream-events-path stream_events.csv --phase-stats-path streaming_phase_stats.csv \\
   --output foundation_output.txt --token-io-path foundation_token_io.txt \\
-  -n {args.force_generation or args.n_predict} -c {args.ctx_size} -b {args.batch_size} -ub {args.ubatch_size} \\
+  -n {args.force_generation or args.n_predict}{ctx_dynamic_kv_suffix} -b {args.batch_size} -ub {args.ubatch_size} \\
   -ngl {args.gpu_layers} -t {args.threads} --temp {args.temperature} \\
   {device_arg}{cache_suffix}{fit_suffix}{rope_suffix}{flash_kv_suffix} {force_arg} > {stdout_name} 2>&1 &
 runner_pid=$!
@@ -1612,6 +1801,14 @@ def main() -> int:
     )
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--ctx-size", type=int, default=32768)
+    parser.add_argument(
+        "--dynamic-kv-cache",
+        action="store_true",
+        dest="dynamic_kv_cache",
+        help="Project prototype: use model max context as logical limit and grow physical KV on demand.",
+    )
+    parser.add_argument("--kv-init-size", type=int, default=1024, help="Initial physical KV capacity for --dynamic-kv-cache.")
+    parser.add_argument("--kv-grow-step", type=int, default=1024, help="Physical KV grow step for --dynamic-kv-cache.")
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--ubatch-size", type=int, default=512)
     parser.add_argument("--gpu-layers", "--n-gpu-layers", dest="gpu_layers", type=int, default=99)
@@ -1868,6 +2065,7 @@ def main() -> int:
         args.cache_type_v,
         text_only=_standalone_completion_mode(args),
         streaming=args.streaming_video is not None,
+        dynamic_kv_cache=getattr(args, "dynamic_kv_cache", False),
     )
     result_dir.mkdir(parents=True, exist_ok=True)
 
