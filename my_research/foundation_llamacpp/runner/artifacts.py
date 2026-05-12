@@ -18,6 +18,18 @@ HYBRID_PULL_ARTIFACTS = (
     "android_memory_timeline.csv",
 )
 
+HYBRID_STREAMING_PULL_ARTIFACTS = (
+    "hybrid_streaming_stdout.txt",
+    "foundation_output.txt",
+    "stream_events.csv",
+    "streaming_phase_stats.csv",
+    "foundation_token_io.txt",
+    "foundation_inference_tokens.txt",
+    "media_manifest.json",
+    "foundation_exit_code.txt",
+    "android_memory_timeline.csv",
+)
+
 STANDALONE_PULL_ARTIFACTS = (
     "foundation_output.txt",
     "foundation_exit_code.txt",

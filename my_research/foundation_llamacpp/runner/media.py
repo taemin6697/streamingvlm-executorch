@@ -202,7 +202,126 @@ def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segment
     )
 
 
+def prepare_streaming_video_media(
+    video: Path,
+    work_dir: Path,
+    *,
+    sampling_fps: float,
+    prompt_events: list[dict[str, object]],
+    max_num: int,
+    max_video_time: float | None = None,
+    single_buffer: bool = False,
+) -> PreparedMedia:
+    from PIL import Image
+
+    decord = importlib.import_module("decord")
+    vr = decord.VideoReader(str(video), ctx=decord.cpu(0), num_threads=1)
+    source_fps = float(vr.get_avg_fps())
+    if source_fps <= 0:
+        raise SystemExit(f"Could not read FPS from streaming video: {video}")
+    frame_count = len(vr)
+    duration_s = frame_count / source_fps if frame_count else 0.0
+    if frame_count <= 0:
+        raise SystemExit(f"Streaming video has no frames: {video}")
+    effective_duration_s = min(duration_s, max_video_time) if max_video_time is not None else duration_s
+
+    sample_count = int(np.floor(effective_duration_s * sampling_fps)) + 1
+    timestamps = [idx / sampling_fps for idx in range(sample_count)]
+    frame_indices = sorted({
+        min(int(round(ts * source_fps)), frame_count - 1)
+        for ts in timestamps
+        if ts <= effective_duration_s
+    })
+
+    frame_bins: list[Path] = []
+    layout_images: list[Path] = []
+    num_patches_list: list[int] = []
+    frame_records: list[dict[str, object]] = []
+    for stream_i, frame_index in enumerate(frame_indices):
+        timestamp_s = frame_index / source_fps
+        image = Image.fromarray(vr[int(frame_index)].asnumpy()).convert("RGB")
+        if single_buffer:
+            layout_image = work_dir / f"stream_frame_{stream_i:04d}.png"
+            image.save(layout_image)
+            layout_images.append(layout_image)
+            num_patches_list.append(1)
+            frame_records.append(
+                {
+                    "stream_frame": stream_i,
+                    "timestamp_s": round(timestamp_s, 6),
+                    "video_frame_index": int(frame_index),
+                    "num_patches": 1,
+                    "tiles": [{"layout_image": layout_image.name}],
+                }
+            )
+            continue
+        tiles = dynamic_preprocess_tiles(image, image_size=448, max_num=max_num, use_thumbnail=True)
+        num_patches_list.append(len(tiles))
+        tile_records: list[dict[str, object]] = []
+        for tile_i, tile in enumerate(tiles):
+            stem = f"stream_frame_{stream_i:04d}_tile_{tile_i:04d}"
+            frame_bin = work_dir / f"{stem}.bin"
+            layout_image = work_dir / f"{stem}.png"
+            normalize_image_to_bin(tile, frame_bin)
+            tile.save(layout_image)
+            frame_bins.append(frame_bin)
+            layout_images.append(layout_image)
+            tile_records.append({"bin": frame_bin.name, "layout_image": layout_image.name})
+        frame_records.append(
+            {
+                "stream_frame": stream_i,
+                "timestamp_s": round(timestamp_s, 6),
+                "video_frame_index": int(frame_index),
+                "num_patches": len(tiles),
+                "tiles": tile_records,
+            }
+        )
+
+    metadata = {
+        "schema_version": MEDIA_MANIFEST_VERSION,
+        "source_kind": "streaming_video",
+        "source": str(video),
+        "source_fps": source_fps,
+        "sampling_fps": sampling_fps,
+        "duration_s": duration_s,
+        "effective_duration_s": effective_duration_s,
+        "max_video_time": max_video_time,
+        "frame_count": frame_count,
+        "max_num": max_num,
+        "stream_mode": "single_buffer" if single_buffer else "vision_encoder",
+        "frame_indices": [int(i) for i in frame_indices],
+        "num_patches_list": num_patches_list,
+        "frame_bins": [p.name for p in frame_bins],
+        "layout_images": [p.name for p in layout_images],
+        "frames": frame_records,
+        "prompt_events": prompt_events,
+        "prompt": "",
+        "raw_prompt": [event["prompt"] for event in prompt_events],
+    }
+    metadata_path = work_dir / "media_manifest.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return PreparedMedia(
+        frame_bins=frame_bins,
+        layout_images=layout_images,
+        prompt="",
+        metadata_path=metadata_path,
+        num_patches_list=num_patches_list,
+        frame_indices=[int(i) for i in frame_indices],
+        source_kind="streaming_video",
+    )
+
+
 def prepare_media(args, work_dir: Path) -> PreparedMedia:
+    if getattr(args, "streaming_video", None) is not None:
+        return prepare_streaming_video_media(
+            args.streaming_video,
+            work_dir,
+            sampling_fps=args.sampling_fps,
+            prompt_events=args.prompt_events,
+            max_num=args.max_num,
+            max_video_time=getattr(args, "max_video_time", None),
+            single_buffer=getattr(args, "single_buffer", False),
+        )
     if args.video is not None:
         return prepare_video_media(
             args.video,

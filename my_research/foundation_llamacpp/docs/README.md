@@ -408,6 +408,51 @@ For this video path, check `media_manifest.json` for sampled frame indices and
 (for the command above, `8 x 256 x 4096`), and `foundation_inference_tokens.txt`
 for eight frame-prefixed IMAGE chunks.
 
+Streaming video input is separate from the offline `--video` path. The host
+samples the video at a fixed `--sampling-fps`, pushes sampled frame images plus
+`media_manifest.json`, and the device-side `hybrid_streaming_decode` runner
+simulates real-time frame arrival from that manifest. In the current
+`--single-buffer` mode it keeps only the latest sampled image as the buffer; when
+a prompt timestamp is reached, the runner answers using that buffered image.
+Prompt events are given as JSON lists with matching lengths:
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q4_K_M.gguf \
+  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
+  --single-buffer \
+  --sampling-fps 1.0 \
+  --max_video_time 15 \
+  --time '[5.0, 8.0]' \
+  --prompt '["What is this situation?", "What is that?!"]' \
+  --max-num 1 \
+  --n-predict 32 \
+  --ctx-size 4096 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --soc-model SM8750 \
+  --baseline-window 5.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log \
+  --force-push
+```
+
+This first streaming runner records frame-buffer updates and prompt handling in
+`stream_events.csv` and phase rows in `streaming_phase_stats.csv`, then mirrors
+them into the usual `foundation_summary.csv`, `foundation_proc.csv`, and plots.
+It is a deterministic file-backed streaming simulator: frames are extracted and
+pushed before the Android run, then consumed on device according to manifest
+timestamps. Future modes can add persistent prefill or vision-encoder-only
+behavior beside `--single-buffer`.
+
 This `--vision` artifact is the 16a8w QNN vision-tower-only export:
 `projector_included: false`, output shape `1 x 256 x 4096`. Because it stops
 before InternVL3 `multi_modal_projector`, the decoder bridge must apply mmproj

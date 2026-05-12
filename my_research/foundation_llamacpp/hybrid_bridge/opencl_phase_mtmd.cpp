@@ -440,6 +440,7 @@ void show_usage(int, char** argv) {
 
 } // namespace
 
+#ifndef STREAMINGVLM_OPENCL_PHASE_MTMD_NO_MAIN
 int main(int argc, char** argv) {
   std::setlocale(LC_NUMERIC, "C");
   ggml_time_init();
@@ -522,3 +523,4 @@ int main(int argc, char** argv) {
   llama_perf_context_print(ctx.lctx);
   return 0;
 }
+#endif

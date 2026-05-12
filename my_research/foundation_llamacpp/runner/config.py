@@ -30,6 +30,8 @@ class PreparedMedia:
 
 
 def media_mode_from_args(args) -> MediaMode:
+    if getattr(args, "streaming_video", None) is not None:
+        return MediaMode.STREAMING
     if getattr(args, "video", None) is not None:
         return MediaMode.VIDEO_FILE
     if getattr(args, "image", None) is not None:

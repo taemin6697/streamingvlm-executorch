@@ -28,6 +28,8 @@ my_research/foundation/
   docs/
     mobile_backend_flow.md
     for_cursor_llm.md
+    archive/
+      awesome_streaming_video_understanding_survey.md
   scripts/
     build_backend_and_runner.sh
     export_internvl3_matrix.sh
@@ -60,6 +62,56 @@ my_research/foundation/
 ```
 
 ## Changes Already Made
+
+### 2026-05-12. Foundation llama.cpp streaming-video simulator
+
+`run_android_hybrid_bridge.py` now accepts a separate hybrid-only
+`--streaming-video` mode with `--sampling-fps`, `--time '[...]'`, and list-form
+`--prompt '[...]'`. The current `--single-buffer` submode samples frame PNGs at
+fixed FPS, writes a `media_manifest.json` with frame timestamps and prompt
+events, pushes all files up front, and invokes a project-local Android bridge
+binary `hybrid_streaming_decode`.
+
+The first streaming runner is intentionally deterministic: it reads the manifest
+on device, uses a producer thread to enqueue frames according to timestamps, and
+a consumer loop to update a one-image buffer. At prompt timestamps it calls the
+existing llama.cpp multimodal runner on the currently buffered image and prompt.
+It records `stream_events.csv` and `streaming_phase_stats.csv`; the Python
+finalizer mirrors those into `foundation_summary.csv`, `foundation_proc.csv`, and
+plots. Future modes can add persistent prefill or vision-encoder-only behavior
+beside `--single-buffer`.
+
+Follow-up: `hybrid_streaming_decode` now merges each delegated
+`opencl_phase_mtmd` prompt run's `stream_prompt_phase_<idx>.csv` into
+`streaming_phase_stats.csv` with a wall-clock offset. This keeps streaming
+`foundation_proc.csv` compatible with the existing phase vocabulary, including
+`ImageLoad`, `LayoutTokenize`, `V_Encode`, `Mmproj`, `ImagePrefill`,
+`T_Prefill`, and per-token `D` rows.
+
+The streaming finalizer also writes `streaming_phase_timeline.png` from
+`foundation_proc.csv`, showing single-buffer frame updates, prompt trigger
+markers, and delegated prompt phases on a shared elapsed-time axis. The plot is
+rebased to the first `SingleBufferUpdate` so setup/model-load time remains in
+the CSV but is excluded from the visual streaming timeline.
+
+Follow-up: `--single-buffer` no longer launches `opencl_phase_mtmd` as a fresh
+process per prompt. `hybrid_streaming_decode` links llama.cpp/mtmd directly,
+loads the text model and mmproj once before frame playback, clears KV/sampler
+state per prompt, and evaluates the buffered image in-process. As a result,
+`L_DecoderRuntimeInit` and `L_DecoderLoad` appear once at run setup instead of
+inside every prompt latency.
+
+`run_android_hybrid_bridge.py` accepts `--max-video-time` / `--max_video_time`
+for `--streaming-video`. Media preparation samples only up to that many seconds
+and records both `duration_s` and `effective_duration_s` in `media_manifest.json`.
+
+### 2026-05-12. Streaming video understanding survey archive
+
+Added `docs/archive/awesome_streaming_video_understanding_survey.md`: curated snapshot of
+[Awesome-Streaming-Video-Understanding](https://github.com/sotayang/Awesome-Streaming-Video-Understanding)
+(README captured 2026-05-12), plus short notes on typical web ingest pipelines and the local
+`my_research/test_python/external/Flash-VStream` multiprocess streaming demo (`embed_video_streaming`
+vs CLI `generate`). Prefer refreshing content from upstream README rather than hand-editing the tables.
 
 ### 2026-05-11. Android Hybrid Video Input
 
