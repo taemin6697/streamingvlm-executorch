@@ -3350,3 +3350,14 @@ segment; only after IDs match is it worthwhile to blame sampling, KV dtype, or k
   A prompt at stream time 3s/5s/8s should now appear at 3s/5s/8s on the plot rather than at 0s.
 - Updated `my_research/foundation_llamacpp/docs/README.md` to state that streaming timeline x-axis
   labels are stream/video time, not first-prompt-relative time.
+
+## foundation_llamacpp: streaming implementation archive note (2026-05-12)
+
+- Added `my_research/foundation_llamacpp/docs/archive/streaming_single_buffer_implementation.md`
+  as a detailed code-level implementation note for `--streaming-video --single-buffer`.
+- The note explains what changed across `runner/media.py`, `runner/cli.py`,
+  `runner/artifacts.py`, `hybrid_bridge/CMakeLists.txt`,
+  `hybrid_bridge/hybrid_streaming_decode.cpp`, and `vision_encoder_et.{hpp,cpp}`.
+- It also records the single-buffer semantics, Android producer/consumer scheduling,
+  QNN vs OpenCL prompt execution paths, token trace aggregation fix, stream-time timeline plot,
+  validation results, current limits, and future modification checklist.

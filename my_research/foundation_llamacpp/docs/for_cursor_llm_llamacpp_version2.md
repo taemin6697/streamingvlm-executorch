@@ -418,3 +418,20 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - decode tokens mostly about `160-188 ms/token`;
   - prompt 1 answered that the earlier question asked about the situation in the
     image, confirming multi-turn state was preserved.
+
+## 2026-05-12: Streaming Implementation Archive Note
+
+- Added `docs/archive/streaming_single_buffer_implementation.md` as a detailed
+  code-level explanation of the current `--streaming-video --single-buffer`
+  implementation.
+- The archive note documents:
+  - host CLI parsing and validation in `runner/cli.py`;
+  - video sampling and streaming `media_manifest.json` generation in
+    `runner/media.py`;
+  - Android remote script construction and artifact finalization;
+  - CMake target split between `hybrid_streaming_decode` and
+    `opencl_streaming_decode`;
+  - C++ producer/consumer scheduling in `hybrid_streaming_decode.cpp`;
+  - QNN `VisionEncoderSession`, OpenCL prompt execution, multi-turn state,
+    token trace aggregation, phase CSVs, timeline plotting, validation results,
+    known limits, and future modification checklists.
