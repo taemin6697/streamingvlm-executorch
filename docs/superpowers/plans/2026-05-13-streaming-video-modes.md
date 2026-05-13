@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add `single-buffer`, `context-window`, and `vision-prefill` modes to the existing Android `--streaming-video` runner.
+**Goal:** Add `single-buffer`, `sliding-window`, and `vision-prefill` modes to the existing Android `--streaming-video` runner.
 
 **Architecture:** Keep Python responsible for media sampling, manifest metadata, and CLI compatibility. Move frame-selection semantics into small pure helpers, then mirror the selection in the C++ streaming runner so prompt jobs can carry one or more frames.
 
@@ -39,7 +39,7 @@
 - [ ] Parse stream mode and window controls.
 - [ ] Change `PromptJob` from one frame to many frames.
 - [ ] For `single-buffer`, preserve existing behavior and multi-turn state.
-- [ ] For `context-window` and `vision-prefill`, reset decoder state before each prompt and format all selected frames as `Frame N:` video input.
+- [ ] For `sliding-window` and `vision-prefill`, reset decoder state before each prompt and format all selected frames as `Frame N:` video input.
 - [ ] Support both QNN hybrid and OpenCL-only paths using existing multi-image evaluation helpers.
 
 ### Task 4: Documentation And Verification

@@ -6,8 +6,8 @@ guide. Build internals and historical notes live in
 `archive/executorch_vision_llamacpp_decoder.md`. Dynamic KV implementation
 details live in `archive/dynamic_kv_cache_implementation.md`. Streaming
 single-buffer details live in `archive/streaming_single_buffer_implementation.md`;
-context-window and KV vision-prefill details live in
-`archive/streaming_context_window_and_vision_prefill.md`.
+sliding-window and KV vision-prefill details live in
+`archive/streaming_sliding_window_and_vision_prefill.md`.
 
 ## Common Setup
 
@@ -456,7 +456,7 @@ Streaming video mode is supported by `--processor gpu` and `--processor hybrid`.
 The host samples the video first and pushes frame files plus `media_manifest.json`
 to Android. The device runner then replays those frames according to their
 timestamps. `--stream-mode single-buffer` keeps only the latest sampled frame.
-`--stream-mode context-window` turns the recent sampled frames into one
+`--stream-mode sliding-window` turns the recent sampled frames into one
 singleton video clip at prompt arrival. `--stream-mode vision-prefill` is the
 hybrid KV-cache observation mode: every sampled frame builds a full-history
 video-prefix KV snapshot, and prompt handling restores that snapshot before
@@ -621,7 +621,7 @@ same marker should appear in `streaming_phase_timeline.png` and
   current image buffer. Earlier frames are overwritten, not queued for later
   processing. This mode keeps llama.cpp chat/KV state across prompt events.
 
---stream-mode context-window
+--stream-mode sliding-window
   Sliding video-window baseline. Each prompt selects recent sampled frames,
   formats them as `Frame 1: <__media__>` / `Frame 2: <__media__>` / ... plus
   the question, clears decoder chat/KV state, then runs full vision encode,
@@ -647,13 +647,13 @@ same marker should appear in `streaming_phase_timeline.png` and
   into each cached KV chunk.
 
 --window-sec SEC
-  Optional prompt-time lookback window for context-window.
+  Optional prompt-time lookback window for sliding-window.
   If omitted, all sampled frames up to the prompt timestamp are eligible before
   `--window-max-frames` is applied. `vision-prefill` ignores this option and
   caches the full sampled frame history up to each frame.
 
 --window-max-frames N
-  Maximum frames used by one context-window prompt. If more frames are eligible,
+  Maximum frames used by one sliding-window prompt. If more frames are eligible,
   an even temporal subset is selected. `vision-prefill` ignores this option and
   caches the full sampled frame history up to each frame.
 
@@ -672,7 +672,7 @@ same marker should appear in `streaming_phase_timeline.png` and
 
 --max-num N
   Max InternVL dynamic-preprocess tiles per sampled video frame. Single-buffer
-  still uses one full-frame image; context-window and vision-prefill use the
+  still uses one full-frame image; sliding-window and vision-prefill use the
   normal tiled video-frame path.
 
 --dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024
@@ -718,7 +718,7 @@ Prompt wait
 
 Multi-turn
   Streaming single-buffer keeps llama.cpp chat/KV state across prompt events.
-  `context-window` intentionally clears llama.cpp chat/KV state before each
+  `sliding-window` intentionally clears llama.cpp chat/KV state before each
   prompt. `vision-prefill` restores a cached video-prefix KV snapshot before the
   prompt text suffix, so it is still a singleton video query at the chat level.
   `foundation_inference_tokens.txt` appends all turns, and
@@ -733,7 +733,7 @@ Vision-prefill scheduling
   rows before the matching `ImagePrefill` rows.
 ```
 
-Example context-window run:
+Example sliding-window run:
 
 ```bash
 python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
@@ -743,7 +743,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
   --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
-  --stream-mode context-window \
+  --stream-mode sliding-window \
   --sampling-fps 1.0 \
   --window-sec 4.0 \
   --window-max-frames 8 \

@@ -2,15 +2,15 @@
 
 ## Goal
 
-Extend `--streaming-video` beyond the current latest-frame baseline so experiments can compare native single-frame streaming, context-window streaming, and cached-vision-prefill-style streaming with the same Android runner and artifacts.
+Extend `--streaming-video` beyond the current latest-frame baseline so experiments can compare native single-frame streaming, sliding-window streaming, and cached-vision-prefill-style streaming with the same Android runner and artifacts.
 
 ## Modes
 
 - `single-buffer`: existing baseline. Each prompt uses the latest sampled frame as one image.
-- `context-window`: singleton baseline. Each prompt resets decoder/chat state, selects recent sampled frames, formats them as an InternVL-style video prompt, then runs full vision encode, image prefill, text prefill, and decode after the prompt.
+- `sliding-window`: singleton baseline. Each prompt resets decoder/chat state, selects recent sampled frames, formats them as an InternVL-style video prompt, then runs full vision encode, image prefill, text prefill, and decode after the prompt.
 - `vision-prefill`: singleton baseline. Each prompt resets decoder/chat state and uses multiple selected frames in the same InternVL-style video prompt. The first implementation keeps the selection/manifest/runner interface separate so frame-level precompute or KV-level prefill reuse can be added without changing CLI shape.
 
-`context-window` and `vision-prefill` both use:
+`sliding-window` and `vision-prefill` both use:
 
 ```text
 Frame 1: <__media__>
@@ -21,7 +21,7 @@ Frame 2: <__media__>
 
 ## CLI
 
-Add `--stream-mode {single-buffer,context-window,vision-prefill}`. Keep `--single-buffer` as a backward-compatible alias for `--stream-mode single-buffer`.
+Add `--stream-mode {single-buffer,sliding-window,vision-prefill}`. Keep `--single-buffer` as a backward-compatible alias for `--stream-mode single-buffer`.
 
 Add frame selection controls:
 
@@ -37,7 +37,7 @@ The C++ streaming runner changes prompt jobs from one `FrameRecord` to a vector 
 Decoder state behavior:
 
 - `single-buffer`: keep existing multi-turn behavior.
-- `context-window`: reset before each prompt.
+- `sliding-window`: reset before each prompt.
 - `vision-prefill`: reset before each prompt.
 
 This gives clean singleton latency baselines for the two video modes while preserving the original native streaming baseline.

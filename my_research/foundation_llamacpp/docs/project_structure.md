@@ -256,7 +256,7 @@ duration_s / effective_duration_s / max_video_time:
   original and clipped stream duration
 
 stream_mode:
-  "single_buffer", "context_window", or "vision_prefill"
+  "single_buffer", "sliding_window", or "vision_prefill"
 
 frames:
   stream_frame index, timestamp_s, video_frame_index, num_patches, and tile files
@@ -271,7 +271,7 @@ queue. Prompt events capture the buffered frame at arrival time; the actual
 prompt execution lane is serialized, so a prompt may wait behind an earlier
 decode.
 
-In `--stream-mode context-window`, prompt events capture a selected list of
+In `--stream-mode sliding-window`, prompt events capture a selected list of
 sampled frames rather than one latest frame. The selection is bounded by
 `--window-sec` and then evenly reduced to `--window-max-frames` when needed.
 The decoder context is reset before each prompt, so the selected frames behave
@@ -478,7 +478,7 @@ Responsibilities:
 
 ```text
 Purpose:
-  hybrid QNN streaming runner for single-buffer, context-window, and
+  hybrid QNN streaming runner for single-buffer, sliding-window, and
   vision-prefill modes.
 
 Compile mode:
@@ -500,7 +500,7 @@ Responsibilities:
   maintain sampled-frame history and the latest-frame buffer
   capture prompt events against the correct frame/window snapshot
   for single-buffer, QNN-encode only the selected frame per prompt
-  for context-window, reset decoder state and evaluate the selected window
+  for sliding-window, reset decoder state and evaluate the selected window
   for vision-prefill, build full-history KV snapshots as frames arrive
   run decoder-side mmproj, prefill, and decode
   preserve chat history and KV state only in single-buffer mode
@@ -753,10 +753,10 @@ Hybrid streaming QNN phase timing is rebased onto the llama.cpp `ggml_time_ms()`
 timeline. This avoids mixing ExecuTorch absolute timestamps with llama.cpp
 elapsed timestamps.
 
-### Streaming Context-Window Hybrid
+### Streaming Sliding-Window Hybrid
 
 ```text
-run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-mode context-window
+run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-mode sliding-window
   -> runner.media.prepare_streaming_video_media
   -> push media_manifest.json, stream_frame_<idx>.png, stream_frame_<idx>.bin
   -> run hybrid_streaming_decode
@@ -983,12 +983,12 @@ When changing streaming:
 1. Keep video_file and streaming semantics separate. Video_file is offline
    sampled frames; streaming is timestamped replay with prompt events.
 2. Preserve the explicit state model. Single-buffer is latest-frame state,
-   context-window is reset singleton window state, and vision-prefill is restored
+   sliding-window is reset singleton window state, and vision-prefill is restored
    full-history video-prefix KV state.
 3. Keep prompt arrival timestamp, selected buffered frame, and actual execution
    start distinguishable in stream_events.csv.
 4. Decoder context retention/eviction must remain explicit. Single-buffer
-   preserves chat history and KV across prompt events; context-window clears
+   preserves chat history and KV across prompt events; sliding-window clears
    them; vision-prefill restores a cached prefix state and evaluates only the
    text suffix.
 5. Keep OpenCL and Hybrid streaming artifacts aligned so their timelines can be

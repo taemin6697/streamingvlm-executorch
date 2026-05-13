@@ -1,9 +1,9 @@
-# Streaming Context-Window And Vision-Prefill Modes
+# Streaming Sliding-Window And Vision-Prefill Modes
 
 This note documents the two non-native streaming observation modes added after
 the original single-buffer streaming baseline:
 
-- `--stream-mode context-window`
+- `--stream-mode sliding-window`
 - `--stream-mode vision-prefill`
 
 The code lives in the foundation llama.cpp runner and bridge:
@@ -28,7 +28,7 @@ single-buffer:
   multi-turn chat/KV state is preserved
   prompt latency includes prompt-time vision encode and image prefill
 
-context-window:
+sliding-window:
   selected recent frames become one video clip
   decoder chat/KV state is reset per prompt
   prompt latency includes full prompt-time vision encode and image prefill
@@ -39,7 +39,7 @@ vision-prefill:
   prompt latency restores cached image-prefix KV and evaluates only text suffix
 ```
 
-`context-window` is the sliding-window baseline. `vision-prefill` is the current
+`sliding-window` is the sliding-window baseline. `vision-prefill` is the current
 KV-level image-prefill cache path. It is not yet the chunk-composition algorithm
 planned for future `--chunked-vision-prefill`.
 
@@ -61,7 +61,7 @@ The manifest records:
 
 ```text
 source_kind: streaming_video
-stream_mode: single_buffer | context_window | vision_prefill
+stream_mode: single_buffer | sliding_window | vision_prefill
 sampling_fps
 duration_s
 effective_duration_s
@@ -83,14 +83,14 @@ ExecuTorch/QNN vision encoding.
 --single-buffer
   Backward-compatible alias for --stream-mode single-buffer.
 
---stream-mode single-buffer|context-window|vision-prefill
+--stream-mode single-buffer|sliding-window|vision-prefill
   Selects streaming state semantics.
 
 --window-sec SEC
-  Lookback window used only by context-window.
+  Lookback window used only by sliding-window.
 
 --window-max-frames N
-  Maximum frame count used only by context-window.
+  Maximum frame count used only by sliding-window.
 ```
 
 `vision-prefill` intentionally ignores `--window-sec` and
@@ -99,7 +99,7 @@ ExecuTorch/QNN vision encoding.
 Result directories include the stream mode for non-single-buffer runs:
 
 ```text
-<model>_hybrid_ctx_4096_streaming_context_window_kv16
+<model>_hybrid_ctx_4096_streaming_sliding_window_kv16
 <model>_hybrid_ctx_4096_streaming_vision_prefill_kv16
 ```
 
@@ -122,9 +122,9 @@ The consumer lane processes jobs in queue order. This means prompt execution can
 wait behind older cache builds or an earlier prompt decode. The selected
 frame/window is still captured at the prompt's stream timestamp.
 
-## Context-Window Details
+## Sliding-Window Details
 
-`context-window` is a singleton video-window run per prompt.
+`sliding-window` is a singleton video-window run per prompt.
 
 Frame selection:
 

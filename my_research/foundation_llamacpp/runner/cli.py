@@ -1953,14 +1953,14 @@ def main() -> int:
         "--stream_mode",
         dest="stream_mode",
         default=None,
-        choices=("single-buffer", "context-window", "vision-prefill"),
+        choices=("single-buffer", "sliding-window", "vision-prefill"),
         help="Streaming strategy for --streaming-video. Defaults to single-buffer; --single-buffer remains an alias.",
     )
     parser.add_argument("--num-segments", type=int, default=8, help="Uniform temporal samples for --video.")
     parser.add_argument("--sampling-fps", "--sampling_fps", dest="sampling_fps", type=float, default=None, help="Frame sampling FPS for --streaming-video.")
     parser.add_argument("--max-video-time", "--max_video_time", dest="max_video_time", type=float, default=None, help="Optional maximum streaming-video duration to sample, in seconds.")
-    parser.add_argument("--window-sec", "--window_sec", dest="window_sec", type=float, default=None, help="Prompt-time lookback window in seconds for context-window streaming. vision-prefill ignores this and caches full history.")
-    parser.add_argument("--window-max-frames", "--window_max_frames", dest="window_max_frames", type=int, default=8, help="Maximum sampled frames used by one context-window prompt. vision-prefill ignores this and caches full history.")
+    parser.add_argument("--window-sec", "--window_sec", dest="window_sec", type=float, default=None, help="Prompt-time lookback window in seconds for sliding-window streaming. vision-prefill ignores this and caches full history.")
+    parser.add_argument("--window-max-frames", "--window_max_frames", dest="window_max_frames", type=int, default=8, help="Maximum sampled frames used by one sliding-window prompt. vision-prefill ignores this and caches full history.")
     parser.add_argument("--time", default=None, help="JSON list of prompt timestamps for --streaming-video, e.g. '[5.0, 10.0]'.")
     parser.add_argument("--max-num", type=int, default=1, help="Max InternVL dynamic-preprocess tiles per sampled video frame.")
     parser.add_argument("--prompt", default="Describe this image briefly.")

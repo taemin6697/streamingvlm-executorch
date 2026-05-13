@@ -511,12 +511,12 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   init-16384 run closely, so the grow path does not appear to poison graph or
   scheduler caching across later prompts.
 
-## 2026-05-13: Context-Window And Vision-Prefill Streaming Modes
+## 2026-05-13: Sliding-Window And Vision-Prefill Streaming Modes
 
 - Added explicit streaming modes on top of `--streaming-video`:
   - `--stream-mode single-buffer`: the existing latest-frame baseline. It keeps
     chat/KV state across prompt events.
-  - `--stream-mode context-window`: a sliding-window singleton video baseline.
+  - `--stream-mode sliding-window`: a sliding-window singleton video baseline.
     Prompt arrival selects sampled frames up to the prompt timestamp, optionally
     filters by `--window-sec`, evenly limits with `--window-max-frames`, resets
     decoder chat/KV state, then evaluates the selected frames as a video clip.
@@ -535,7 +535,7 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   folders with `_streaming_<mode>` for non-single-buffer modes.
 - `hybrid_streaming_decode.cpp` now has explicit frame selection:
   - `single_buffer`: selected frame is the current latest frame.
-  - `context_window`: selected frames are bounded by prompt time/window and then
+  - `sliding_window`: selected frames are bounded by prompt time/window and then
     evenly sampled to `window_max_frames`.
   - `vision_prefill`: selected frames are the full sampled history up to the
     cache or prompt timestamp, ignoring `window_sec` and `window_max_frames`.
@@ -582,6 +582,6 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - CSV checks showed `VisionPrefillCacheBuild 11`,
     `VisionPrefillCacheHit 2`, `VisionPrefillV_Encode 66`,
     `VisionPrefillImagePrefill 66`, and `bad_consecutive_vencode=0`.
-- Added `docs/archive/streaming_context_window_and_vision_prefill.md` as the
+- Added `docs/archive/streaming_sliding_window_and_vision_prefill.md` as the
   detailed archive writeup for the sliding-window baseline and current
   full-history KV vision-prefill mode.

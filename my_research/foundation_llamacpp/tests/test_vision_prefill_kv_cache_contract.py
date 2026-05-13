@@ -56,6 +56,7 @@ def test_vision_prefill_keeps_full_history_and_caches_every_frame():
     source = STREAMING_CPP.read_text()
 
     assert 'args.stream_mode == "vision_prefill"' in source
+    assert 'args.stream_mode == "sliding_window"' in source
     assert "return selected;" in source
     assert "StreamJobKind::CacheUpdate" in source
     assert "drop_pending_cache_updates" not in source
