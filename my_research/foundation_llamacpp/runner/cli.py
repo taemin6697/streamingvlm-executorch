@@ -20,6 +20,7 @@ from my_research.foundation_llamacpp.runner.config import (
     backend_mode_from_processor,
     media_mode_from_args,
 )
+from my_research.foundation_llamacpp.runner.media import normalize_stream_mode
 from my_research.foundation_llamacpp.runner.media import prepare_media
 from my_research.foundation_llamacpp.runner.media import prepare_warmup_image
 from my_research.foundation_llamacpp.runner.artifacts import (
@@ -645,6 +646,7 @@ def _phase_colors() -> dict[str, str]:
         "ExternalEmbeddingRead": "#00cec9",
         "L_DecoderRuntimeInit": "#a29bfe",
         "L_DecoderLoad": "#6c5ce7",
+        "SingleBufferUpdate": "#636e72",
         "LayoutTokenize": "#fdcb6e",
         "Prefill": "#2d98da",
         "I_Prefill": "#0984e3",
@@ -952,6 +954,27 @@ def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[
     plt.close(fig)
 
 
+def _streaming_timeline_phase_name(name: str) -> str | None:
+    aliases = {
+        "VisionPrefillV_Encode": "V_Encode",
+        "VisionPrefillMmproj": "Mmproj",
+        "VisionPrefillImagePrefill": "ImagePrefill",
+        "VisionPrefillT_Prefill": "T_Prefill",
+    }
+    name = aliases.get(name, name)
+    if name in {"SingleBufferUpdate", "V_Encode", "Mmproj", "ImagePrefill", "T_Prefill", "D"}:
+        return name
+    return None
+
+
+def _streaming_timeline_origin(
+    stream_origin_video: float,
+    prompt_markers: list[float],
+    phases: list[tuple[str, float, float, int]],
+) -> float:
+    return stream_origin_video
+
+
 def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]) -> None:
     if not phase_rows:
         return
@@ -992,19 +1015,18 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
             prompt_idx += 1
             prompt_markers.append(to_stream_time(start))
             continue
-        if name == "SingleBufferUpdate":
-            phases.append((name, to_stream_time(start), max(to_stream_time(end), to_stream_time(start) + 0.015), max(prompt_idx, 0)))
+        display_name = _streaming_timeline_phase_name(name)
+        if display_name is None:
             continue
         if end <= start:
-            continue
-        phases.append((name, to_stream_time(start), to_stream_time(end), max(prompt_idx, 0)))
+            if display_name != "SingleBufferUpdate":
+                continue
+            end = start + 0.015
+        phases.append((display_name, to_stream_time(start), to_stream_time(end), max(prompt_idx, 0)))
     if not phases:
         return
 
-    if prompt_markers:
-        timeline_origin = min(prompt_markers)
-    else:
-        timeline_origin = min(start for _, start, _, _ in phases)
+    timeline_origin = _streaming_timeline_origin(stream_origin_video, prompt_markers, phases)
     decode_ends = [end for name, _, end, _ in phases if name == "D" and end >= timeline_origin]
     timeline_end = max(decode_ends) if decode_ends else max(end for _, _, end, _ in phases)
     phases = [
@@ -1024,9 +1046,8 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
         "SingleBufferUpdate",
         "V_Encode",
         "Mmproj",
-        "T_Prefill",
         "ImagePrefill",
-        "DynamicKVGrow",
+        "T_Prefill",
         "D",
     ]
     y_for = {name: idx for idx, name in enumerate(visible)}
@@ -1038,6 +1059,16 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
         if y is None:
             continue
         color = colors.get(name, "#636e72")
+        if name == "SingleBufferUpdate":
+            ax.vlines(
+                start,
+                y - 0.32,
+                y + 0.32,
+                color=color,
+                linewidth=1.4,
+                alpha=0.85,
+            )
+            continue
         alpha = 0.38 if name == "SingleBufferUpdate" else 0.82
         ax.barh(
             y,
@@ -1337,11 +1368,16 @@ def _result_model_name(
     *,
     text_only: bool = False,
     streaming: bool = False,
+    stream_mode: str | None = None,
     dynamic_kv_cache: bool = False,
 ) -> str:
     suffix = "opencl" if processor == "gpu" else processor
     kv = _result_kv_suffix(cache_type_k, cache_type_v)
-    mid = "_streaming" if streaming else "_text" if text_only else ""
+    if streaming:
+        mode_suffix = "" if stream_mode in (None, "single_buffer") else f"_{stream_mode}"
+        mid = f"_streaming{mode_suffix}"
+    else:
+        mid = "_text" if text_only else ""
     dynamic = "_dynamic" if dynamic_kv_cache else ""
     return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}"
 
@@ -1730,6 +1766,9 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
     ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     force_arg = "--force-generation" if args.force_generation else ""
     single_buffer_arg = "--single-buffer" if args.single_buffer else ""
+    stream_mode_arg = f"--stream-mode {shlex.quote(args.stream_mode)}"
+    window_sec_arg = f"--window-sec {args.window_sec}" if args.window_sec is not None else ""
+    window_max_frames_arg = f"--window-max-frames {args.window_max_frames}"
     is_hybrid = args.processor == "hybrid"
     runner_bin = "hybrid_streaming_decode" if is_hybrid else "opencl_streaming_decode"
     stdout_name = "hybrid_streaming_stdout.txt" if is_hybrid else "opencl_streaming_stdout.txt"
@@ -1751,6 +1790,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
 ./{runner_bin} {single_buffer_arg} --runner ./opencl_phase_mtmd \\
   {encoder_arg} {warmup_image_arg} \\
+  {stream_mode_arg} {window_sec_arg} {window_max_frames_arg} \\
   -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} \\
   --stream-manifest media_manifest.json \\
   --stream-events-path stream_events.csv --phase-stats-path streaming_phase_stats.csv \\
@@ -1908,9 +1948,19 @@ def main() -> int:
         action="store_true",
         help="Streaming mode: keep only the latest sampled frame as an image buffer and answer prompt events with that frame.",
     )
+    parser.add_argument(
+        "--stream-mode",
+        "--stream_mode",
+        dest="stream_mode",
+        default=None,
+        choices=("single-buffer", "context-window", "vision-prefill"),
+        help="Streaming strategy for --streaming-video. Defaults to single-buffer; --single-buffer remains an alias.",
+    )
     parser.add_argument("--num-segments", type=int, default=8, help="Uniform temporal samples for --video.")
     parser.add_argument("--sampling-fps", "--sampling_fps", dest="sampling_fps", type=float, default=None, help="Frame sampling FPS for --streaming-video.")
     parser.add_argument("--max-video-time", "--max_video_time", dest="max_video_time", type=float, default=None, help="Optional maximum streaming-video duration to sample, in seconds.")
+    parser.add_argument("--window-sec", "--window_sec", dest="window_sec", type=float, default=None, help="Prompt-time lookback window in seconds for context-window streaming. vision-prefill ignores this and caches full history.")
+    parser.add_argument("--window-max-frames", "--window_max_frames", dest="window_max_frames", type=int, default=8, help="Maximum sampled frames used by one context-window prompt. vision-prefill ignores this and caches full history.")
     parser.add_argument("--time", default=None, help="JSON list of prompt timestamps for --streaming-video, e.g. '[5.0, 10.0]'.")
     parser.add_argument("--max-num", type=int, default=1, help="Max InternVL dynamic-preprocess tiles per sampled video frame.")
     parser.add_argument("--prompt", default="Describe this image briefly.")
@@ -2104,15 +2154,25 @@ def main() -> int:
         raise SystemExit("--max-num must be positive.")
     if args.max_video_time is not None and args.max_video_time <= 0:
         raise SystemExit("--max-video-time must be positive when provided.")
+    if args.window_sec is not None and args.window_sec <= 0:
+        raise SystemExit("--window-sec must be positive when provided.")
+    if args.window_max_frames <= 0:
+        raise SystemExit("--window-max-frames must be positive.")
     selected_media_count = sum(x is not None for x in (args.image, args.video, args.streaming_video))
     if selected_media_count > 1:
         raise SystemExit("--image, --video, and --streaming-video are mutually exclusive.")
     if args.streaming_video is not None:
         if args.sampling_fps is None or args.sampling_fps <= 0:
             raise SystemExit("--streaming-video requires positive --sampling-fps.")
+        try:
+            args.stream_mode = normalize_stream_mode(args.stream_mode, single_buffer=args.single_buffer)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        args.single_buffer = args.stream_mode == "single_buffer"
         args.prompt_events = _parse_streaming_prompt_events(args.time, args.prompt)
     else:
         args.prompt_events = []
+        args.stream_mode = normalize_stream_mode(args.stream_mode, single_buffer=args.single_buffer)
     args.media_mode = media_mode_from_args(args)
     args.backend_mode = backend_mode_from_processor(args.processor)
     if args.vision_build_dir is None:
@@ -2189,6 +2249,7 @@ def main() -> int:
         args.cache_type_v,
         text_only=_standalone_completion_mode(args),
         streaming=args.streaming_video is not None,
+        stream_mode=getattr(args, "stream_mode", None),
         dynamic_kv_cache=getattr(args, "dynamic_kv_cache", False),
     )
     result_dir.mkdir(parents=True, exist_ok=True)

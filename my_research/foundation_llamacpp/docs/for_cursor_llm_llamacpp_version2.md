@@ -510,3 +510,78 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   and is now separated into `DynamicKVGrow`. Subsequent prompts match the
   init-16384 run closely, so the grow path does not appear to poison graph or
   scheduler caching across later prompts.
+
+## 2026-05-13: Context-Window And Vision-Prefill Streaming Modes
+
+- Added explicit streaming modes on top of `--streaming-video`:
+  - `--stream-mode single-buffer`: the existing latest-frame baseline. It keeps
+    chat/KV state across prompt events.
+  - `--stream-mode context-window`: a sliding-window singleton video baseline.
+    Prompt arrival selects sampled frames up to the prompt timestamp, optionally
+    filters by `--window-sec`, evenly limits with `--window-max-frames`, resets
+    decoder chat/KV state, then evaluates the selected frames as a video clip.
+  - `--stream-mode vision-prefill`: hybrid-only KV-level image-prefill cache.
+    Every frame arrival enqueues a cache update. Each update builds a
+    full-history video-prefix KV snapshot from all sampled frames up to that
+    frame. Prompt handling restores the matching snapshot and evaluates only the
+    formatted question suffix.
+- `runner/media.py` now writes streaming manifests with `stream_mode`,
+  `window_sec`, and `window_max_frames`. Hybrid streaming modes write both
+  layout PNGs and QNN `.bin` tensors for sampled frames.
+- `runner/cli.py` normalizes `--single-buffer` as an alias for
+  `--stream-mode single-buffer`, validates `--time`/JSON prompt lists, forwards
+  `--stream-mode`, `--window-sec`, and `--window-max-frames` into
+  `hybrid_streaming_decode` / `opencl_streaming_decode`, and names result
+  folders with `_streaming_<mode>` for non-single-buffer modes.
+- `hybrid_streaming_decode.cpp` now has explicit frame selection:
+  - `single_buffer`: selected frame is the current latest frame.
+  - `context_window`: selected frames are bounded by prompt time/window and then
+    evenly sampled to `window_max_frames`.
+  - `vision_prefill`: selected frames are the full sampled history up to the
+    cache or prompt timestamp, ignoring `window_sec` and `window_max_frames`.
+- The current `vision-prefill` cache is a complete snapshot, not a composable
+  per-frame cache. It stores frame indices, layout image paths, saved seq 0
+  bytes from `llama_state_seq_get_data_ext()`, state flags, and `n_past`.
+  Restore uses `llama_state_seq_set_data_ext()` before suffix text prefill.
+- Prompt boundary handling uses `SVLM_QUESTION_SENTINEL` inside the same
+  chat-template formatted user message that the non-cached prompt would use.
+  Cache build evaluates the formatted video prefix before the sentinel; prompt
+  restore evaluates the formatted suffix after the sentinel.
+- Cache scheduling was corrected after timeline inspection:
+  - earlier code QNN-encoded all selected bins first, creating runs with
+    consecutive `VisionPrefillV_Encode` rows before image-prefill work;
+  - current code uses `eval_streaming_chunks_with_on_demand_vision()`, walks
+    mtmd chunks in order, QNN-encodes only `bins[image_chunk_idx]` when that
+    IMAGE chunk is reached, then immediately runs `VisionPrefillMmproj` and
+    `VisionPrefillImagePrefill` before the next frame/tile.
+- Timeline presentation:
+  - `SingleBufferUpdate` ticks remain visible for frame arrivals.
+  - `VisionPrefillV_Encode`, `VisionPrefillMmproj`,
+    `VisionPrefillImagePrefill`, and `VisionPrefillT_Prefill` are aliased onto
+    normal `V_Encode`, `Mmproj`, `ImagePrefill`, and `T_Prefill` lanes.
+  - Cache-management rows such as `VisionPrefillCacheBuild`,
+    `VisionPrefillCacheSave`, and `VisionPrefillCacheRestore` are hidden in the
+    PNG timeline but remain in CSV.
+- Future mode naming is reserved:
+  - `--chunked-vision-prefill`
+  - `--chunk-count`
+  This should build independently reusable 1-frame, 2-frame, or larger chunks
+  instead of changing the full-history `vision-prefill` semantics.
+- Validation:
+  - `pytest my_research/foundation_llamacpp/tests/test_vision_prefill_kv_cache_contract.py my_research/foundation_llamacpp/tests/test_streaming_media.py -q`
+    passed with `12 passed`.
+  - `python3 -m compileall my_research/foundation_llamacpp/runner my_research/foundation_llamacpp/tests`
+    passed.
+  - `cmake --build my_research/foundation_llamacpp/build-hybrid-android-opencl --target opencl_streaming_decode hybrid_streaming_decode -j2`
+    passed.
+  - 2B Q8 hybrid `vision-prefill` run with
+    `sample_images/surveil_8_20sec.mp4`, prompts at `5s` and `8s`,
+    `--ctx-size 4096`, f16 KV, and `--n-predict 32` returned code `0`.
+    Result:
+    `results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16`.
+  - CSV checks showed `VisionPrefillCacheBuild 11`,
+    `VisionPrefillCacheHit 2`, `VisionPrefillV_Encode 66`,
+    `VisionPrefillImagePrefill 66`, and `bad_consecutive_vencode=0`.
+- Added `docs/archive/streaming_context_window_and_vision_prefill.md` as the
+  detailed archive writeup for the sliding-window baseline and current
+  full-history KV vision-prefill mode.

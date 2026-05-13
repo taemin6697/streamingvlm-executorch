@@ -13,6 +13,70 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 MEDIA_MARKER = "<__media__>"
 MEDIA_MANIFEST_VERSION = 2
+STREAM_MODE_SINGLE_BUFFER = "single_buffer"
+STREAM_MODE_CONTEXT_WINDOW = "context_window"
+STREAM_MODE_VISION_PREFILL = "vision_prefill"
+STREAM_MODES = {
+    STREAM_MODE_SINGLE_BUFFER,
+    STREAM_MODE_CONTEXT_WINDOW,
+    STREAM_MODE_VISION_PREFILL,
+}
+
+
+def normalize_stream_mode(stream_mode: str | None, *, single_buffer: bool = False) -> str:
+    if single_buffer:
+        return STREAM_MODE_SINGLE_BUFFER
+    if stream_mode is None:
+        return STREAM_MODE_SINGLE_BUFFER
+    normalized = stream_mode.strip().lower().replace("-", "_")
+    if normalized not in STREAM_MODES:
+        choices = ", ".join(sorted(mode.replace("_", "-") for mode in STREAM_MODES))
+        raise ValueError(f"unsupported stream mode: {stream_mode!r}; expected one of: {choices}")
+    return normalized
+
+
+def _evenly_limit_items(items: list, limit: int) -> list:
+    if limit <= 0:
+        raise ValueError("window_max_frames must be positive")
+    if len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[-1]]
+    last = len(items) - 1
+    indices = [round(i * last / (limit - 1)) for i in range(limit)]
+    return [items[i] for i in indices]
+
+
+def select_recent_window_frames(
+    frames: list[dict[str, object]],
+    *,
+    prompt_time_s: float,
+    window_sec: float | None,
+    window_max_frames: int,
+) -> list[dict[str, object]]:
+    if window_max_frames <= 0:
+        raise ValueError("window_max_frames must be positive")
+    start_s = float("-inf") if window_sec is None else prompt_time_s - window_sec
+    selected = [
+        frame
+        for frame in frames
+        if start_s <= float(frame.get("timestamp_s", 0.0)) <= prompt_time_s
+    ]
+    if not selected:
+        selected = [
+            frame
+            for frame in frames
+            if float(frame.get("timestamp_s", 0.0)) <= prompt_time_s
+        ][-1:]
+    return _evenly_limit_items(selected, window_max_frames)
+
+
+def build_streaming_video_prompt(frames: list[dict[str, object]], raw_prompt: str) -> str:
+    prefix_parts: list[str] = []
+    for frame_i, frame in enumerate(frames):
+        n_patches = int(frame.get("num_patches", 1) or 1)
+        prefix_parts.append(f"Frame {frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
+    return "".join(prefix_parts) + raw_prompt
 
 
 def normalize_image_to_bin(image, output_path: Path, image_size: int = 448) -> None:
@@ -210,6 +274,9 @@ def prepare_streaming_video_media(
     prompt_events: list[dict[str, object]],
     max_num: int,
     max_video_time: float | None = None,
+    stream_mode: str | None = None,
+    window_sec: float | None = None,
+    window_max_frames: int = 8,
     single_buffer: bool = False,
 ) -> PreparedMedia:
     from PIL import Image
@@ -224,6 +291,8 @@ def prepare_streaming_video_media(
     if frame_count <= 0:
         raise SystemExit(f"Streaming video has no frames: {video}")
     effective_duration_s = min(duration_s, max_video_time) if max_video_time is not None else duration_s
+    normalized_stream_mode = normalize_stream_mode(stream_mode, single_buffer=single_buffer)
+    use_single_buffer_frames = normalized_stream_mode == STREAM_MODE_SINGLE_BUFFER
 
     sample_count = int(np.floor(effective_duration_s * sampling_fps)) + 1
     timestamps = [idx / sampling_fps for idx in range(sample_count)]
@@ -240,7 +309,7 @@ def prepare_streaming_video_media(
     for stream_i, frame_index in enumerate(frame_indices):
         timestamp_s = frame_index / source_fps
         image = Image.fromarray(vr[int(frame_index)].asnumpy()).convert("RGB")
-        if single_buffer:
+        if use_single_buffer_frames:
             frame_bin = work_dir / f"stream_frame_{stream_i:04d}.bin"
             layout_image = work_dir / f"stream_frame_{stream_i:04d}.png"
             normalize_image_to_bin(image, frame_bin)
@@ -291,7 +360,9 @@ def prepare_streaming_video_media(
         "max_video_time": max_video_time,
         "frame_count": frame_count,
         "max_num": max_num,
-        "stream_mode": "single_buffer" if single_buffer else "vision_encoder",
+        "stream_mode": normalized_stream_mode,
+        "window_sec": window_sec,
+        "window_max_frames": window_max_frames,
         "frame_indices": [int(i) for i in frame_indices],
         "num_patches_list": num_patches_list,
         "frame_bins": [p.name for p in frame_bins],
@@ -323,6 +394,9 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
             prompt_events=args.prompt_events,
             max_num=args.max_num,
             max_video_time=getattr(args, "max_video_time", None),
+            stream_mode=getattr(args, "stream_mode", None),
+            window_sec=getattr(args, "window_sec", None),
+            window_max_frames=getattr(args, "window_max_frames", 8),
             single_buffer=getattr(args, "single_buffer", False),
         )
     if args.video is not None:
@@ -336,4 +410,3 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
     if args.image is None:
         raise SystemExit("media preparation requires --image or --video")
     return prepare_image_media(args.image, work_dir, args.prompt)
-

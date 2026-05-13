@@ -4,7 +4,10 @@ This directory contains the Android runner and bridge binaries used for
 llama.cpp / ExecuTorch hybrid VLM experiments. This document is the quick run
 guide. Build internals and historical notes live in
 `archive/executorch_vision_llamacpp_decoder.md`. Dynamic KV implementation
-details live in `archive/dynamic_kv_cache_implementation.md`.
+details live in `archive/dynamic_kv_cache_implementation.md`. Streaming
+single-buffer details live in `archive/streaming_single_buffer_implementation.md`;
+context-window and KV vision-prefill details live in
+`archive/streaming_context_window_and_vision_prefill.md`.
 
 ## Common Setup
 
@@ -452,9 +455,12 @@ Streaming video mode is supported by `--processor gpu` and `--processor hybrid`.
 
 The host samples the video first and pushes frame files plus `media_manifest.json`
 to Android. The device runner then replays those frames according to their
-timestamps. In `--single-buffer` mode, the runner keeps only the latest sampled
-frame. When a prompt timestamp arrives, it answers using the current buffered
-frame.
+timestamps. `--stream-mode single-buffer` keeps only the latest sampled frame.
+`--stream-mode context-window` turns the recent sampled frames into one
+singleton video clip at prompt arrival. `--stream-mode vision-prefill` is the
+hybrid KV-cache observation mode: every sampled frame builds a full-history
+video-prefix KV snapshot, and prompt handling restores that snapshot before
+evaluating only the text question suffix.
 
 This is a deterministic file-backed streaming simulator, not a real camera
 queue.
@@ -500,14 +506,14 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --processor hybrid \
   --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
-  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
-  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --model llama.cpp/models/InternVL3-8B-Instruct-GGUF/InternVL3-8B-Instruct-Q4_K_M.gguf \
+  --mmproj llama.cpp/models/InternVL3-8B-Instruct-GGUF/mmproj-InternVL3-8B-Instruct-Q8_0.gguf \
   --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
   --single-buffer \
   --sampling-fps 1.0 \
-  --max_video_time 15 \
-  --time '[5.0, 8.0]' \
-  --prompt '["What is this situation?", "What did I ask earlier???"]' \
+  --max_video_time 60 \
+  --time '[5.0, 8.0, 11.0, 14.0]' \
+  --prompt '["What is this situation?", "What did I ask earlier???", "What changed in the scene?", "Summarize the full situation so far."]' \
   --max-num 1 \
   --n-predict 64 \
   --ctx-size 4096 \
@@ -534,12 +540,12 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --processor hybrid \
   --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
-  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
-  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --model llama.cpp/models/InternVL3-8B-Instruct-GGUF/InternVL3-8B-Instruct-Q4_K_M.gguf \
+  --mmproj llama.cpp/models/InternVL3-8B-Instruct-GGUF/mmproj-InternVL3-8B-Instruct-Q8_0.gguf \
   --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
   --single-buffer \
   --sampling-fps 1.0 \
-  --max_video_time 15 \
+  --max_video_time 60 \
   --time '[5.0, 8.0, 11.0, 14.0]' \
   --prompt '["What is this situation?", "What did I ask earlier???", "What changed in the scene?", "Summarize the full situation so far."]' \
   --max-num 1 \
@@ -608,8 +614,48 @@ same marker should appear in `streaming_phase_timeline.png` and
   Input video to sample and replay.
 
 --single-buffer
-  Keep only the latest sampled frame as the current image buffer. Earlier frames
-  are overwritten, not queued for later processing.
+  Backward-compatible alias for `--stream-mode single-buffer`.
+
+--stream-mode single-buffer
+  Existing native streaming baseline. Keep only the latest sampled frame as the
+  current image buffer. Earlier frames are overwritten, not queued for later
+  processing. This mode keeps llama.cpp chat/KV state across prompt events.
+
+--stream-mode context-window
+  Sliding video-window baseline. Each prompt selects recent sampled frames,
+  formats them as `Frame 1: <__media__>` / `Frame 2: <__media__>` / ... plus
+  the question, clears decoder chat/KV state, then runs full vision encode,
+  mmproj, image prefill, text prefill, and decode. It does not reuse a KV
+  snapshot across prompts.
+
+--stream-mode vision-prefill
+  KV-level cached vision-prefill mode for hybrid streaming. As frames arrive,
+  the bridge rebuilds the full-history video prefix from all sampled frames up
+  to the current frame, runs QNN vision encode, mmproj, and image prefill, then
+  saves the resulting llama sequence KV state. Cache construction is
+  frame-ordered: the bridge evaluates the text label for a frame, QNN-encodes
+  that frame/tile only when its image chunk is reached, runs mmproj and
+  ImagePrefill, and only then moves to the next frame. At prompt time it
+  restores the latest matching KV snapshot and pre-fills only the text question
+  suffix before decode. This mode is singleton at the text/chat level: each
+  prompt uses one restored full-history video-prefix KV snapshot, not a
+  multi-turn conversation.
+
+--chunked-vision-prefill
+  Reserved future mode flag for independently reusable vision-prefill chunks.
+  The planned `--chunk-count` argument will control how many frames are grouped
+  into each cached KV chunk.
+
+--window-sec SEC
+  Optional prompt-time lookback window for context-window.
+  If omitted, all sampled frames up to the prompt timestamp are eligible before
+  `--window-max-frames` is applied. `vision-prefill` ignores this option and
+  caches the full sampled frame history up to each frame.
+
+--window-max-frames N
+  Maximum frames used by one context-window prompt. If more frames are eligible,
+  an even temporal subset is selected. `vision-prefill` ignores this option and
+  caches the full sampled frame history up to each frame.
 
 --sampling-fps FPS
   Sampling/replay rate. `1.0` means one buffer update per second. `0.5` means
@@ -625,7 +671,9 @@ same marker should appear in `streaming_phase_timeline.png` and
   JSON list of prompts. Must have the same length as `--time`.
 
 --max-num N
-  Current single-buffer mode uses one image per frame; keep this at `1` for now.
+  Max InternVL dynamic-preprocess tiles per sampled video frame. Single-buffer
+  still uses one full-frame image; context-window and vision-prefill use the
+  normal tiled video-frame path.
 
 --dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024
   Optional project prototype. The decoder advertises model-max logical context
@@ -638,11 +686,18 @@ same marker should appear in `streaming_phase_timeline.png` and
 
 stream_events.csv
   Frame arrival, `SingleBufferUpdate`, prompt arrival, and prompt decode events.
+  For multi-frame modes, prompt/decode rows use the last selected frame index.
 
 streaming_phase_stats.csv / foundation_proc.csv
   Phase timing rows, including `V_Encode`, `Mmproj`, prefill, and decode.
   GPU streaming uses llama.cpp OpenCL vision encode. Hybrid streaming uses QNN
-  vision encode and OpenCL mmproj/decode.
+  vision encode and OpenCL mmproj/decode. In `vision-prefill`, cache work is
+  reported with rows such as `VisionPrefillCacheBuild`,
+  `VisionPrefillImagePrefill`, `VisionPrefillCacheSave`,
+  `VisionPrefillCacheHit`, and `VisionPrefillCacheRestore`. Timeline plotting
+  aliases `VisionPrefillV_Encode`, `VisionPrefillMmproj`,
+  `VisionPrefillImagePrefill`, and `VisionPrefillT_Prefill` onto the normal
+  lanes, while cache-management rows are hidden.
 
 streaming_phase_timeline.png
   Prompt-time timeline plot. The x-axis uses stream/video time, so a prompt at
@@ -659,13 +714,89 @@ SingleBufferUpdate
 Prompt wait
   Prompt events are captured at their stream timestamp, but prompt execution is
   serialized. If prompt 1 arrives while prompt 0 is decoding, prompt 1 waits.
-  The selected image remains the frame buffered at prompt arrival.
+  The selected image/window remains frozen at prompt arrival.
 
 Multi-turn
   Streaming single-buffer keeps llama.cpp chat/KV state across prompt events.
+  `context-window` intentionally clears llama.cpp chat/KV state before each
+  prompt. `vision-prefill` restores a cached video-prefix KV snapshot before the
+  prompt text suffix, so it is still a singleton video query at the chat level.
   `foundation_inference_tokens.txt` appends all turns, and
   `stream_inference_tokens_<idx>.txt` stores each turn's raw trace.
+
+Vision-prefill scheduling
+  Frame arrivals are still logged as `SingleBufferUpdate` ticks at their stream
+  timestamps, even while the consumer lane is busy building older cache
+  snapshots. Cache jobs are serialized: one full-history cache build completes
+  its frame-ordered text/image prefill sequence before the next cache job or
+  prompt job runs. This keeps the phase trace from batching several `V_Encode`
+  rows before the matching `ImagePrefill` rows.
 ```
+
+Example context-window run:
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
+  --stream-mode context-window \
+  --sampling-fps 1.0 \
+  --window-sec 4.0 \
+  --window-max-frames 8 \
+  --time '[5.0, 8.0]' \
+  --prompt '["What is happening?", "What changed?"]' \
+  --max-num 1 \
+  --n-predict 64 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --soc-model SM8750
+```
+
+Swap `--stream-mode vision-prefill` to run the KV snapshot cached
+vision-prefill mode. In this mode the `--window-sec` and `--window-max-frames`
+limits are ignored and each frame rebuilds a full-history prefix cache.
+
+Example vision-prefill run used for the current KV snapshot validation:
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --vision my_research/foundation_llamacpp/results/vision_models/internvl3_1b_vision_tower_preproj_qnn_realweights_sm8750/vision_tower_preproj_qnn.pte \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8_20sec.mp4 \
+  --stream-mode vision-prefill \
+  --sampling-fps 1.0 \
+  --max-video-time 10 \
+  --time '[5.0, 8.0]' \
+  --prompt '["What is happening in this video window?", "What changed in the recent window?"]' \
+  --max-num 1 \
+  --n-predict 32 \
+  --ctx-size 4096 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --soc-model SM8750 \
+  --baseline-window 0 \
+  --remote-root /data/local/tmp/streamingvlm_2b_kv_cache \
+  --results-root my_research/foundation_llamacpp/results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered
+```
+
+Validated result:
+`results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16`
+with `foundation_exit_code.txt=0`, eleven `VisionPrefillCacheBuild` rows, two
+`VisionPrefillCacheHit` rows, and no consecutive `VisionPrefillV_Encode` before
+the matching `VisionPrefillImagePrefill`.
 
 ## Vision Tower Export
 

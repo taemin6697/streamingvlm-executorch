@@ -238,7 +238,7 @@ input video
   -> decord.VideoReader
   -> sample frames at --sampling-fps up to optional --max-video-time
   -> write stream_frame_<idx>.png layout images
-  -> in hybrid single-buffer mode, also write stream_frame_<idx>.bin QNN tensors
+  -> in hybrid streaming modes, also write stream_frame_<idx>.bin QNN tensors
   -> record prompt events from --time and JSON-list --prompt
   -> write media_manifest.json with source_kind: streaming_video
 ```
@@ -256,7 +256,7 @@ duration_s / effective_duration_s / max_video_time:
   original and clipped stream duration
 
 stream_mode:
-  currently "single_buffer"
+  "single_buffer", "context_window", or "vision_prefill"
 
 frames:
   stream_frame index, timestamp_s, video_frame_index, num_patches, and tile files
@@ -270,6 +270,19 @@ replaced with the latest sampled frame. It does not pop from an accumulated
 queue. Prompt events capture the buffered frame at arrival time; the actual
 prompt execution lane is serialized, so a prompt may wait behind an earlier
 decode.
+
+In `--stream-mode context-window`, prompt events capture a selected list of
+sampled frames rather than one latest frame. The selection is bounded by
+`--window-sec` and then evenly reduced to `--window-max-frames` when needed.
+The decoder context is reset before each prompt, so the selected frames behave
+like one independent video clip.
+
+In `--stream-mode vision-prefill`, every frame arrival enqueues a cache-update
+job. Each cache-update rebuilds a full-history video prefix from all sampled
+frames up to that frame, saves the llama sequence state, and replaces the
+previous cache snapshot. Prompt events restore the latest matching full-history
+snapshot and evaluate only the text suffix. `--window-sec` and
+`--window-max-frames` are intentionally ignored in this mode.
 
 ### `runner/remote.py`
 
@@ -465,7 +478,8 @@ Responsibilities:
 
 ```text
 Purpose:
-  hybrid QNN single-buffer streaming runner.
+  hybrid QNN streaming runner for single-buffer, context-window, and
+  vision-prefill modes.
 
 Compile mode:
   STREAMINGVLM_STREAMING_DECODE_USE_QNN=1
@@ -483,11 +497,13 @@ Responsibilities:
   optionally warm QNN vision once with fixed warmup bin
   load llama.cpp/mmproj decode context once
   replay sampled frame arrivals according to manifest timestamps
-  maintain a single latest-frame buffer
-  capture prompt events against the current buffered frame
-  QNN-encode only the selected frame per prompt
+  maintain sampled-frame history and the latest-frame buffer
+  capture prompt events against the correct frame/window snapshot
+  for single-buffer, QNN-encode only the selected frame per prompt
+  for context-window, reset decoder state and evaluate the selected window
+  for vision-prefill, build full-history KV snapshots as frames arrive
   run decoder-side mmproj, prefill, and decode
-  preserve chat history and KV state across prompts
+  preserve chat history and KV state only in single-buffer mode
   write stream events, phase rows, output, and per-turn token traces
 ```
 
@@ -737,6 +753,65 @@ Hybrid streaming QNN phase timing is rebased onto the llama.cpp `ggml_time_ms()`
 timeline. This avoids mixing ExecuTorch absolute timestamps with llama.cpp
 elapsed timestamps.
 
+### Streaming Context-Window Hybrid
+
+```text
+run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-mode context-window
+  -> runner.media.prepare_streaming_video_media
+  -> push media_manifest.json, stream_frame_<idx>.png, stream_frame_<idx>.bin
+  -> run hybrid_streaming_decode
+  -> producer thread replays sampled frame timestamps
+  -> prompt job selects frames with timestamp <= prompt time
+  -> optional --window-sec filters to recent frames
+  -> --window-max-frames evenly reduces the selected frame list when needed
+  -> consumer lane resets llama memory, sampler, chat history, and n_past
+  -> build prompt as Frame 1/Frame 2/... plus the user question
+  -> QNN-encode all selected frame/tile bins
+  -> eval_with_external_embedding() runs mmproj, image prefill, text prefill
+  -> generate_response() decodes as a singleton video-window question
+```
+
+This mode is the sliding-window baseline. It preserves prompt-arrival selection
+semantics, but it intentionally does not preserve chat/KV state between prompt
+events and does not reuse image-prefix KV. It is useful for measuring how much
+latency remains when the model receives a bounded recent video clip.
+
+### Streaming Vision-Prefill Hybrid
+
+```text
+run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-mode vision-prefill
+  -> runner.media.prepare_streaming_video_media
+  -> push media_manifest.json, stream_frame_<idx>.png, stream_frame_<idx>.bin
+  -> run hybrid_streaming_decode
+  -> producer thread replays sampled frame timestamps
+  -> every frame arrival enqueues a CacheUpdate job
+  -> CacheUpdate selects all sampled frames up to that frame
+  -> reset decoder context
+  -> tokenize the chat-formatted video prefix before SVLM_QUESTION_SENTINEL
+  -> walk mtmd chunks in order
+  -> for text chunks, run VisionPrefillT_Prefill
+  -> for image chunks, QNN-encode exactly the matching bin on demand
+  -> run VisionPrefillMmproj and VisionPrefillImagePrefill immediately
+  -> save seq 0 with llama_state_seq_get_data_ext()
+  -> prompt job restores the matching snapshot with llama_state_seq_set_data_ext()
+  -> tokenize/evaluate only the formatted question suffix
+  -> decode the answer
+```
+
+This mode is a KV-level cached image-prefill observation path, not a chunk
+composition algorithm. The current cache is one full-history snapshot per
+sampled frame. It ignores `--window-sec` and `--window-max-frames`, because P0
+must be able to use all cached frames before the question boundary. Future
+`--chunked-vision-prefill` should add independently reusable chunks controlled
+by `--chunk-count` instead of changing this full-history mode.
+
+The cache build is intentionally frame-ordered. Earlier prototypes encoded all
+selected bins first, which produced traces with several consecutive
+`VisionPrefillV_Encode` rows before any image-prefill work. The current helper
+`eval_streaming_chunks_with_on_demand_vision()` QNN-encodes one frame/tile only
+when its IMAGE chunk is reached, then immediately runs mmproj and image prefill
+before advancing to the next chunk.
+
 ## Result Artifacts
 
 Each run writes under:
@@ -907,11 +982,15 @@ When changing streaming:
 ```text
 1. Keep video_file and streaming semantics separate. Video_file is offline
    sampled frames; streaming is timestamped replay with prompt events.
-2. Preserve the explicit state model. Current mode is single latest-frame buffer.
+2. Preserve the explicit state model. Single-buffer is latest-frame state,
+   context-window is reset singleton window state, and vision-prefill is restored
+   full-history video-prefix KV state.
 3. Keep prompt arrival timestamp, selected buffered frame, and actual execution
    start distinguishable in stream_events.csv.
-4. Decoder context retention/eviction must remain explicit. Current streaming
-   mode preserves chat history and KV across prompt events.
+4. Decoder context retention/eviction must remain explicit. Single-buffer
+   preserves chat history and KV across prompt events; context-window clears
+   them; vision-prefill restores a cached prefix state and evaluates only the
+   text suffix.
 5. Keep OpenCL and Hybrid streaming artifacts aligned so their timelines can be
    compared.
 6. If adding persistent prefill or vision-encoder-only streaming, add new mode
@@ -944,4 +1023,3 @@ hybrid_decode.cpp and opencl_phase_mtmd.cpp:
   llama_decode_session, mtmd_layout, prefill_engine, and generation while keeping
   target behavior unchanged.
 ```
-
