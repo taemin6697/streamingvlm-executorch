@@ -1938,7 +1938,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 if (llm_arch_is_recurrent(arch)) {
-                    if (cparams.dynamic_kv_cache || cparams.paged_kv_cache) {
+                    if (cparams.dynamic_kv_cache) {
                         throw std::runtime_error("dynamic KV cache prototype does not support recurrent memory");
                     }
                     res = new llama_memory_recurrent(
@@ -1950,7 +1950,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch)) {
-                    if (cparams.dynamic_kv_cache || cparams.paged_kv_cache) {
+                    if (cparams.dynamic_kv_cache) {
                         throw std::runtime_error("dynamic KV cache prototype does not support hybrid memory");
                     }
                     // The main difference between hybrid architectures is the
@@ -2021,7 +2021,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                        if (cparams.dynamic_kv_cache || cparams.paged_kv_cache) {
+                        if (cparams.dynamic_kv_cache) {
                             throw std::runtime_error("dynamic KV cache prototype does not support SWA/iSWA memory");
                         }
                         GGML_ASSERT(hparams.is_swa_any());
@@ -2057,9 +2057,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 hparams.n_swa,
                                 hparams.swa_type,
                                 nullptr,
-                                nullptr,
-                                cparams.paged_kv_cache,
-                                cparams.kv_page_size);
+                                nullptr);
                     }
                 }
             }

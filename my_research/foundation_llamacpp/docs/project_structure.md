@@ -30,11 +30,6 @@ debug hook (`clip_image_encode_internvl_split()` and
 separately. Treat this as a project patch/debug hook when updating llama.cpp
 upstream.
 
-Current KV-memory note: dynamic contiguous KV is implemented and runnable.
-Paged KV is wired as an experimental infrastructure path (`--paged-kv-cache`,
-`--kv-page-size`) but is guarded until the OpenCL attention op reads K/V through
-the page table. See `docs/archive/paged_kv_opencl_prototype.md`.
-
 The current refactor separates three axes that were previously mixed together:
 
 ```text

@@ -453,10 +453,6 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    if (self_kv_page_table) {
-        mctx->set_input_kv_page_table(self_kv_page_table);
-    }
-
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     if (self_k_rot) {
@@ -477,10 +473,6 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
-
-    if (self_kv_page_table) {
-        res &= mctx->is_paged_kv();
-    }
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
@@ -2165,9 +2157,6 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
-        if (mctx_cur->is_paged_kv()) {
-            inp->self_kv_page_table = mctx_cur->build_input_kv_page_table(ctx0);
-        }
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
@@ -2231,10 +2220,6 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = inp->get_kq_mask();
 
-    // TODO_PAGED_KV_ATTENTION: paged KV metadata and the attn_inp_kv_page_table
-    // input are wired, but the OpenCL/ggml attention path still reads
-    // contiguous K/V views. The guarded CLI mode must stay disabled until the
-    // attention op/kernel consumes self_kv_page_table for K/V addressing.
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);

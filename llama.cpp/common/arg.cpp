@@ -1287,22 +1287,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_GROW_STEP"));
     add_opt(common_arg(
-        {"--paged-kv-cache"},
-        "[PROJECT] enable experimental paged KV cache metadata/page-table mode",
-        [](common_params & params) {
-            params.paged_kv_cache = true;
-            params.n_ctx = 0;
-            params.fit_params_min_ctx = UINT32_MAX;
-        }
-    ).set_env("LLAMA_ARG_PAGED_KV_CACHE"));
-    add_opt(common_arg(
-        {"--kv-page-size"}, "N",
-        "[PROJECT] paged KV page size in cells (default: 256)",
-        [](common_params & params, int value) {
-            params.kv_page_size = value;
-        }
-    ).set_env("LLAMA_ARG_KV_PAGE_SIZE"));
-    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

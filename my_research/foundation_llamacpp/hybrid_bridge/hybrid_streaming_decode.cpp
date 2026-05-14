@@ -291,7 +291,6 @@ struct Args {
   int ctx_size = 4096;
   int kv_init_size = 0;
   int kv_grow_step = 0;
-  int kv_page_size = 256;
   int batch_size = 2048;
   int ubatch_size = 512;
   int gpu_layers = 99;
@@ -304,7 +303,6 @@ struct Args {
   bool force_generation = false;
   bool single_buffer = false;
   bool dynamic_kv_cache = false;
-  bool paged_kv_cache = false;
   bool no_kv_offload = false;
   bool no_warmup = false;
 };
@@ -357,8 +355,6 @@ Args parse_args(int argc, char** argv) {
       args.kv_init_size = std::atoi(tmp.c_str());
     } else if (read_string("--kv-grow-step", tmp)) {
       args.kv_grow_step = std::atoi(tmp.c_str());
-    } else if (read_string("--kv-page-size", tmp)) {
-      args.kv_page_size = std::atoi(tmp.c_str());
     } else if (read_string("-b", tmp) || read_string("--batch-size", tmp)) {
       args.batch_size = std::atoi(tmp.c_str());
     } else if (read_string("-ub", tmp) || read_string("--ubatch-size", tmp)) {
@@ -379,8 +375,6 @@ Args parse_args(int argc, char** argv) {
       args.single_buffer = true;
     } else if (a == "--dynamic-kv-cache") {
       args.dynamic_kv_cache = true;
-    } else if (a == "--paged-kv-cache") {
-      args.paged_kv_cache = true;
     } else if (a == "--force-generation") {
       args.force_generation = true;
     } else if (a == "--no-kv-offload") {
@@ -521,11 +515,7 @@ std::vector<std::string> build_llama_args(const Args& args, const std::string& i
       "--temp",
       std::to_string(args.temperature),
   };
-  if (args.paged_kv_cache) {
-    out.push_back("--paged-kv-cache");
-    out.push_back("--kv-page-size");
-    out.push_back(std::to_string(args.kv_page_size));
-  } else if (!args.dynamic_kv_cache) {
+  if (!args.dynamic_kv_cache) {
     out.push_back("--ctx-size");
     out.push_back(std::to_string(args.ctx_size));
   } else {

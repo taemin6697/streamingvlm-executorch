@@ -425,7 +425,6 @@ struct common_params {
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t kv_init_size          =     0; // [PROJECT] initial physical KV capacity when dynamic KV is enabled
     int32_t kv_grow_step          =     0; // [PROJECT] physical KV grow step when dynamic KV is enabled
-    int32_t kv_page_size          =   256; // [PROJECT] page size for experimental paged KV
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -543,7 +542,6 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
     bool dynamic_kv_cache  = false; // [PROJECT] lazily allocate/grow standard KV cache capacity
-    bool paged_kv_cache    = false; // [PROJECT] experimental paged KV cache metadata/page-table mode
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache

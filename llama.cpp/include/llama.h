@@ -335,7 +335,6 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t kv_init_size;      // [PROJECT] initial physical KV capacity for dynamic KV, 0 = n_ctx
         uint32_t kv_grow_step;      // [PROJECT] physical KV grow step, 0 = disabled
-        uint32_t kv_page_size;      // [PROJECT] experimental paged KV page size, in cells
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -378,7 +377,6 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool dynamic_kv_cache; // [PROJECT] lazily allocate/grow standard KV cache capacity
-        bool paged_kv_cache;   // [PROJECT] experimental paged KV cache metadata/page-table mode
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
