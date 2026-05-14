@@ -6,6 +6,13 @@
 
 기존 fixed KV mode에서는 `--ctx-size 4096` 같은 값이 logical context 길이이면서 동시에 KV tensor의 physical allocation 크기였다. 따라서 실제로 아직 1024 token 정도만 사용해도, `ctx-size` 전체에 해당하는 K/V buffer가 시작 시점에 잡혔다.
 
+현재 `main`의 active 구현은 standard llama.cpp KV cache를 대상으로 한
+contiguous dynamic KV grow이다. Paged KV prototype은 실험 후 revert했으며,
+현재 main에는 page-table attention path나 max-context backing allocation trick을
+남기지 않는다. 이 문서는 contiguous dynamic KV와 OpenCL device-to-device
+migration만 설명한다. OpenCL buffer가 SoC memory hierarchy에서 어디에 잡히는지
+설명한 문서는 `dynamic_kv_opencl_buffer_memory_architecture.md`를 참고한다.
+
 Dynamic KV prototype은 아래 플래그로 켠다.
 
 ```bash
@@ -123,6 +130,7 @@ Documentation/logs:
 - `my_research/foundation_llamacpp/docs/README.md`: dynamic KV command와 output artifact 설명 추가.
 - `my_research/foundation_llamacpp/docs/for_cursor_llm_llamacpp_version2.md`: 구현/검증 로그 추가.
 - `my_research/foundation_llamacpp/docs/archive/streaming_single_buffer_implementation.md`: streaming 구현 문서에 dynamic KV validation section 추가.
+- `my_research/foundation_llamacpp/docs/archive/dynamic_kv_opencl_buffer_memory_architecture.md`: OpenCL buffer allocation, device-to-device copy, memory bus 관점 설명 추가.
 - `my_research/foundation/docs/for_cursor_llm.md`: workspace-level 누적 로그 추가.
 
 ## 4. llama.cpp parameter plumbing
@@ -581,3 +589,24 @@ Dynamic KV가 줄이는 것은 "처음부터 예약되는 KV buffer capacity"이
 3. KV capacity step을 adaptive policy로 바꾸기. 예: 작은 turn에서는 1024, long prefill 직전에는 4096 이상.
 4. OpenCL buffer reallocation latency를 줄이기 위해 async copy/event chaining, copy granularity, grow 직전 사전 reserve 가능성 검토.
 5. dynamic KV를 CPU fixed path에서도 검증하고, OpenCL/hybrid 외 backend로 확대.
+
+## 18. Main Branch Closure State
+
+현재 main에는 아래 상태로 정리되어 있다.
+
+```text
+active:
+  contiguous dynamic KV grow
+  OpenCL device-to-device K/V migration
+  DynamicKVGrow timeline/finalizer instrumentation
+  sliding-window multi-turn streaming
+
+reverted / not active:
+  paged KV cache prototype
+  page-table OpenCL attention path
+```
+
+마지막 main 정리에서는 원격 main에 들어가 있던 paged-KV prototype 커밋 두 개를
+revert한 뒤 dynamic-KV/device-copy streaming 작업만 merge했다. 따라서 이후
+문서나 실험에서 "dynamic KV"라고 부르는 것은 이 문서의 contiguous grow 방식을
+의미한다.

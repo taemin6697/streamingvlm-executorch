@@ -608,3 +608,34 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 - Added `docs/archive/streaming_sliding_window_and_vision_prefill.md` as the
   detailed archive writeup for the sliding-window baseline and current
   full-history KV vision-prefill mode.
+
+## 2026-05-14: Main Branch Closure State
+
+- Paged KV was explicitly removed from the active `main` line:
+  - reverted `feat: wire paged kv opencl attention`;
+  - reverted `feat: add guarded paged kv cache infrastructure`;
+  - tracked docs/code no longer describe paged KV as active behavior.
+- Active dynamic KV behavior on `main` is now:
+  - contiguous standard llama.cpp KV cache grow;
+  - OpenCL `clEnqueueCopyBuffer` device-to-device migration for K/V bytes;
+  - host tensor get/set only as fallback;
+  - `DynamicKVGrow` timeline/finalizer rows aligned through `clock_origin_ms`.
+- Active streaming behavior on `main`:
+  - `single-buffer` keeps latest frame plus multi-turn chat/KV state;
+  - `sliding-window` keeps multi-turn chat/KV state while bounding only the
+    visual frame window;
+  - `vision-prefill` remains a singleton restored full-history video-prefix KV
+    snapshot mode.
+- Real 2B Q8 hybrid sliding-window validation after the multi-turn change used
+  `--dynamic-kv-cache --kv-init-size 512 --kv-grow-step 512`, prompts at
+  `5s/8s/11s/14s`, and returned code `0`. Prompt 1 answered that the earlier
+  question was about the activity in the video, confirming text history was
+  preserved.
+- Documentation closure:
+  - `README.md` is the quick-run surface;
+  - `project_structure.md` is the architecture/state map;
+  - `archive/dynamic_kv_cache_implementation.md` tracks code-level dynamic KV;
+  - `archive/dynamic_kv_opencl_buffer_memory_architecture.md` explains OpenCL
+    buffer allocation and device-to-device migration in SoC terms;
+  - `archive/streaming_sliding_window_and_vision_prefill.md` tracks streaming
+    mode semantics.

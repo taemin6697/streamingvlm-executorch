@@ -34,6 +34,12 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 
 중요한 점은 `SingleBufferUpdate`가 queue에서 오래된 frame을 하나씩 pop하는 구조가 아니라는 것이다. 단일 슬롯에 latest frame pointer를 계속 덮어쓴다.
 
+현재 main에는 single-buffer 외에도 `--stream-mode sliding-window`와
+`--stream-mode vision-prefill`이 있다. 이 문서는 최신 frame 하나만 보는
+single-buffer baseline을 설명한다. Sliding-window는 visual input만 bounded recent
+window로 바꾸고 multi-turn chat/KV state는 유지한다. Vision-prefill은 restored
+full-history video-prefix KV snapshot을 쓰는 singleton prompt mode다.
+
 ## 2. 변경 파일 요약
 
 Streaming 구현은 project-owned 파일 중심으로 추가했다. 원칙적으로 ExecuTorch upstream source는 직접 수정하지 않았다.
@@ -577,6 +583,10 @@ Dynamic KV prototype validation:
   - one grow: `1024 -> 16384` cells, OpenCL KV `448 MiB`
   - migration log: `dynamic KV data migration used device-to-device copy`
   - internal grow time: `202.135 ms`, finalizer `DynamicKVGrow` row: `299 ms`
+- main closure:
+  - paged-KV prototype was reverted and is not part of this baseline.
+  - active dynamic KV means contiguous standard KV grow with OpenCL
+    device-to-device K/V migration.
 - Dynamic KV reduces reserved KV memory. It does not reduce attention compute;
   decode/prefill latency still grows with the actual accumulated `n_kv`.
 
@@ -585,8 +595,11 @@ Dynamic KV prototype validation:
 현재 구현은 intentional baseline이다.
 
 - Real camera input이 아니라 file-backed replay이다.
-- `--single-buffer`만 구현되어 있다.
-- Persistent vision KV prefill이나 historical frame cache는 아직 없다.
+- 이 문서의 범위는 `single-buffer` baseline이다. Sliding-window와
+  vision-prefill은 `streaming_sliding_window_and_vision_prefill.md`에서 따로
+  다룬다.
+- Single-buffer에는 persistent vision KV prefill이나 historical frame cache가
+  없다.
 - Single-buffer mode는 latest frame 하나만 사용하므로 긴 temporal history를 보존하지 않는다.
 - Prompt execution은 single consumer lane이라 이전 prompt가 오래 걸리면 다음 prompt execution은 밀린다.
 - OpenCL streaming은 실행/logging baseline으로 동작하지만, 답변 품질은 QNN hybrid path와 다를 수 있다.

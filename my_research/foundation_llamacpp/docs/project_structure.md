@@ -873,7 +873,9 @@ DynamicKVGrow:
   the full grow/retry window from `llama_context::decode()`, including
   `grow_to()`, KV migration, scheduler reserve, and retry preparation. For
   OpenCL-backed KV tensors, migration should log device-to-device
-  `clEnqueueCopyBuffer` usage instead of CPU snapshot round-tripping.
+  `clEnqueueCopyBuffer` usage instead of CPU snapshot round-tripping. The active
+  main branch uses contiguous dynamic KV grow only; paged KV prototype code was
+  reverted and should not be assumed present.
 
 retry-side ImagePrefill:
   if an `ImagePrefill` row overlaps the grow window, finalization clips the row
@@ -996,6 +998,9 @@ When changing streaming:
    compared.
 6. If adding persistent prefill or vision-encoder-only streaming, add new mode
    flags instead of changing --single-buffer semantics silently.
+7. Keep dynamic KV and paged KV language separate. Current main means
+   contiguous dynamic KV grow with OpenCL device-to-device migration; paged KV
+   must be reintroduced only through a new design/branch.
 ```
 
 ## Known Current Gaps

@@ -43,6 +43,10 @@ vision-prefill:
 KV-level image-prefill cache path. It is not yet the chunk-composition algorithm
 planned for future `--chunked-vision-prefill`.
 
+Both modes can run with `--dynamic-kv-cache`. In current `main`, dynamic KV means
+contiguous standard KV grow with OpenCL device-to-device K/V migration. Paged KV
+is not active; the prototype was reverted to keep this observation path focused.
+
 ## Host-Side Media Preparation
 
 The streaming path starts in `runner/media.py`.
@@ -160,6 +164,22 @@ D / Decode
 
 The purpose is to measure a bounded recent video clip while preserving
 multi-turn text state, but without reusing image-prefix KV.
+
+Validated multi-turn behavior:
+
+```text
+prompt 0 @ 5s: What is this situation?
+prompt 1 @ 8s: What did I ask earlier???
+
+response to prompt 1:
+  You asked about the activity in the video.
+```
+
+That run used 2B Q8 hybrid, `--dynamic-kv-cache`, `--kv-init-size 512`,
+`--kv-grow-step 512`, `--window-sec 4.0`, and `--window-max-frames 8`. Because
+sliding-window now preserves text/chat KV, dynamic KV grew from `512` to `5632`
+cells over the four-prompt test rather than stopping at the earlier singleton
+capacity.
 
 ## Vision-Prefill Details
 
@@ -378,6 +398,22 @@ eleven frames:
 ```text
 1 + 2 + 3 + ... + 11 = 66
 ```
+
+Additional closure validation:
+
+```text
+pytest my_research/foundation_llamacpp/tests/test_dynamic_kv_device_copy_contract.py \
+  my_research/foundation_llamacpp/tests/test_vision_prefill_kv_cache_contract.py \
+  my_research/foundation_llamacpp/tests/test_streaming_media.py -q
+
+cmake --build my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --target hybrid_streaming_decode -j2
+```
+
+The tracked main branch no longer contains paged-KV code or docs as active
+behavior. Future paged-KV or true KV compression work should start from a new
+branch/spec and should not silently change the semantics of these streaming
+modes.
 
 ## Future Chunked Vision Prefill
 

@@ -4,7 +4,9 @@ This directory contains the Android runner and bridge binaries used for
 llama.cpp / ExecuTorch hybrid VLM experiments. This document is the quick run
 guide. Build internals and historical notes live in
 `archive/executorch_vision_llamacpp_decoder.md`. Dynamic KV implementation
-details live in `archive/dynamic_kv_cache_implementation.md`. Streaming
+details live in `archive/dynamic_kv_cache_implementation.md`, and the OpenCL
+buffer/memory-architecture explanation lives in
+`archive/dynamic_kv_opencl_buffer_memory_architecture.md`. Streaming
 single-buffer details live in `archive/streaming_single_buffer_implementation.md`;
 sliding-window and KV vision-prefill details live in
 `archive/streaming_sliding_window_and_vision_prefill.md`.
@@ -60,7 +62,9 @@ Common arguments used by most runs:
   On OpenCL KV buffers, grow migration uses `clEnqueueCopyBuffer` to copy K/V
   data directly device-to-device; it falls back to host tensor get/set only if
   the tensors are not OpenCL-backed. First validation is scoped to the
-  OpenCL/hybrid streaming path and non-SWA single-sequence models.
+  OpenCL/hybrid streaming path and non-SWA single-sequence models. Paged KV is
+  not active on `main`; the paged-KV prototype commits were reverted so this
+  path stays a contiguous dynamic KV grow experiment.
 
 --batch-size N / --ubatch-size N
   llama.cpp batch and micro-batch sizes.
@@ -689,7 +693,8 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
   K/V data into the larger allocation. On OpenCL-backed tensors this copy is a
   device-to-device `clEnqueueCopyBuffer`; host tensor get/set is only the
   fallback path. Growth can still introduce a latency spike; it reduces
-  reserved KV memory, not attention work.
+  reserved KV memory, not attention work. Paged KV is intentionally not part of
+  the active `main` implementation.
   New builds write grow timestamps with the same `ggml_time_ms()` clock used by
   streaming phase timers, so retry-side prefill rows can be separated from grow
   time in `foundation_proc.csv` and `streaming_phase_timeline.png`.
