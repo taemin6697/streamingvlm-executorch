@@ -872,7 +872,9 @@ streaming_phase_timeline.png:
 DynamicKVGrow:
   synthetic dynamic KV expansion row inserted during finalization. New runs use
   the full grow/retry window from `llama_context::decode()`, including
-  `grow_to()`, KV copy/restore, scheduler reserve, and retry preparation.
+  `grow_to()`, KV migration, scheduler reserve, and retry preparation. For
+  OpenCL-backed KV tensors, migration should log device-to-device
+  `clEnqueueCopyBuffer` usage instead of CPU snapshot round-tripping.
 
 retry-side ImagePrefill:
   if an `ImagePrefill` row overlaps the grow window, finalization clips the row

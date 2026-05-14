@@ -320,6 +320,8 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
+    bool copy_existing_data_from(const std::vector<kv_layer> & old_layers, uint32_t old_size, uint32_t new_size, bool & used_device_copy);
+
     bool reset_capacity(uint32_t new_size, bool copy_existing);
 };
 

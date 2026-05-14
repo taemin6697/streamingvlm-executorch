@@ -17,7 +17,7 @@ Dynamic KV prototype은 아래 플래그로 켠다.
 1. `--dynamic-kv-cache`가 켜지면 runner는 `--ctx-size`를 직접 넘기지 않고 llama.cpp 쪽 logical context를 모델 최대 context로 둔다.
 2. `--kv-init-size`는 최초 physical KV capacity가 된다.
 3. prefill/decode 중 현재 batch가 physical KV capacity 안에 들어가지 않으면 standard KV cache를 grow한다.
-4. grow 시점에는 기존 K/V state를 host snapshot으로 저장하고, K/V tensor와 backend buffer를 새 capacity로 다시 만든 뒤 snapshot을 복원한다.
+4. grow 시점에는 기존 K/V tensor와 metadata를 보존하고, K/V tensor와 backend buffer를 새 capacity로 다시 만든 뒤 기존 byte range를 새 buffer로 옮긴다. OpenCL-backed KV에서는 `clEnqueueCopyBuffer`를 사용해 device-to-device로 복사하며, OpenCL fast path가 불가능할 때만 host tensor get/set으로 fallback한다.
 5. backend scheduler reserve를 다시 수행하고, 실패했던 batch를 재시도한다.
 6. grow event는 stdout log에 남고, Python finalizer가 이를 `foundation_proc.csv`의 `DynamicKVGrow` row로 backfill한다.
 
@@ -109,7 +109,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 - `llama.cpp/src/llama-model.cpp`: dynamic KV unsupported memory type guard 추가, standard `llama_kv_cache` 생성 시 initial physical capacity와 logical capacity를 분리해서 전달.
 - `llama.cpp/src/llama-memory.h`: `llama_memory_i`에 grow capability interface 추가.
 - `llama.cpp/src/llama-kv-cache.h`: `llama_kv_cache`에 logical/physical capacity 분리, cache type/offload 보존 멤버, grow/query/reset method 선언 추가.
-- `llama.cpp/src/llama-kv-cache.cpp`: `reset_capacity()`, `grow_to()`, host snapshot reader/writer, physical/logical query 구현.
+- `llama.cpp/src/llama-kv-cache.cpp`: `reset_capacity()`, `grow_to()`, OpenCL device-to-device tensor byte copy fast path, fallback host tensor copy, physical/logical query 구현.
 - `llama.cpp/src/llama-kv-cache-iswa.cpp`: iSWA wrapper의 `llama_kv_cache` constructor call에 fixed logical size 인자 추가.
 - `llama.cpp/src/llama-memory-hybrid.cpp`: hybrid memory wrapper의 `llama_kv_cache` constructor call에 fixed logical size 인자 추가.
 
@@ -161,7 +161,7 @@ Documentation/logs:
 - `kv_init_size`는 logical context보다 클 수 없고, 256 pad를 적용한다.
 - `kv_grow_step`도 256 pad를 적용한다.
 
-현재 prototype이 single non-unified sequence만 지원하는 이유는 `state_write()`/`state_read()` 기반 snapshot과 `v_cells` 재구성이 가장 단순하고, streaming 실험 경로가 single chat sequence이기 때문이다.
+현재 prototype이 single non-unified sequence만 지원하는 이유는 K/V byte layout과 `v_cells` metadata 보존을 단순하게 유지하기 위해서다. streaming 실험 경로도 single chat sequence이므로 이 범위에서 먼저 검증한다.
 
 ## 5. logical context와 physical KV capacity 분리
 
@@ -227,24 +227,28 @@ standard `llama_kv_cache`만 이 interface를 override한다.
 
 동작 순서:
 
-1. `copy_existing == true`이면 현재 KV state를 host memory snapshot으로 쓴다.
-2. 기존 `ctxs_bufs`, `v_cells`, `layers`, `map_layer_ids` 등을 비운다.
+1. `copy_existing == true`이면 기존 `ctxs_bufs`, `layers`, `v_cells`, `v_heads`를 임시 변수로 move해서 old buffer lifetime을 유지한다.
+2. 기존 live `ctxs_bufs`, `v_cells`, `layers`, `map_layer_ids` 등을 비운다.
 3. 새 `kv_size` 기준으로 `v_heads`, `v_cells`, K/V tensors를 재생성한다.
 4. backend buffer type은 기존 `offload` 값에 따라 CPU 또는 model layer device buffer를 사용한다.
 5. K/V dtype은 기존 `cache_type_k`, `cache_type_v`를 사용한다.
 6. backend buffer를 allocate하고 clear한다.
-7. `copy_existing == true`이면 snapshot을 새 tensors에 read back한다.
+7. `copy_existing == true`이면 `v_cells` metadata를 grow하고, K/V tensor bytes를 old tensor에서 new tensor로 복사한다. OpenCL-backed tensor는 `clEnqueueCopyBuffer`로 device-to-device copy를 수행한다.
 
 초기 constructor도 중복 초기화 코드를 들고 있지 않고 `reset_capacity(kv_size, false)`를 호출한다.
 
-### 8.3 host snapshot reader/writer
+### 8.3 K/V data migration
 
-grow는 device/OpenCL buffer를 새로 만들기 때문에 기존 K/V 내용을 보존해야 한다. 이를 위해 `llama.cpp/src/llama-kv-cache.cpp`에 두 helper class를 추가했다.
+grow는 device/OpenCL buffer를 새로 만들기 때문에 기존 K/V 내용을 보존해야 한다. 현재 구현은 아래 순서로 처리한다.
 
-- `llama_kv_io_write_host`: `llama_io_write_i` 구현. 일반 bytes와 tensor bytes를 `std::vector<uint8_t>`에 저장한다.
-- `llama_kv_io_read_host`: `llama_io_read_i` 구현. 저장된 bytes를 새 tensor로 복원한다.
+- `llama_kv_cache::copy_existing_data_from()`: old/new layer 목록을 비교하고 K/V byte range를 복사한다.
+- `llama_kv_copy_tensor_bytes()`: OpenCL fast path를 먼저 시도하고, 실패하면 `ggml_backend_tensor_get()` / `ggml_backend_tensor_set()` fallback을 사용한다.
+- `ggml_backend_opencl_tensor_copy_bytes()`: old/new tensor가 같은 OpenCL device buffer type이면 `clEnqueueCopyBuffer`로 GPU driver queue 안에서 직접 복사한다.
+- `llama_kv_cells::grow_to()`: 기존 cell metadata를 유지하고 새 cell 영역만 empty state로 초기화한다.
 
-tensor copy는 `ggml_backend_tensor_get()`과 `ggml_backend_tensor_set()`을 사용한다. 따라서 OpenCL buffer에서 host로 내려왔다가 새 OpenCL buffer로 올라가는 비용이 grow latency에 포함된다.
+K/V tensor layout은 K와 non-transposed V는 앞쪽 `old_size` rows가 contiguous하므로 한 번에 복사한다. transposed V는 embedding lane마다 stride가 `kv_size`에 의존하므로 lane 단위로 `old_size` elements를 old offset에서 new offset으로 옮긴다.
+
+중요: 더 큰 OpenCL buffer를 "제자리에서 확장"하는 것은 OpenCL buffer API로는 불가능하므로 새 buffer allocation 자체는 여전히 필요하다. 다만 기존 방식처럼 CPU DRAM snapshot을 왕복하지 않고, OpenCL command queue의 buffer-to-buffer copy로 old KV를 새 KV에 복사한다.
 
 ### 8.4 `grow_to()`
 
@@ -263,7 +267,8 @@ stdout 예:
 grow_to: growing dynamic KV cache: old = 1024, new = 16384, logical = 32768
 reset_capacity:     OpenCL KV buffer size =   448.00 MiB
 reset_capacity: size =  448.00 MiB ( 16384/ 32768 cells,  28 layers,  1/1 seqs), K (f16):  224.00 MiB, V (f16):  224.00 MiB
-grow_to: dynamic KV grow completed in 272.943 ms
+reset_capacity: dynamic KV data migration used device-to-device copy
+grow_to: dynamic KV grow completed in 202.135 ms
 ```
 
 ## 9. grow trigger point
@@ -463,7 +468,7 @@ DynamicKVGrow,38.670695,38.748724,,,78,,78,1024,2048,,28672,57344,57344,1024->20
 결과 폴더:
 
 ```text
-my_research/foundation_llamacpp/results/log/dynamic_grow_16384/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic
+my_research/foundation_llamacpp/results/log/dynamic_kv_device_copy_2b_hybrid_retry/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic
 ```
 
 조건:
@@ -475,7 +480,7 @@ my_research/foundation_llamacpp/results/log/dynamic_grow_16384/InternVL3-2B-Inst
 관찰:
 
 ```text
-DynamicKVGrow,41.154632,41.427575,,,273,,273,1024,16384,,28672,458752,458752,1024->16384/32768 cells; 28.00->448.00 MiB
+DynamicKVGrow,30.427000,30.726000,,,299,,299,1024,16384,,28672,458752,458752,1024->16384/32768 cells; 28.00->448.00 MiB
 ```
 
 stdout:
@@ -484,7 +489,8 @@ stdout:
 grow_to: growing dynamic KV cache: old = 1024, new = 16384, logical = 32768
 reset_capacity:     OpenCL KV buffer size =   448.00 MiB
 reset_capacity: size =  448.00 MiB ( 16384/ 32768 cells,  28 layers,  1/1 seqs), K (f16):  224.00 MiB, V (f16):  224.00 MiB
-grow_to: dynamic KV grow completed in 272.943 ms
+reset_capacity: dynamic KV data migration used device-to-device copy
+grow_to: dynamic KV grow completed in 202.135 ms
 ```
 
 즉:
@@ -492,7 +498,7 @@ grow_to: dynamic KV grow completed in 272.943 ms
 - `1024 -> 16384 cells`
 - `28.00 -> 448.00 MiB`
 - 증가량: `+420 MiB`
-- grow latency: 약 `273 ms`
+- grow latency: 약 `202 ms` (`llama_kv_cache::grow_to()` internal time), full grow/retry window은 runner finalizer의 `DynamicKVGrow` row 기준으로 해석한다.
 
 `android_memory_timeline.csv`에서도 grow 직후 `MemAvailable` 하락 구간이 더 명확하게 보인다. 다만 Android 전체 memory metric은 allocator/cache/driver 영향이 섞이므로, 정확한 KV allocation 크기는 `foundation_proc.csv`의 `kv_physical_committed_kb`와 stdout의 `reset_capacity` log를 기준으로 해석하는 것이 좋다.
 
@@ -560,8 +566,8 @@ Dynamic KV가 줄이는 것은 "처음부터 예약되는 KV buffer capacity"이
 ## 16. 구현상 주의점
 
 - 이 변경은 upstream `llama.cpp` source를 직접 수정한다. 프로젝트 원칙상 가능한 한 patch로 유지하고, upstream update 시 conflict를 작게 관리해야 한다.
-- `llama_kv_cache::reset_capacity()`는 device buffer를 재생성한다. OpenCL backend에서는 grow latency가 host-device copy와 buffer allocation을 포함한다.
-- `state_write()`/`state_read()`를 사용하므로 snapshot 대상 state schema가 upstream에서 바뀌면 grow restore도 재검증해야 한다.
+- `llama_kv_cache::reset_capacity()`는 device buffer를 재생성한다. OpenCL backend에서는 grow latency가 새 buffer allocation과 device-to-device copy를 포함한다. OpenCL tensor 조건이 맞지 않으면 host fallback copy가 사용될 수 있다.
+- K/V migration은 tensor byte layout에 의존한다. upstream에서 KV tensor shape, transposed V layout, stream view 생성 방식이 바뀌면 `copy_existing_data_from()`을 재검증해야 한다.
 - 현재 parser는 stdout log format에 의존한다. `grow_to:` 또는 `reset_capacity:` log string이 바뀌면 `_dynamic_kv_rows_from_stdout()`도 같이 수정해야 한다.
 - current implementation은 single stream/single sequence 중심이다. multi-session, beam/parallel sequence, unified KV, SWA/iSWA로 확장하려면 memory object별 semantics를 다시 설계해야 한다.
 - 결과 폴더명 `_dynamic`은 dynamic mode 여부만 표시한다. `kv-grow-step` 값까지 폴더명에 들어가지는 않으므로, 비교 실험은 `--results-root`를 다르게 주는 것이 안전하다.
@@ -573,6 +579,5 @@ Dynamic KV가 줄이는 것은 "처음부터 예약되는 KV buffer capacity"이
 1. grow threshold를 "prepare failure 후"가 아니라 "다음 prompt prefill 예상 token 수 기준"으로 사전 grow하도록 바꾸기.
 2. `foundation_proc.csv`에 grow 전후 Android memory sample을 가까운 timestamp 기준으로 같이 기록하기.
 3. KV capacity step을 adaptive policy로 바꾸기. 예: 작은 turn에서는 1024, long prefill 직전에는 4096 이상.
-4. OpenCL buffer reallocation latency를 줄이기 위해 copy granularity나 async copy 가능성 검토.
+4. OpenCL buffer reallocation latency를 줄이기 위해 async copy/event chaining, copy granularity, grow 직전 사전 reserve 가능성 검토.
 5. dynamic KV를 CPU fixed path에서도 검증하고, OpenCL/hybrid 외 backend로 확대.
-
