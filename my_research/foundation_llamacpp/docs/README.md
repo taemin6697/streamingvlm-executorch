@@ -60,6 +60,13 @@ Common arguments used by most runs:
   First validation is scoped to the OpenCL/hybrid streaming path and non-SWA
   single-sequence models.
 
+--paged-kv-cache --kv-page-size 256
+  Experimental paged KV cache infrastructure. The current tree wires CLI
+  parsing, llama.cpp context params, standard KV metadata, and a graph page-table
+  input, but intentionally rejects execution until OpenCL attention reads K/V
+  through that page table. The follow-up kernel work is documented in
+  `archive/paged_kv_opencl_prototype.md`.
+
 --batch-size N / --ubatch-size N
   llama.cpp batch and micro-batch sizes.
 
@@ -683,6 +690,13 @@ same marker should appear in `streaming_phase_timeline.png` and
   New builds write grow timestamps with the same `ggml_time_ms()` clock used by
   streaming phase timers, so retry-side prefill rows can be separated from grow
   time in `foundation_proc.csv` and `streaming_phase_timeline.png`.
+
+--paged-kv-cache --kv-page-size 256
+  Reserved for the paged KV prototype. It is wired through the Python runner,
+  `hybrid_streaming_decode`, common llama.cpp args, `llama_context_params`,
+  `llama_kv_cache` metadata, and `llama-graph` page-table input creation. Current
+  builds fail loudly with "paged attention is not implemented yet" because the
+  OpenCL attention kernels still consume contiguous K/V tensor views.
 
 stream_events.csv
   Frame arrival, `SingleBufferUpdate`, prompt arrival, and prompt decode events.

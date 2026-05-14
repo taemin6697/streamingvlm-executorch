@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct llama_cparams;
@@ -107,7 +108,9 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                         bool   paged_kv_cache = false,
+                     uint32_t   kv_page_size = 256);
 
     ~llama_kv_cache() = default;
 
@@ -157,6 +160,7 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+    bool is_paged_kv() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -202,9 +206,11 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    ggml_tensor * build_input_kv_page_table(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_kv_page_table(ggml_tensor * dst) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -233,8 +239,21 @@ private:
     bool v_trans = true;  // the value tensor is transposed
     bool offload = false;
 
+    struct PagedKVBlockTable {
+        uint32_t page_size = 256;
+        std::vector<uint32_t> logical_to_physical;
+
+        uint32_t n_logical_pages() const {
+            return logical_to_physical.size();
+        }
+    };
+
     ggml_type cache_type_k = GGML_TYPE_F16;
     ggml_type cache_type_v = GGML_TYPE_F16;
+
+    bool paged_kv_cache = false;
+    uint32_t kv_page_size = 256;
+    PagedKVBlockTable paged_block_table;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -292,6 +311,9 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    bool allocate_paged_kv_page();
+    std::pair<uint32_t, uint32_t> logical_pos_to_page_offset(uint32_t logical_pos) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -366,6 +388,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    bool is_paged_kv() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -391,9 +414,11 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    ggml_tensor * build_input_kv_page_table(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kv_page_table(ggml_tensor * dst) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;

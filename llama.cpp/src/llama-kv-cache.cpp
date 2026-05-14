@@ -144,10 +144,12 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   logical_kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_pad,
-                 uint32_t   n_swa,
+                     uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                         bool   paged_kv_cache,
+                     uint32_t   kv_page_size) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad),
     logical_kv_size(std::max(kv_size, logical_kv_size)), n_swa(n_swa), swa_type(swa_type) {
@@ -156,6 +158,9 @@ llama_kv_cache::llama_kv_cache(
     this->offload = offload;
     this->cache_type_k = type_k;
     this->cache_type_v = type_v;
+    this->paged_kv_cache = paged_kv_cache;
+    this->kv_page_size = kv_page_size;
+    this->paged_block_table.page_size = kv_page_size;
     filter_cb = filter;
     reuse_cb = reuse;
 
@@ -170,6 +175,12 @@ llama_kv_cache::llama_kv_cache(
     }
 
     reset_capacity(kv_size, false);
+    if (this->paged_kv_cache) {
+        const uint32_t n_pages = (kv_size + this->kv_page_size - 1) / this->kv_page_size;
+        for (uint32_t i = 0; i < n_pages; ++i) {
+            allocate_paged_kv_page();
+        }
+    }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
     const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
@@ -712,6 +723,31 @@ bool llama_kv_cache::can_grow() const {
     return n_stream == 1 && n_swa == 0 && swa_type == LLAMA_SWA_TYPE_NONE && logical_kv_size > get_size();
 }
 
+bool llama_kv_cache::allocate_paged_kv_page() {
+    if (!paged_kv_cache) {
+        return false;
+    }
+
+    const uint32_t physical_page = paged_block_table.logical_to_physical.size();
+    paged_block_table.logical_to_physical.push_back(physical_page);
+
+    LLAMA_LOG_INFO("%s: paged KV allocated page logical=%u physical=%u page_size=%u\n",
+            __func__,
+            (uint32_t) paged_block_table.logical_to_physical.size() - 1,
+            physical_page,
+            kv_page_size);
+
+    return true;
+}
+
+std::pair<uint32_t, uint32_t> llama_kv_cache::logical_pos_to_page_offset(uint32_t logical_pos) const {
+    GGML_ASSERT(paged_kv_cache);
+    const uint32_t logical_page = logical_pos / kv_page_size;
+    const uint32_t offset = logical_pos % kv_page_size;
+    GGML_ASSERT(logical_page < paged_block_table.logical_to_physical.size());
+    return { paged_block_table.logical_to_physical[logical_page], offset };
+}
+
 bool llama_kv_cache::grow_to(uint32_t new_size) {
     const uint32_t old_size = get_size();
     new_size = std::min(GGML_PAD(new_size, n_pad), logical_kv_size);
@@ -722,6 +758,20 @@ bool llama_kv_cache::grow_to(uint32_t new_size) {
     if (n_stream != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
         LLAMA_LOG_ERROR("%s: unsupported dynamic KV grow configuration\n", __func__);
         return false;
+    }
+
+    if (paged_kv_cache) {
+        const uint32_t old_pages = paged_block_table.n_logical_pages();
+        const uint32_t needed_pages = (new_size + kv_page_size - 1) / kv_page_size;
+        for (uint32_t i = old_pages; i < needed_pages; ++i) {
+            if (!allocate_paged_kv_page()) {
+                return false;
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: paged KV grow metadata: old_pages = %u, new_pages = %u, page_size = %u, logical = %u\n",
+                __func__, old_pages, paged_block_table.n_logical_pages(), kv_page_size, logical_kv_size);
+        return true;
     }
 
     const int64_t t_start_us = ggml_time_us();
@@ -741,6 +791,9 @@ bool llama_kv_cache::grow_to(uint32_t new_size) {
 }
 
 uint32_t llama_kv_cache::get_physical_size() const {
+    if (paged_kv_cache) {
+        return paged_block_table.n_logical_pages() * kv_page_size;
+    }
     return get_size();
 }
 
@@ -1232,6 +1285,10 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+bool llama_kv_cache::is_paged_kv() const {
+    return paged_kv_cache;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1476,6 +1533,17 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     return res;
 }
 
+ggml_tensor * llama_kv_cache::build_input_kv_page_table(ggml_context * ctx) const {
+    GGML_ASSERT(paged_kv_cache);
+
+    const int64_t n_pages = std::max<int64_t>(1, paged_block_table.n_logical_pages());
+    ggml_tensor * res = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pages);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kv_page_table");
+
+    return res;
+}
+
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
@@ -1489,6 +1557,22 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
+    }
+}
+
+void llama_kv_cache::set_input_kv_page_table(ggml_tensor * dst) const {
+    GGML_ASSERT(paged_kv_cache);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    int32_t * data = (int32_t *) dst->data;
+    const int64_t n_dst = ggml_nelements(dst);
+    for (int64_t i = 0; i < n_dst; ++i) {
+        data[i] = 0;
+    }
+
+    const int64_t n_pages = std::min<int64_t>(n_dst, paged_block_table.logical_to_physical.size());
+    for (int64_t i = 0; i < n_pages; ++i) {
+        data[i] = (int32_t) paged_block_table.logical_to_physical[i];
     }
 }
 
@@ -2557,6 +2641,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+bool llama_kv_cache_context::is_paged_kv() const {
+    return kv->is_paged_kv();
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2597,6 +2685,10 @@ ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) cons
     return kv->build_input_v_rot(ctx);
 }
 
+ggml_tensor * llama_kv_cache_context::build_input_kv_page_table(ggml_context * ctx) const {
+    return kv->build_input_kv_page_table(ctx);
+}
+
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
     kv->set_input_k_shift(dst);
 }
@@ -2607,6 +2699,10 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_kv_page_table(ggml_tensor * dst) const {
+    kv->set_input_kv_page_table(dst);
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {

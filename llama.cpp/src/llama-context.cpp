@@ -54,8 +54,10 @@ llama_context::llama_context(
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
     cparams.dynamic_kv_cache = params.dynamic_kv_cache;
+    cparams.paged_kv_cache   = params.paged_kv_cache;
     cparams.kv_init_size     = params.kv_init_size;
     cparams.kv_grow_step     = params.kv_grow_step;
+    cparams.kv_page_size     = params.kv_page_size;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -210,12 +212,30 @@ llama_context::llama_context(
         cparams.kv_grow_step = GGML_PAD(cparams.kv_grow_step, 256);
     }
 
+    if (cparams.paged_kv_cache) {
+        if (cparams.dynamic_kv_cache) {
+            throw std::runtime_error("paged KV and dynamic contiguous KV cannot both be enabled");
+        }
+        if (cparams.n_seq_max != 1 || cparams.kv_unified) {
+            throw std::runtime_error("paged KV prototype supports only one non-unified sequence");
+        }
+        if (cparams.kv_page_size == 0 || cparams.kv_page_size % 256 != 0) {
+            throw std::runtime_error("--kv-page-size must be a positive multiple of 256");
+        }
+        cparams.kv_page_size = GGML_PAD(cparams.kv_page_size, 256);
+        throw std::runtime_error("paged KV metadata/page-table mode is wired, but paged attention is not implemented yet");
+    }
+
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     if (cparams.dynamic_kv_cache) {
         LLAMA_LOG_INFO("%s: dynamic_kv   = true (init = %u, grow = %u, logical = %u)\n",
                 __func__, cparams.kv_init_size, cparams.kv_grow_step, cparams.n_ctx_seq);
+    }
+    if (cparams.paged_kv_cache) {
+        LLAMA_LOG_INFO("%s: paged_kv    = true (page = %u, logical = %u)\n",
+                __func__, cparams.kv_page_size, cparams.n_ctx_seq);
     }
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
@@ -3180,6 +3200,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.kv_init_size                =*/ 0,
         /*.kv_grow_step                =*/ 0,
+        /*.kv_page_size                =*/ 256,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -3207,6 +3228,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.dynamic_kv_cache            =*/ false,
+        /*.paged_kv_cache              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };

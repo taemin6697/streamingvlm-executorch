@@ -5,6 +5,25 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-14: Paged KV Cache Infrastructure
+
+- Added the first guarded paged KV infrastructure slice for the standard
+  llama.cpp KV cache path:
+  `--paged-kv-cache --kv-page-size 256`.
+- The current implementation wires CLI parsing, runner forwarding,
+  `llama_context_params`, internal `llama_cparams`, `llama_kv_cache`
+  `PagedKVBlockTable` metadata, page allocation helpers, and an
+  `attn_inp_kv_page_table` graph input.
+- Runtime execution is intentionally blocked with a clear error because OpenCL
+  attention still reads contiguous K/V views. The next implementation step must
+  pass the page table into the ggml/OpenCL attention op and replace contiguous
+  `k_idx` addressing with page-table addressing.
+- Future true KV compression is documented as a shrink/repack extension: after
+  compressing pages, active pages and capacity pages must both decrease if the
+  goal is system-visible memory reduction. That requires device-to-device live
+  page compaction into a smaller OpenCL allocation/chunk set and then releasing
+  the old larger allocation.
+
 ## 2026-05-11: Hybrid Bridge Refactor Baseline
 
 - Refactor goal: separate media mode (`text`, `image`, `video_file`, future

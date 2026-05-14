@@ -1494,6 +1494,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ubatch          = params.n_ubatch;
     cparams.kv_init_size      = params.kv_init_size;
     cparams.kv_grow_step      = params.kv_grow_step;
+    cparams.kv_page_size      = params.kv_page_size;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
@@ -1517,6 +1518,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.dynamic_kv_cache  = params.dynamic_kv_cache;
+    cparams.paged_kv_cache    = params.paged_kv_cache;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

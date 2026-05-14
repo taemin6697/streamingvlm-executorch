@@ -1370,6 +1370,7 @@ def _result_model_name(
     streaming: bool = False,
     stream_mode: str | None = None,
     dynamic_kv_cache: bool = False,
+    paged_kv_cache: bool = False,
 ) -> str:
     suffix = "opencl" if processor == "gpu" else processor
     kv = _result_kv_suffix(cache_type_k, cache_type_v)
@@ -1379,7 +1380,8 @@ def _result_model_name(
     else:
         mid = "_text" if text_only else ""
     dynamic = "_dynamic" if dynamic_kv_cache else ""
-    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}"
+    paged = "_paged" if paged_kv_cache else ""
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}{paged}"
 
 
 def _find_executable(build_dir: Path, name: str) -> Path:
@@ -1556,6 +1558,8 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
         cmd.append("--no-kv-offload")
     if getattr(args, "no_warmup", False):
         cmd.append("--no-warmup")
+    if getattr(args, "paged_kv_cache", False):
+        cmd.extend(["--paged-kv-cache", "--kv-page-size", str(args.kv_page_size)])
     _extend_llama_rope_cli(cmd, args)
     return cmd
 
@@ -1611,6 +1615,8 @@ def _build_text_only_command(args: argparse.Namespace) -> list[str]:
         cmd.append("--no-kv-offload")
     if getattr(args, "no_warmup", False):
         cmd.append("--no-warmup")
+    if getattr(args, "paged_kv_cache", False):
+        cmd.extend(["--paged-kv-cache", "--kv-page-size", str(args.kv_page_size)])
     _extend_llama_rope_cli(cmd, args)
     return cmd
 
@@ -1643,6 +1649,8 @@ def _flash_attn_kv_shell_suffix(args: argparse.Namespace) -> str:
 
 
 def _ctx_dynamic_kv_shell_suffix(args: argparse.Namespace) -> str:
+    if getattr(args, "paged_kv_cache", False):
+        return f" --paged-kv-cache --kv-page-size {args.kv_page_size}"
     if getattr(args, "dynamic_kv_cache", False):
         parts = ["--dynamic-kv-cache"]
         if getattr(args, "kv_init_size", None):
@@ -1983,6 +1991,8 @@ def main() -> int:
     )
     parser.add_argument("--kv-init-size", type=int, default=1024, help="Initial physical KV capacity for --dynamic-kv-cache.")
     parser.add_argument("--kv-grow-step", type=int, default=1024, help="Physical KV grow step for --dynamic-kv-cache.")
+    parser.add_argument("--paged-kv-cache", action="store_true", dest="paged_kv_cache", help="Project prototype: enable experimental paged KV cache metadata/page-table mode.")
+    parser.add_argument("--kv-page-size", type=int, default=256, help="Page size in cells for --paged-kv-cache.")
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--ubatch-size", type=int, default=512)
     parser.add_argument("--gpu-layers", "--n-gpu-layers", dest="gpu_layers", type=int, default=99)
@@ -2251,6 +2261,7 @@ def main() -> int:
         streaming=args.streaming_video is not None,
         stream_mode=getattr(args, "stream_mode", None),
         dynamic_kv_cache=getattr(args, "dynamic_kv_cache", False),
+        paged_kv_cache=getattr(args, "paged_kv_cache", False),
     )
     result_dir.mkdir(parents=True, exist_ok=True)
 
