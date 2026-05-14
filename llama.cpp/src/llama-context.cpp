@@ -213,17 +213,21 @@ llama_context::llama_context(
     }
 
     if (cparams.paged_kv_cache) {
-        if (cparams.dynamic_kv_cache) {
-            throw std::runtime_error("paged KV and dynamic contiguous KV cannot both be enabled");
-        }
         if (cparams.n_seq_max != 1 || cparams.kv_unified) {
             throw std::runtime_error("paged KV prototype supports only one non-unified sequence");
+        }
+        if (!cparams.flash_attn) {
+            throw std::runtime_error("paged KV cache requires FlashAttention so the page table is consumed by attention");
+        }
+        if (cparams.kv_init_size == 0 || cparams.kv_grow_step == 0) {
+            throw std::runtime_error("paged KV cache requires --kv-init-size and --kv-grow-step");
         }
         if (cparams.kv_page_size == 0 || cparams.kv_page_size % 256 != 0) {
             throw std::runtime_error("--kv-page-size must be a positive multiple of 256");
         }
+        cparams.kv_init_size = GGML_PAD(std::min(cparams.kv_init_size, cparams.n_ctx_seq), 256);
+        cparams.kv_grow_step = GGML_PAD(cparams.kv_grow_step, 256);
         cparams.kv_page_size = GGML_PAD(cparams.kv_page_size, 256);
-        throw std::runtime_error("paged KV metadata/page-table mode is wired, but paged attention is not implemented yet");
     }
 
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
@@ -1684,7 +1688,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                     }
 
-                    if (cparams.dynamic_kv_cache && memory->can_grow()) {
+                    if ((cparams.dynamic_kv_cache || cparams.paged_kv_cache) && memory->can_grow()) {
                         const int64_t grow_full_start_ms = ggml_time_ms();
                         const uint32_t old_size = memory->get_physical_size();
                         const uint32_t logical_size = memory->get_logical_size();

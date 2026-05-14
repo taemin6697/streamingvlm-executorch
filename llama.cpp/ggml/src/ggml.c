@@ -5405,6 +5405,20 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_page_table(
+        struct ggml_tensor * a,
+        struct ggml_tensor * page_table,
+        int32_t              page_size) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(page_table);
+    GGML_ASSERT(page_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(page_size > 0);
+
+    ggml_set_op_params_i32(a, 4, page_size);
+    a->src[5] = page_table;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

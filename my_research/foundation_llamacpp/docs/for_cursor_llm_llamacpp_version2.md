@@ -604,3 +604,41 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 - Added `docs/archive/streaming_sliding_window_and_vision_prefill.md` as the
   detailed archive writeup for the sliding-window baseline and current
   full-history KV vision-prefill mode.
+
+## 2026-05-13: Paged KV OpenCL Attention Prototype
+
+- Implemented the first executable paged KV path for llama.cpp/OpenCL:
+  - `llama_kv_cache` now stores paged metadata, builds an I32 page-table input,
+    maps K/V write indices from logical cell to physical page offset, and keeps
+    active cell capacity separate from reserved backing capacity.
+  - `llama-graph` attaches the page table to `ggml_flash_attn_ext`.
+  - `ggml` exposes `ggml_flash_attn_ext_set_page_table()`.
+  - OpenCL FlashAttention kernels read K/V with
+    `page_table[logical_page] * page_size + page_offset`.
+- Grow behavior changed for paged KV:
+  - initial allocation reserves the logical max backing rows;
+  - active cells start at `--kv-init-size`;
+  - `grow_to()` only extends active `llama_kv_cells` metadata and page-table
+    entries, with no `reset_capacity()` and no KV snapshot/restore.
+- Runner/bridge fixes:
+  - `runner/cli.py` forwards `-c/--ctx-size` together with paged KV flags into
+    `hybrid_streaming_decode`, avoiding the bridge default `4096` context.
+  - stdout finalization now recognizes `paged KV grow metadata-only` logs and
+    writes them as `DynamicKVGrow` rows, with active MiB and committed backing
+    MiB separated.
+- Validation:
+  - `pytest my_research/foundation_llamacpp/tests/test_paged_kv_cache_contract.py my_research/foundation_llamacpp/tests/test_streaming_media.py my_research/foundation_llamacpp/tests/test_vision_prefill_kv_cache_contract.py -q`
+    passed with `19 passed`.
+  - `cmake --build my_research/foundation_llamacpp/build-hybrid-android-opencl --target opencl_streaming_decode hybrid_streaming_decode -j2`
+    passed.
+  - 2B Q8 hybrid run, single-buffer streaming, `ctx=32768`,
+    `--kv-init-size 1024`, `--kv-grow-step 15360`, `--kv-page-size 256`,
+    returned code `0`.
+    Result:
+    `results/log/paged_kv_full_2b_hybrid/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_paged`.
+  - Measured grow:
+    - contiguous dynamic baseline: retry window `369-394 ms`;
+    - paged run: `grow_to()` metadata update `0.201 ms`,
+      `DynamicKVGrow` retry window `113 ms`;
+    - startup OpenCL KV backing is `896 MiB`, so current paged KV trades memory
+      for removing the grow-time realloc/copy spike.

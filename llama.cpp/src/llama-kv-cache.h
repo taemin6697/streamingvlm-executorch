@@ -161,6 +161,7 @@ public:
 
     bool get_has_shift() const;
     bool is_paged_kv() const;
+    uint32_t get_kv_page_size() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -262,6 +263,7 @@ private:
     const uint32_t n_pad = 1;
 
     uint32_t logical_kv_size = 0;
+    uint32_t backing_kv_size = 0;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -314,6 +316,7 @@ private:
 
     bool allocate_paged_kv_page();
     std::pair<uint32_t, uint32_t> logical_pos_to_page_offset(uint32_t logical_pos) const;
+    uint32_t logical_pos_to_physical_pos(uint32_t logical_pos) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -389,6 +392,7 @@ public:
 
     uint32_t get_n_kv() const;
     bool is_paged_kv() const;
+    uint32_t get_kv_page_size() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

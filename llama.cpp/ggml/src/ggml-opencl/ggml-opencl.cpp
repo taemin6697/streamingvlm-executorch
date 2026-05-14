@@ -9725,6 +9725,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * page_table = dst->src[5];
     GGML_ASSERT(q->extra);
     GGML_ASSERT(k->extra);
     GGML_ASSERT(v->extra);
@@ -9734,6 +9735,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     }
     if (sinks) {
         GGML_ASSERT(sinks->extra);
+    }
+    if (page_table) {
+        GGML_ASSERT(page_table->extra);
+        GGML_ASSERT(page_table->type == GGML_TYPE_I32);
     }
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -9786,6 +9791,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     ggml_tensor_extra_cl * extra_o = (ggml_tensor_extra_cl *)dst->extra;
     ggml_tensor_extra_cl * extra_mask = mask ? (ggml_tensor_extra_cl *)mask->extra : NULL;
     ggml_tensor_extra_cl * extra_sinks = sinks ? (ggml_tensor_extra_cl *)sinks->extra : NULL;
+    ggml_tensor_extra_cl * extra_page_table = page_table ? (ggml_tensor_extra_cl *)page_table->extra : NULL;
 
     cl_ulong offset_q = extra_q->offset + q->view_offs;
     cl_ulong offset_k = extra_k->offset + k->view_offs;
@@ -9795,6 +9801,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     cl_ulong offset_mask = extra_mask ? extra_mask->offset + mask->view_offs : 0;
     cl_mem   sinks_buffer = extra_sinks ? extra_sinks->data_device : NULL;
     cl_ulong offset_sinks = extra_sinks ? extra_sinks->offset + sinks->view_offs : 0;
+    cl_mem   page_table_buffer = extra_page_table ? extra_page_table->data_device : NULL;
+    cl_ulong offset_page_table = extra_page_table ? extra_page_table->offset + page_table->view_offs : 0;
+    const int kv_page_size = page_table ? ggml_get_op_params_i32(dst, 4) : 0;
 
     const cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], q_nb3 = q->nb[3];
     cl_ulong k_nb1 = k->nb[1], k_nb2 = k->nb[2], k_nb3 = k->nb[3];
@@ -9859,6 +9868,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     CL_CHECK(clSetKernelArg(kernel, 37, sizeof(int),      &mask_ne3));
     CL_CHECK(clSetKernelArg(kernel, 38, sizeof(cl_mem),   &sinks_buffer));
     CL_CHECK(clSetKernelArg(kernel, 39, sizeof(cl_ulong), &offset_sinks));
+    CL_CHECK(clSetKernelArg(kernel, 40, sizeof(cl_mem),   &page_table_buffer));
+    CL_CHECK(clSetKernelArg(kernel, 41, sizeof(cl_ulong), &offset_page_table));
+    CL_CHECK(clSetKernelArg(kernel, 42, sizeof(int),      &kv_page_size));
 
     if (n_q == 1) {
         const size_t wg_size = 64;

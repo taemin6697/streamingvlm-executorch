@@ -614,6 +614,49 @@ The second run should report a `DynamicKVGrow` row like
 same marker should appear in `streaming_phase_timeline.png` and
 `memory_timeline_decode_window.png`.
 
+Paged KV no-copy grow test (`1024 -> 16384` active cells with a reserved
+32768-cell backing buffer):
+
+```bash
+python3 my_research/foundation_llamacpp/runner/cli.py \
+  --processor hybrid \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --manifest my_research/foundation/results/model/qnn/internvl3_2b_hybrid_16p_16k_16a4w/manifest.json \
+  --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
+  --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
+  --stream-mode single-buffer \
+  --sampling-fps 1.0 \
+  --max-video-time 15.0 \
+  --time '[5.0, 8.0, 11.0, 14.0]' \
+  --prompt '["What is this situation?", "What did I ask earlier???", "What changed in the scene?", "Summarize the full situation so far."]' \
+  --ctx-size 32768 \
+  --paged-kv-cache \
+  --kv-page-size 256 \
+  --kv-init-size 1024 \
+  --kv-grow-step 15360 \
+  --flash-attn on \
+  --n-predict 32 \
+  --results-root my_research/foundation_llamacpp/results/log/paged_kv_full_2b_hybrid \
+  --force-push
+```
+
+Validated result:
+
+```text
+results/log/paged_kv_full_2b_hybrid/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_paged
+return_code=0
+grow_to paged metadata-only=0.201 ms
+DynamicKVGrow retry window=113 ms
+dynamic contiguous baseline retry window=369-394 ms
+```
+
+The paged run removes the `reset_capacity` realloc/copy spike during grow. The
+current implementation reserves the full 32768-cell OpenCL backing buffer at
+startup (`896 MiB` for 2B f16 KV), while exposing only `1024` active logical
+cells until grow. So it trades memory for predictable grow latency; it is not yet
+the later page-per-allocation memory-saving design.
+
 ### Streaming Extra Arguments
 
 ```text
@@ -692,11 +735,15 @@ same marker should appear in `streaming_phase_timeline.png` and
   time in `foundation_proc.csv` and `streaming_phase_timeline.png`.
 
 --paged-kv-cache --kv-page-size 256
-  Reserved for the paged KV prototype. It is wired through the Python runner,
-  `hybrid_streaming_decode`, common llama.cpp args, `llama_context_params`,
-  `llama_kv_cache` metadata, and `llama-graph` page-table input creation. Current
-  builds fail loudly with "paged attention is not implemented yet" because the
-  OpenCL attention kernels still consume contiguous K/V tensor views.
+  Experimental paged KV prototype for OpenCL FlashAttention. It wires page-table
+  metadata from CLI/common args through `llama_kv_cache`, maps K/V write indices
+  from logical token position to physical page offset, and passes the page table
+  into ggml/OpenCL FlashAttention. OpenCL kernels translate `k_idx` through
+  `page_table[logical_page] * page_size + offset` before loading K/V.
+  Current grow is metadata-only: the cache reserves a max-context backing buffer
+  at init, starts with `--kv-init-size` active cells, then grows active pages and
+  cells without reallocating/restoring KV data. This removes the grow copy spike
+  but does not reduce initial OpenCL KV memory.
 
 stream_events.csv
   Frame arrival, `SingleBufferUpdate`, prompt arrival, and prompt decode events.

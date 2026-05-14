@@ -521,15 +521,23 @@ std::vector<std::string> build_llama_args(const Args& args, const std::string& i
       "--temp",
       std::to_string(args.temperature),
   };
+  if (!args.dynamic_kv_cache) {
+    out.push_back("--ctx-size");
+    out.push_back(std::to_string(args.ctx_size));
+  }
   if (args.paged_kv_cache) {
     out.push_back("--paged-kv-cache");
     out.push_back("--kv-page-size");
     out.push_back(std::to_string(args.kv_page_size));
-  } else if (!args.dynamic_kv_cache) {
-    out.push_back("--ctx-size");
-    out.push_back(std::to_string(args.ctx_size));
-  } else {
-    out.push_back("--dynamic-kv-cache");
+  }
+  if (args.paged_kv_cache || args.dynamic_kv_cache) {
+    if (args.dynamic_kv_cache) {
+      out.push_back("--dynamic-kv-cache");
+    }
+    if (args.paged_kv_cache) {
+      out.push_back("--flash-attn");
+      out.push_back("on");
+    }
     if (args.kv_init_size > 0) {
       out.push_back("--kv-init-size");
       out.push_back(std::to_string(args.kv_init_size));
