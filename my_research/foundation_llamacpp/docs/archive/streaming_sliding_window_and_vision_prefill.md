@@ -34,7 +34,9 @@ sliding-window:
   prompt latency includes full prompt-time vision encode and image prefill
 
 vision-prefill:
-  every frame arrival builds a full-history video-prefix KV snapshot
+  every frame arrival saves a full-history video-prefix KV snapshot
+  frame 0 is built from scratch; later frames append one new frame to the
+  previous restored snapshot
   decoder chat state is singleton per prompt
   prompt latency restores cached image-prefix KV and evaluates only text suffix
 ```
@@ -183,15 +185,15 @@ capacity.
 
 ## Vision-Prefill Details
 
-`vision-prefill` is a hybrid-only full-history KV snapshot cache.
+`vision-prefill` is a hybrid-only incremental full-history KV snapshot cache.
 
-For every sampled frame, the bridge builds a cache using all sampled frames up
-to that frame:
+For every sampled frame, the bridge saves a cache representing all sampled
+frames up to that frame:
 
 ```text
-frame 0 cache: [frame 0]
-frame 1 cache: [frame 0, frame 1]
-frame 2 cache: [frame 0, frame 1, frame 2]
+frame 0 cache: build [frame 0] from scratch
+frame 1 cache: restore frame 0 cache, append [frame 1]
+frame 2 cache: restore frame 1 cache, append [frame 2]
 ...
 ```
 
@@ -282,7 +284,9 @@ image chunk:
   image_chunk_idx += 1
 ```
 
-So a multi-frame cache build becomes:
+For incremental cache updates, each cache build after frame 0 first restores the
+previous snapshot (`VisionPrefillCacheAppendRestore`), then evaluates only the
+new frame's `Frame N:` text and image chunk.
 
 ```text
 Frame label text prefill
@@ -380,7 +384,7 @@ results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered/
   InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16
 ```
 
-Observed:
+Older full-rebuild observation:
 
 ```text
 foundation_exit_code.txt = 0
@@ -398,6 +402,23 @@ eleven frames:
 ```text
 1 + 2 + 3 + ... + 11 = 66
 ```
+
+Current incremental observation:
+
+```text
+result = results/log/stream_modes_2b_hybrid_dynamic512_npredict64/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic
+foundation_exit_code.txt = 0
+VisionPrefillCacheBuild = 16
+VisionPrefillCacheAppendRestore = 15
+VisionPrefillCacheHit = 4
+VisionPrefillCacheRestore = 4
+VisionPrefillV_Encode = 16
+VisionPrefillImagePrefill = 16
+DynamicKVGrow = 8
+```
+
+The `16` vision/image-prefill rows correspond to one newly appended frame per
+sampled frame, not `1 + 2 + ... + 16`.
 
 Additional closure validation:
 
@@ -431,5 +452,5 @@ The planned chunk-size argument is:
 
 This should create independently reusable KV chunks, for example one frame per
 chunk or two frames per chunk. That future mode should not silently change the
-current `vision-prefill` semantics, which are deliberately full-history
-snapshots built at every frame.
+current `vision-prefill` semantics, which maintain one full-history snapshot at
+each frame by incrementally appending the newest frame.

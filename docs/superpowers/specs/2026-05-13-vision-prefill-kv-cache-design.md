@@ -6,11 +6,11 @@ Implement `vision-prefill` as a real KV-level image prefill cache for streaming 
 
 ## Mode Semantics
 
-- `sliding-window`: resets before each prompt and evaluates the selected video window and text prompt together.
-- `vision-prefill`: builds a cached KV snapshot for every sampled frame using all sampled frames up to that frame. At prompt time, it restores that full-history snapshot and evaluates only the text suffix. It ignores `--window-sec` and `--window-max-frames`.
+- `sliding-window`: evaluates the selected video window and text prompt while preserving multi-turn chat/KV state across prompts.
+- `vision-prefill`: builds a cached KV snapshot for every sampled frame. Frame 0 is built from scratch; later frames restore the previous snapshot, append only the newly arrived frame's label/image KV, and save the new full-history snapshot. At prompt time, it restores that full-history snapshot and evaluates only the text suffix. It ignores `--window-sec` and `--window-max-frames`.
 - Future mode flag: `--chunked-vision-prefill`. This will cache independently reusable chunks of 1, 2, or more frames, controlled by a future argument named `--chunk-count`.
 
-The first implementation intentionally covers only `vision-prefill` full-history snapshots. It does not compose per-frame or per-chunk KV fragments.
+The implementation intentionally covers only one active full-history snapshot per sampled frame. It incrementally appends one new frame to the previous snapshot, but it does not yet expose independently reusable per-frame or per-chunk KV fragments.
 
 ## Architecture
 

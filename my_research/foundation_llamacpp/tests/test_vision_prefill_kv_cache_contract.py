@@ -72,6 +72,17 @@ def test_vision_prefill_cache_build_encodes_frames_on_demand():
     assert "bins[image_chunk_idx]" in source
 
 
+def test_vision_prefill_cache_build_restores_previous_snapshot_and_appends_one_frame():
+    source = STREAMING_CPP.read_text()
+    build_fn = source.split("bool build_vision_prefill_cache(", 1)[1].split("\n}\n\nint run_single_buffer_prompt", 1)[0]
+
+    assert "build_formatted_incremental_vision_cache_append" in source
+    assert "restore_vision_prefill_cache_state(ctx, cache, cache_phases, \"VisionPrefillCacheAppendRestore\")" in build_fn
+    assert "std::vector<FrameRecord> append_frames{frames.back()}" in build_fn
+    assert "bins_for_frames(append_frames)" in build_fn
+    assert "layout_images_for_frames(append_frames)" in build_fn
+
+
 def test_sliding_window_keeps_multiturn_text_history():
     source = STREAMING_CPP.read_text()
     singleton_fn = source.split("bool is_singleton_video_mode(", 1)[1].split("\n}\n\nvoid reset_decode_context_for_singleton", 1)[0]

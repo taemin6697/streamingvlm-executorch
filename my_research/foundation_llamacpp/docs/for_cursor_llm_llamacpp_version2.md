@@ -544,10 +544,12 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     evaluates the selected frames as a video clip while preserving decoder
     chat/KV state across prompt events.
   - `--stream-mode vision-prefill`: hybrid-only KV-level image-prefill cache.
-    Every frame arrival enqueues a cache update. Each update builds a
-    full-history video-prefix KV snapshot from all sampled frames up to that
-    frame. Prompt handling restores the matching snapshot and evaluates only the
-    formatted question suffix.
+    Every frame arrival enqueues a cache update. Frame 0 builds the
+    full-history video-prefix KV snapshot from scratch; later updates restore
+    the previous snapshot, append only the newly arrived frame's `Frame N:`
+    text/image KV, then save the next full-history snapshot. Prompt handling
+    restores the matching snapshot and evaluates only the formatted question
+    suffix.
 - `runner/media.py` now writes streaming manifests with `stream_mode`,
   `window_sec`, and `window_max_frames`. Hybrid streaming modes write both
   layout PNGs and QNN `.bin` tensors for sampled frames.
@@ -562,10 +564,11 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     evenly sampled to `window_max_frames`.
   - `vision_prefill`: selected frames are the full sampled history up to the
     cache or prompt timestamp, ignoring `window_sec` and `window_max_frames`.
-- The current `vision-prefill` cache is a complete snapshot, not a composable
-  per-frame cache. It stores frame indices, layout image paths, saved seq 0
-  bytes from `llama_state_seq_get_data_ext()`, state flags, and `n_past`.
-  Restore uses `llama_state_seq_set_data_ext()` before suffix text prefill.
+- The current `vision-prefill` cache is one complete active snapshot, not a
+  composable per-frame cache. It stores frame indices, layout image paths, saved
+  seq 0 bytes from `llama_state_seq_get_data_ext()`, state flags, and `n_past`.
+  Cache updates restore the previous snapshot for append, and prompt handling
+  restores the matched snapshot before suffix text prefill.
 - Prompt boundary handling uses `SVLM_QUESTION_SENTINEL` inside the same
   chat-template formatted user message that the non-cached prompt would use.
   Cache build evaluates the formatted video prefix before the sentinel; prompt
@@ -577,6 +580,9 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     mtmd chunks in order, QNN-encodes only `bins[image_chunk_idx]` when that
     IMAGE chunk is reached, then immediately runs `VisionPrefillMmproj` and
     `VisionPrefillImagePrefill` before the next frame/tile.
+  - later correction changed cache construction from full-history rebuild to
+    incremental append: each cache update after frame 0 restores the previous
+    KV snapshot and evaluates only the newest frame.
 - Timeline presentation:
   - `SingleBufferUpdate` ticks remain visible for frame arrivals.
   - `VisionPrefillV_Encode`, `VisionPrefillMmproj`,
@@ -589,7 +595,7 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - `--chunked-vision-prefill`
   - `--chunk-count`
   This should build independently reusable 1-frame, 2-frame, or larger chunks
-  instead of changing the full-history `vision-prefill` semantics.
+  instead of changing the current single-snapshot `vision-prefill` semantics.
 - Validation:
   - `pytest my_research/foundation_llamacpp/tests/test_vision_prefill_kv_cache_contract.py my_research/foundation_llamacpp/tests/test_streaming_media.py -q`
     passed with `12 passed`.
@@ -602,12 +608,16 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     `--ctx-size 4096`, f16 KV, and `--n-predict 32` returned code `0`.
     Result:
     `results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16`.
-  - CSV checks showed `VisionPrefillCacheBuild 11`,
+  - Earlier full-rebuild CSV checks showed `VisionPrefillCacheBuild 11`,
     `VisionPrefillCacheHit 2`, `VisionPrefillV_Encode 66`,
     `VisionPrefillImagePrefill 66`, and `bad_consecutive_vencode=0`.
+  - Incremental validation later changed the expected steady-state count:
+    16 sampled frames produced `VisionPrefillCacheBuild 16`,
+    `VisionPrefillCacheAppendRestore 15`, `VisionPrefillCacheHit 4`,
+    `VisionPrefillV_Encode 16`, and `VisionPrefillImagePrefill 16`.
 - Added `docs/archive/streaming_sliding_window_and_vision_prefill.md` as the
   detailed archive writeup for the sliding-window baseline and current
-  full-history KV vision-prefill mode.
+  incremental full-history KV vision-prefill mode.
 
 ## 2026-05-14: Main Branch Closure State
 
@@ -625,7 +635,8 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - `sliding-window` keeps multi-turn chat/KV state while bounding only the
     visual frame window;
   - `vision-prefill` remains a singleton restored full-history video-prefix KV
-    snapshot mode.
+    snapshot mode, but cache construction now appends only the newest frame to
+    the previous restored snapshot.
 - Real 2B Q8 hybrid sliding-window validation after the multi-turn change used
   `--dynamic-kv-cache --kv-init-size 512 --kv-grow-step 512`, prompts at
   `5s/8s/11s/14s`, and returned code `0`. Prompt 1 answered that the earlier

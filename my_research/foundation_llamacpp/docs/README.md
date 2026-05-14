@@ -465,8 +465,10 @@ timestamps. `--stream-mode single-buffer` keeps only the latest sampled frame.
 `--stream-mode sliding-window` turns the recent sampled frames into one
 video clip at prompt arrival while preserving multi-turn chat/KV state.
 `--stream-mode vision-prefill` is the
-hybrid KV-cache observation mode: every sampled frame builds a full-history
-video-prefix KV snapshot, and prompt handling restores that snapshot before
+hybrid KV-cache observation mode: every sampled frame saves a full-history
+video-prefix KV snapshot. Frame 0 is built from scratch; later frames restore
+the previous snapshot and append only the new frame's label/image KV before
+saving the next snapshot. Prompt handling restores the matching snapshot before
 evaluating only the text question suffix.
 
 This is a deterministic file-backed streaming simulator, not a real camera
@@ -641,12 +643,11 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
 
 --stream-mode vision-prefill
   KV-level cached vision-prefill mode for hybrid streaming. As frames arrive,
-  the bridge rebuilds the full-history video prefix from all sampled frames up
-  to the current frame, runs QNN vision encode, mmproj, and image prefill, then
-  saves the resulting llama sequence KV state. Cache construction is
-  frame-ordered: the bridge evaluates the text label for a frame, QNN-encodes
-  that frame/tile only when its image chunk is reached, runs mmproj and
-  ImagePrefill, and only then moves to the next frame. At prompt time it
+  the bridge keeps the full-history video-prefix KV as an incremental snapshot.
+  The first frame is built from scratch. For each later frame, the bridge
+  restores the previous cache, evaluates only the new `Frame N:` label, QNN
+  vision encode, mmproj, and ImagePrefill for that frame/tile, then saves the
+  resulting llama sequence KV state. At prompt time it
   restores the latest matching KV snapshot and pre-fills only the text question
   suffix before decode. This mode is singleton at the text/chat level: each
   prompt uses one restored full-history video-prefix KV snapshot, not a
@@ -743,10 +744,11 @@ Multi-turn
 Vision-prefill scheduling
   Frame arrivals are still logged as `SingleBufferUpdate` ticks at their stream
   timestamps, even while the consumer lane is busy building older cache
-  snapshots. Cache jobs are serialized: one full-history cache build completes
-  its frame-ordered text/image prefill sequence before the next cache job or
-  prompt job runs. This keeps the phase trace from batching several `V_Encode`
-  rows before the matching `ImagePrefill` rows.
+  snapshots. Cache jobs are serialized: one cache build restores the previous
+  snapshot, appends one new frame's text/image KV, saves the next snapshot, and
+  then moves to the next cache job or prompt job. This keeps the phase trace to
+  one `VisionPrefillV_Encode` / `VisionPrefillImagePrefill` pair per sampled
+  frame.
 ```
 
 Example sliding-window run:
@@ -777,7 +779,8 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 
 Swap `--stream-mode vision-prefill` to run the KV snapshot cached
 vision-prefill mode. In this mode the `--window-sec` and `--window-max-frames`
-limits are ignored and each frame rebuilds a full-history prefix cache.
+limits are ignored and each frame incrementally appends to the full-history
+prefix cache.
 
 Example vision-prefill run used for the current KV snapshot validation:
 
@@ -808,11 +811,11 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --results-root my_research/foundation_llamacpp/results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered
 ```
 
-Validated result:
-`results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16`
-with `foundation_exit_code.txt=0`, eleven `VisionPrefillCacheBuild` rows, two
-`VisionPrefillCacheHit` rows, and no consecutive `VisionPrefillV_Encode` before
-the matching `VisionPrefillImagePrefill`.
+Validated incremental result:
+`results/log/stream_modes_2b_hybrid_dynamic512_npredict64/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic`
+with `foundation_exit_code.txt=0`, sixteen `VisionPrefillCacheBuild` rows, four
+`VisionPrefillCacheHit` rows, and only sixteen `VisionPrefillV_Encode` /
+`VisionPrefillImagePrefill` rows for sixteen sampled frames.
 
 ## Vision Tower Export
 

@@ -770,6 +770,19 @@ bool vision_prefill_cache_matches(const VisionPrefillCache& cache, const std::ve
   return cache.valid && cache.frame_indices == frame_indices_for(frames);
 }
 
+bool vision_prefill_cache_is_immediate_prefix(
+    const VisionPrefillCache& cache,
+    const std::vector<FrameRecord>& frames) {
+  if (!cache.valid) {
+    return false;
+  }
+  const std::vector<int> target = frame_indices_for(frames);
+  if (target.size() != cache.frame_indices.size() + 1) {
+    return false;
+  }
+  return std::equal(cache.frame_indices.begin(), cache.frame_indices.end(), target.begin());
+}
+
 std::string format_singleton_user_message(decode_context& ctx, const std::string& content) {
   common_chat_msg msg;
   msg.role = "user";
@@ -800,6 +813,22 @@ bool build_formatted_vision_cache_prefix(
     std::string& out) {
   const std::string content = build_video_prompt_prefix(frames) + SVLM_QUESTION_SENTINEL;
   return split_formatted_at_question_sentinel(format_singleton_user_message(ctx, content), &out, nullptr);
+}
+
+bool build_formatted_incremental_vision_cache_append(
+    const std::vector<FrameRecord>& frames,
+    std::string& out) {
+  if (frames.empty()) {
+    return false;
+  }
+  const FrameRecord& frame = frames.back();
+  out = "Frame " + std::to_string(frames.size()) + ": ";
+  const size_t n_tiles = std::max<size_t>(1, frame.tiles.size());
+  for (size_t tile_i = 0; tile_i < n_tiles; ++tile_i) {
+    out += mtmd_default_marker();
+  }
+  out += "\n";
+  return true;
 }
 
 bool build_formatted_question_suffix(
@@ -1112,7 +1141,8 @@ bool save_vision_prefill_cache_state(
 bool restore_vision_prefill_cache_state(
     decode_context& ctx,
     const VisionPrefillCache& cache,
-    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
+    const char* phase_name = "VisionPrefillCacheRestore") {
   if (!cache.valid || cache.state.empty()) {
     return false;
   }
@@ -1125,7 +1155,7 @@ bool restore_vision_prefill_cache_state(
       0,
       cache.state_flags);
   llama_synchronize(ctx.lctx);
-  phases.row("VisionPrefillCacheRestore", restore_start_ms, now_ms());
+  phases.row(phase_name, restore_start_ms, now_ms());
   if (restored != cache.state.size()) {
     LOG_ERR("failed to restore vision prefill cache state: restored %zu of %zu bytes\n", restored, cache.state.size());
     return false;
@@ -1145,8 +1175,7 @@ bool build_vision_prefill_cache(
   VisionPrefillCache next_cache;
   next_cache.frame_indices = frame_indices_for(frames);
   next_cache.images = layout_images_for_frames(frames);
-  const std::vector<std::string> bins = bins_for_frames(frames);
-  if (bins.empty() || next_cache.images.empty()) {
+  if (frames.empty() || next_cache.images.empty()) {
     LOG_ERR("cannot build vision prefill cache for frame %d: missing bins or layout images\n", frame_idx);
     cache = std::move(next_cache);
     return false;
@@ -1158,17 +1187,46 @@ bool build_vision_prefill_cache(
       origin_ms,
       streamingvlm::hybrid_bridge::hybrid_decode_phase_description());
   const long build_start_ms = now_ms();
-  reset_decode_context_for_singleton(ctx);
 
+  const bool can_append_incrementally = vision_prefill_cache_is_immediate_prefix(cache, frames);
+  bool use_incremental_append = false;
   std::string formatted_prefix;
-  if (!build_formatted_vision_cache_prefix(ctx, frames, formatted_prefix)) {
-    LOG_ERR("failed to split formatted vision prefill cache prefix\n");
+  std::vector<std::string> bins;
+  std::vector<std::string> images_to_load;
+
+  if (can_append_incrementally &&
+      restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore")) {
+    std::vector<FrameRecord> append_frames{frames.back()};
+    bins = bins_for_frames(append_frames);
+    images_to_load = layout_images_for_frames(append_frames);
+    if (!build_formatted_incremental_vision_cache_append(frames, formatted_prefix)) {
+      LOG_ERR("failed to build incremental vision prefill cache append\n");
+      cache = std::move(next_cache);
+      return false;
+    }
+    use_incremental_append = true;
+  } else {
+    reset_decode_context_for_singleton(ctx);
+    bins = bins_for_frames(frames);
+    images_to_load = next_cache.images;
+    if (!build_formatted_vision_cache_prefix(ctx, frames, formatted_prefix)) {
+      LOG_ERR("failed to split formatted vision prefill cache prefix\n");
+      cache = std::move(next_cache);
+      return false;
+    }
+  }
+
+  if (bins.empty() || images_to_load.empty()) {
+    LOG_ERR(
+        "cannot build vision prefill cache for frame %d: missing %s bins or layout images\n",
+        frame_idx,
+        use_incremental_append ? "incremental" : "full-history");
     cache = std::move(next_cache);
     return false;
   }
 
   mtmd::bitmaps bitmaps;
-  if (!load_layout_bitmaps(ctx, next_cache.images, bitmaps)) {
+  if (!load_layout_bitmaps(ctx, images_to_load, bitmaps)) {
     cache = std::move(next_cache);
     return false;
   }

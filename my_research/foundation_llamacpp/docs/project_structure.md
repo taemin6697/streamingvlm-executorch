@@ -278,10 +278,11 @@ The selected frames behave like the current visual window, while the decoder
 chat/KV state is preserved across prompt events for multi-turn text context.
 
 In `--stream-mode vision-prefill`, every frame arrival enqueues a cache-update
-job. Each cache-update rebuilds a full-history video prefix from all sampled
-frames up to that frame, saves the llama sequence state, and replaces the
-previous cache snapshot. Prompt events restore the latest matching full-history
-snapshot and evaluate only the text suffix. `--window-sec` and
+job. The first cache-update builds frame 0 from scratch. Later cache updates
+restore the previous full-history snapshot, append only the newly arrived
+frame's `Frame N:` text/image KV, save the llama sequence state, and replace
+the previous cache snapshot. Prompt events restore the latest matching
+full-history snapshot and evaluate only the text suffix. `--window-sec` and
 `--window-max-frames` are intentionally ignored in this mode.
 
 ### `runner/remote.py`
@@ -501,7 +502,7 @@ Responsibilities:
   capture prompt events against the correct frame/window snapshot
   for single-buffer, QNN-encode only the selected frame per prompt
   for sliding-window, evaluate the selected window while preserving chat/KV state
-  for vision-prefill, build full-history KV snapshots as frames arrive
+  for vision-prefill, incrementally append frame KV into full-history snapshots
   run decoder-side mmproj, prefill, and decode
   preserve chat history and KV state in single-buffer and sliding-window modes
   write stream events, phase rows, output, and per-turn token traces
@@ -785,11 +786,11 @@ run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-m
   -> producer thread replays sampled frame timestamps
   -> every frame arrival enqueues a CacheUpdate job
   -> CacheUpdate selects all sampled frames up to that frame
-  -> reset decoder context
-  -> tokenize the chat-formatted video prefix before SVLM_QUESTION_SENTINEL
+  -> if frame 0, reset decoder context and tokenize the chat-formatted prefix
+  -> otherwise restore the previous cache snapshot and tokenize only Frame N
   -> walk mtmd chunks in order
   -> for text chunks, run VisionPrefillT_Prefill
-  -> for image chunks, QNN-encode exactly the matching bin on demand
+  -> for image chunks, QNN-encode only the newly appended frame bin on demand
   -> run VisionPrefillMmproj and VisionPrefillImagePrefill immediately
   -> save seq 0 with llama_state_seq_get_data_ext()
   -> prompt job restores the matching snapshot with llama_state_seq_set_data_ext()
@@ -799,10 +800,11 @@ run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-m
 
 This mode is a KV-level cached image-prefill observation path, not a chunk
 composition algorithm. The current cache is one full-history snapshot per
-sampled frame. It ignores `--window-sec` and `--window-max-frames`, because P0
-must be able to use all cached frames before the question boundary. Future
+sampled frame, built incrementally from the previous snapshot plus one new
+frame. It ignores `--window-sec` and `--window-max-frames`, because P0 must be
+able to use all cached frames before the question boundary. Future
 `--chunked-vision-prefill` should add independently reusable chunks controlled
-by `--chunk-count` instead of changing this full-history mode.
+by `--chunk-count` instead of changing this single-snapshot full-history mode.
 
 The cache build is intentionally frame-ordered. Earlier prototypes encoded all
 selected bins first, which produced traces with several consecutive
@@ -987,7 +989,8 @@ When changing streaming:
    sampled frames; streaming is timestamped replay with prompt events.
 2. Preserve the explicit state model. Single-buffer is latest-frame state,
    sliding-window is bounded visual-window state with retained text/chat KV, and
-   vision-prefill is restored full-history video-prefix KV state.
+   vision-prefill is incrementally saved/restored full-history video-prefix KV
+   state.
 3. Keep prompt arrival timestamp, selected buffered frame, and actual execution
    start distinguishable in stream_events.csv.
 4. Decoder context retention/eviction must remain explicit. Single-buffer
