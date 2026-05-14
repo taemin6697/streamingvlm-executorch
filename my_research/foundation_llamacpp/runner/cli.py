@@ -962,7 +962,7 @@ def _streaming_timeline_phase_name(name: str) -> str | None:
         "VisionPrefillT_Prefill": "T_Prefill",
     }
     name = aliases.get(name, name)
-    if name in {"SingleBufferUpdate", "V_Encode", "Mmproj", "ImagePrefill", "T_Prefill", "D"}:
+    if name in {"SingleBufferUpdate", "V_Encode", "Mmproj", "ImagePrefill", "T_Prefill", "DynamicKVGrow", "D"}:
         return name
     return None
 
@@ -1048,6 +1048,7 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
         "Mmproj",
         "ImagePrefill",
         "T_Prefill",
+        "DynamicKVGrow",
         "D",
     ]
     y_for = {name: idx for idx, name in enumerate(visible)}

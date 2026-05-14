@@ -6,6 +6,7 @@ KV_CPP = ROOT / "llama.cpp/src/llama-kv-cache.cpp"
 KV_CELLS_H = ROOT / "llama.cpp/src/llama-kv-cells.h"
 OPENCL_H = ROOT / "llama.cpp/ggml/include/ggml-opencl.h"
 OPENCL_CPP = ROOT / "llama.cpp/ggml/src/ggml-opencl/ggml-opencl.cpp"
+RUNNER_CLI = ROOT / "my_research/foundation_llamacpp/runner/cli.py"
 
 
 def test_dynamic_kv_grow_has_device_to_device_copy_path():
@@ -35,3 +36,19 @@ def test_dynamic_kv_grow_preserves_cell_metadata_without_state_snapshot():
     assert "v_cells[s].grow_to(kv_size)" in reset_body
     assert "state_write(snapshot)" not in reset_body
     assert "state_read(reader)" not in reset_body
+
+
+def test_streaming_timeline_shows_dynamic_kv_grow_lane():
+    runner_cli = RUNNER_CLI.read_text()
+
+    phase_name_body = runner_cli[
+        runner_cli.index("def _streaming_timeline_phase_name"):
+        runner_cli.index("def _streaming_timeline_origin")
+    ]
+    timeline_body = runner_cli[
+        runner_cli.index("def _write_png_streaming_phase_timeline"):
+        runner_cli.index("def _finalize_hybrid_outputs")
+    ]
+
+    assert "\"DynamicKVGrow\"" in phase_name_body
+    assert "\"DynamicKVGrow\"," in timeline_body
