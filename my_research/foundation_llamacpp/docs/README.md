@@ -57,8 +57,10 @@ Common arguments used by most runs:
   Project-local prototype for the standard llama.cpp KV cache path. Logical
   context uses the model max context (`--ctx-size 0` internally), while physical
   KV starts at `kv-init-size` cells and grows by `kv-grow-step` cells on demand.
-  First validation is scoped to the OpenCL/hybrid streaming path and non-SWA
-  single-sequence models.
+  On OpenCL KV buffers, grow migration uses `clEnqueueCopyBuffer` to copy K/V
+  data directly device-to-device; it falls back to host tensor get/set only if
+  the tensors are not OpenCL-backed. First validation is scoped to the
+  OpenCL/hybrid streaming path and non-SWA single-sequence models.
 
 --batch-size N / --ubatch-size N
   llama.cpp batch and micro-batch sizes.
@@ -457,7 +459,8 @@ The host samples the video first and pushes frame files plus `media_manifest.jso
 to Android. The device runner then replays those frames according to their
 timestamps. `--stream-mode single-buffer` keeps only the latest sampled frame.
 `--stream-mode sliding-window` turns the recent sampled frames into one
-singleton video clip at prompt arrival. `--stream-mode vision-prefill` is the
+video clip at prompt arrival while preserving multi-turn chat/KV state.
+`--stream-mode vision-prefill` is the
 hybrid KV-cache observation mode: every sampled frame builds a full-history
 video-prefix KV snapshot, and prompt handling restores that snapshot before
 evaluating only the text question suffix.
@@ -605,7 +608,10 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 The second run should report a `DynamicKVGrow` row like
 `1024->16384/32768 cells; 28.00->448.00 MiB` in `foundation_proc.csv`, and the
 same marker should appear in `streaming_phase_timeline.png` and
-`memory_timeline_decode_window.png`.
+`memory_timeline_decode_window.png`. Current OpenCL builds should also log
+`reset_capacity: dynamic KV data migration used device-to-device copy`; the
+validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
+`202 ms` inside `llama_kv_cache::grow_to()`.
 
 ### Streaming Extra Arguments
 
@@ -624,9 +630,10 @@ same marker should appear in `streaming_phase_timeline.png` and
 --stream-mode sliding-window
   Sliding video-window baseline. Each prompt selects recent sampled frames,
   formats them as `Frame 1: <__media__>` / `Frame 2: <__media__>` / ... plus
-  the question, clears decoder chat/KV state, then runs full vision encode,
-  mmproj, image prefill, text prefill, and decode. It does not reuse a KV
-  snapshot across prompts.
+  the question, then runs full vision encode, mmproj, image prefill, text
+  prefill, and decode. It preserves llama.cpp chat/KV state across prompt
+  events, so previous user/assistant turns remain visible. It does not reuse a
+  cached image-prefix KV snapshot across prompts.
 
 --stream-mode vision-prefill
   KV-level cached vision-prefill mode for hybrid streaming. As frames arrive,
@@ -678,8 +685,11 @@ same marker should appear in `streaming_phase_timeline.png` and
 --dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 1024
   Optional project prototype. The decoder advertises model-max logical context
   while initially allocating only 1024 KV cells, then grows by 1024 cells when
-  the used KV no longer fits. Growth reallocates/restores KV buffers and can
-  introduce a latency spike; it reduces reserved KV memory, not attention work.
+  the used KV no longer fits. Growth reallocates KV buffers and copies existing
+  K/V data into the larger allocation. On OpenCL-backed tensors this copy is a
+  device-to-device `clEnqueueCopyBuffer`; host tensor get/set is only the
+  fallback path. Growth can still introduce a latency spike; it reduces
+  reserved KV memory, not attention work.
   New builds write grow timestamps with the same `ggml_time_ms()` clock used by
   streaming phase timers, so retry-side prefill rows can be separated from grow
   time in `foundation_proc.csv` and `streaming_phase_timeline.png`.
@@ -717,10 +727,11 @@ Prompt wait
   The selected image/window remains frozen at prompt arrival.
 
 Multi-turn
-  Streaming single-buffer keeps llama.cpp chat/KV state across prompt events.
-  `sliding-window` intentionally clears llama.cpp chat/KV state before each
-  prompt. `vision-prefill` restores a cached video-prefix KV snapshot before the
-  prompt text suffix, so it is still a singleton video query at the chat level.
+  Streaming single-buffer and sliding-window keep llama.cpp chat/KV state across
+  prompt events. In sliding-window, only the visual input is bounded to the
+  selected recent frame window; the text conversation remains multi-turn.
+  `vision-prefill` restores a cached video-prefix KV snapshot before the prompt
+  text suffix, so it is still a singleton video query at the chat level.
   `foundation_inference_tokens.txt` appends all turns, and
   `stream_inference_tokens_<idx>.txt` stores each turn's raw trace.
 

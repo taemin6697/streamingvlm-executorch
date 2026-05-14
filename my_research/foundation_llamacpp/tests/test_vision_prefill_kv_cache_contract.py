@@ -56,7 +56,7 @@ def test_vision_prefill_keeps_full_history_and_caches_every_frame():
     source = STREAMING_CPP.read_text()
 
     assert 'args.stream_mode == "vision_prefill"' in source
-    assert 'args.stream_mode == "sliding_window"' in source
+    assert 'mode == "sliding_window"' in source
     assert "return selected;" in source
     assert "StreamJobKind::CacheUpdate" in source
     assert "drop_pending_cache_updates" not in source
@@ -70,6 +70,15 @@ def test_vision_prefill_cache_build_encodes_frames_on_demand():
     assert "eval_streaming_chunks_with_on_demand_vision(" in build_fn
     assert "encoder.encode(bins)" not in build_fn
     assert "bins[image_chunk_idx]" in source
+
+
+def test_sliding_window_keeps_multiturn_text_history():
+    source = STREAMING_CPP.read_text()
+    singleton_fn = source.split("bool is_singleton_video_mode(", 1)[1].split("\n}\n\nvoid reset_decode_context_for_singleton", 1)[0]
+
+    assert 'args.stream_mode == "vision_prefill"' in singleton_fn
+    assert 'args.stream_mode == "sliding_window"' not in singleton_fn
+    assert 'if (args.stream_mode == "sliding_window") {\n    reset_decode_context_for_singleton(ctx);\n  }' not in source
 
 
 def test_streaming_timeline_starts_at_stream_origin():

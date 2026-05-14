@@ -5,6 +5,10 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#ifdef GGML_USE_OPENCL
+#include "ggml-opencl.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -74,60 +78,6 @@ static ggml_tensor * ggml_mul_mat_aux(
 
     return res;
 }
-
-class llama_kv_io_write_host : public llama_io_write_i {
-public:
-    void write(const void * src, size_t size) override {
-        const auto * bytes = static_cast<const uint8_t *>(src);
-        data.insert(data.end(), bytes, bytes + size);
-    }
-
-    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        const size_t old_size = data.size();
-        data.resize(old_size + size);
-        ggml_backend_tensor_get(tensor, data.data() + old_size, offset, size);
-    }
-
-    size_t n_bytes() override {
-        return data.size();
-    }
-
-    std::vector<uint8_t> data;
-};
-
-class llama_kv_io_read_host : public llama_io_read_i {
-public:
-    llama_kv_io_read_host(const uint8_t * data, size_t size) : ptr(data), remaining(size) {}
-
-    void read(void * dst, size_t size) override {
-        if (size > remaining) {
-            throw std::runtime_error("unexpectedly reached end of dynamic KV snapshot");
-        }
-        memcpy(dst, ptr, size);
-        ptr += size;
-        remaining -= size;
-        read_size += size;
-    }
-
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        if (size > remaining) {
-            throw std::runtime_error("unexpectedly reached end of dynamic KV snapshot tensor data");
-        }
-        ggml_backend_tensor_set(tensor, ptr, offset, size);
-        ptr += size;
-        remaining -= size;
-        read_size += size;
-    }
-
-    size_t n_bytes() override {
-        return read_size;
-    }
-
-private:
-    const uint8_t * ptr = nullptr;
-    size_t remaining = 0;
-    size_t read_size = 0;
-};
 
 //
 // llama_kv_cache
@@ -217,12 +167,111 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+static bool llama_kv_copy_tensor_bytes(
+        const ggml_tensor * src,
+              ggml_tensor * dst,
+        size_t              src_offset,
+        size_t              dst_offset,
+        size_t              size,
+        bool              & used_device_copy) {
+    if (size == 0) {
+        return true;
+    }
+
+#ifdef GGML_USE_OPENCL
+    if (ggml_backend_opencl_tensor_copy_bytes(src, dst, src_offset, dst_offset, size)) {
+        used_device_copy = true;
+        return true;
+    }
+#endif
+
+    std::vector<uint8_t> data(size);
+    ggml_backend_tensor_get(src, data.data(), src_offset, size);
+    ggml_backend_tensor_set(dst, data.data(), dst_offset, size);
+    return true;
+}
+
+bool llama_kv_cache::copy_existing_data_from(
+        const std::vector<kv_layer> & old_layers,
+        uint32_t                      old_size,
+        uint32_t                      new_size,
+        bool                        & used_device_copy) {
+    GGML_ASSERT(n_stream == 1);
+    GGML_ASSERT(new_size >= old_size);
+
+    if (old_layers.size() != layers.size()) {
+        LLAMA_LOG_ERROR("%s: layer count mismatch (%zu != %zu)\n", __func__, old_layers.size(), layers.size());
+        return false;
+    }
+
+    bool saw_device_copy = false;
+    bool all_device_copy = true;
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & old_layer = old_layers[i];
+              auto & new_layer = layers[i];
+
+        if (old_layer.il != new_layer.il) {
+            LLAMA_LOG_ERROR("%s: layer id mismatch (%u != %u)\n", __func__, old_layer.il, new_layer.il);
+            return false;
+        }
+
+        if (old_layer.k && new_layer.k) {
+            bool segment_device_copy = false;
+            const size_t row_size = ggml_row_size(old_layer.k_stream[0]->type, old_layer.k_stream[0]->ne[0]);
+            if (!llama_kv_copy_tensor_bytes(old_layer.k_stream[0], new_layer.k_stream[0], 0, 0, old_size * row_size, segment_device_copy)) {
+                return false;
+            }
+            saw_device_copy = saw_device_copy || segment_device_copy;
+            all_device_copy = all_device_copy && segment_device_copy;
+        }
+
+        if (!old_layer.v || !new_layer.v) {
+            continue;
+        }
+
+        if (!v_trans) {
+            bool segment_device_copy = false;
+            const size_t row_size = ggml_row_size(old_layer.v_stream[0]->type, old_layer.v_stream[0]->ne[0]);
+            if (!llama_kv_copy_tensor_bytes(old_layer.v_stream[0], new_layer.v_stream[0], 0, 0, old_size * row_size, segment_device_copy)) {
+                return false;
+            }
+            saw_device_copy = saw_device_copy || segment_device_copy;
+            all_device_copy = all_device_copy && segment_device_copy;
+        } else {
+            const size_t v_size_el = ggml_type_size(old_layer.v_stream[0]->type);
+            const uint32_t n_embd_v_gqa = static_cast<uint32_t>(old_layer.v_stream[0]->ne[0]);
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                bool segment_device_copy = false;
+                const size_t src_offset = (size_t) j * old_size * v_size_el;
+                const size_t dst_offset = (size_t) j * new_size * v_size_el;
+                if (!llama_kv_copy_tensor_bytes(old_layer.v_stream[0], new_layer.v_stream[0], src_offset, dst_offset, old_size * v_size_el, segment_device_copy)) {
+                    return false;
+                }
+                saw_device_copy = saw_device_copy || segment_device_copy;
+                all_device_copy = all_device_copy && segment_device_copy;
+            }
+        }
+    }
+
+    used_device_copy = saw_device_copy && all_device_copy;
+    return true;
+}
+
 bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    llama_kv_io_write_host snapshot;
+    const uint32_t old_size = copy_existing ? get_size() : 0;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> old_ctxs_bufs;
+    std::vector<kv_layer> old_layers;
+    std::vector<llama_kv_cells> old_v_cells;
+    std::vector<uint32_t> old_v_heads;
+
     if (copy_existing) {
-        state_write(snapshot);
+        old_ctxs_bufs = std::move(ctxs_bufs);
+        old_layers    = std::move(layers);
+        old_v_cells   = std::move(v_cells);
+        old_v_heads   = v_heads;
     }
 
     ctxs_bufs.clear();
@@ -404,8 +453,25 @@ bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
     }
 
     if (copy_existing) {
-        llama_kv_io_read_host reader(snapshot.data.data(), snapshot.data.size());
-        state_read(reader);
+        if (old_v_cells.size() != v_cells.size()) {
+            throw std::runtime_error("failed to preserve dynamic KV cell metadata");
+        }
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s] = std::move(old_v_cells[s]);
+            v_cells[s].grow_to(kv_size);
+        }
+        v_heads = std::move(old_v_heads);
+
+        bool used_device_copy = false;
+        if (!copy_existing_data_from(old_layers, old_size, kv_size, used_device_copy)) {
+            return false;
+        }
+
+        LLAMA_LOG_INFO("%s: dynamic KV data migration used %s copy\n",
+                __func__, used_device_copy ? "device-to-device" : "host fallback");
+
+        old_ctxs_bufs.clear();
     }
 
     return true;

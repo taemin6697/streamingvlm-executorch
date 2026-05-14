@@ -30,7 +30,7 @@ single-buffer:
 
 sliding-window:
   selected recent frames become one video clip
-  decoder chat/KV state is reset per prompt
+  multi-turn chat/KV state is preserved across prompts
   prompt latency includes full prompt-time vision encode and image prefill
 
 vision-prefill:
@@ -124,7 +124,9 @@ frame/window is still captured at the prompt's stream timestamp.
 
 ## Sliding-Window Details
 
-`sliding-window` is a singleton video-window run per prompt.
+`sliding-window` is a multi-turn video-window run. Each prompt receives a bounded
+recent visual window, while the text conversation and decoder KV continue across
+prompt events.
 
 Frame selection:
 
@@ -146,16 +148,7 @@ Frame 2: <__media__>
 <user question>
 ```
 
-Before prompt evaluation, the bridge clears:
-
-```text
-llama memory
-sampler state
-chat history
-n_past
-```
-
-Then it performs the normal full prefill path:
+For every prompt, it performs the normal full visual prefill path:
 
 ```text
 QNN V_Encode for selected frame bins
@@ -165,8 +158,8 @@ T_Prefill
 D / Decode
 ```
 
-The purpose is to measure a bounded recent video clip without preserving
-multi-turn state and without reusing image-prefix KV.
+The purpose is to measure a bounded recent video clip while preserving
+multi-turn text state, but without reusing image-prefix KV.
 
 ## Vision-Prefill Details
 

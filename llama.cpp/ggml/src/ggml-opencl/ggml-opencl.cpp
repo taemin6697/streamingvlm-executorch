@@ -6308,6 +6308,61 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     GGML_UNUSED(buffer);
 }
 
+bool ggml_backend_opencl_tensor_copy_bytes(const ggml_tensor * src, ggml_tensor * dst, size_t src_offset, size_t dst_offset, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (!src || !dst || !src->buffer || !dst->buffer || !src->extra || !dst->extra) {
+        return false;
+    }
+
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!src_buf || !dst_buf) {
+        return false;
+    }
+    if (src_buf->iface.get_base != ggml_backend_opencl_buffer_get_base ||
+            dst_buf->iface.get_base != ggml_backend_opencl_buffer_get_base) {
+        return false;
+    }
+    if (src_buf->buft->device != dst_buf->buft->device) {
+        return false;
+    }
+
+    ggml_tensor_extra_cl * extra_src = (ggml_tensor_extra_cl *) src->extra;
+    ggml_tensor_extra_cl * extra_dst = (ggml_tensor_extra_cl *) dst->extra;
+    if (!extra_src->data_device || !extra_dst->data_device) {
+        return false;
+    }
+
+    ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(dst_buf->buft->device);
+    const size_t src_abs_offset = extra_src->offset + src->view_offs + src_offset;
+    const size_t dst_abs_offset = extra_dst->offset + dst->view_offs + dst_offset;
+
+    cl_int err = clEnqueueCopyBuffer(
+            backend_ctx->queue,
+            extra_src->data_device,
+            extra_dst->data_device,
+            src_abs_offset,
+            dst_abs_offset,
+            size,
+            0,
+            NULL,
+            NULL);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("%s: clEnqueueCopyBuffer failed with %d\n", __func__, err);
+        return false;
+    }
+
+    err = clFinish(backend_ctx->queue);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("%s: clFinish failed with %d\n", __func__, err);
+        return false;
+    }
+
+    return true;
+}
+
 static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_dev_t dev = buffer->buft->device;
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(dev);

@@ -571,6 +571,12 @@ Dynamic KV prototype validation:
   - one grow: `1024 -> 2048` cells, OpenCL KV `56 MiB`
   - grow log: `dynamic KV grow completed in 78.029 ms`
   - `ImagePrefill`: `1077, 1427, 1769, 2386 ms`
+- OpenCL device-copy validation:
+  - result: `dynamic_kv_device_copy_2b_hybrid_retry/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic`
+  - flags: `--kv-init-size 1024 --kv-grow-step 15360`
+  - one grow: `1024 -> 16384` cells, OpenCL KV `448 MiB`
+  - migration log: `dynamic KV data migration used device-to-device copy`
+  - internal grow time: `202.135 ms`, finalizer `DynamicKVGrow` row: `299 ms`
 - Dynamic KV reduces reserved KV memory. It does not reduce attention compute;
   decode/prefill latency still grows with the actual accumulated `n_kv`.
 

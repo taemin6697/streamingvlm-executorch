@@ -408,7 +408,7 @@ std::string normalize_stream_mode(std::string mode, bool single_buffer) {
 }
 
 bool is_singleton_video_mode(const Args& args) {
-  return args.stream_mode == "sliding_window" || args.stream_mode == "vision_prefill";
+  return args.stream_mode == "vision_prefill";
 }
 
 void reset_decode_context_for_singleton(decode_context& ctx) {
@@ -1224,9 +1224,6 @@ int run_single_buffer_prompt(
     int prompt_idx,
     long origin_ms,
     const VisionPrefillCache* vision_cache) {
-  if (args.stream_mode == "sliding_window") {
-    reset_decode_context_for_singleton(ctx);
-  }
   const std::vector<std::string> bins = bins_for_frames(frames);
   const std::vector<std::string> images = layout_images_for_frames(frames);
   if (bins.empty()) {

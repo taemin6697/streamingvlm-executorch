@@ -450,9 +450,10 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   configurations are rejected for this prototype.
 - Added standard KV grow support in `llama_kv_cache`: on prepare failure,
   `llama_context::decode()` grows physical capacity by the configured step,
-  snapshots existing KV through the existing state read/write path, recreates
-  K/V tensors and backend buffers, restores the snapshot, marks the scheduler
-  for reserve, and retries the batch.
+  recreates K/V tensors and backend buffers, copies existing K/V data into the
+  larger allocation, marks the scheduler for reserve, and retries the batch.
+  Current OpenCL-backed tensors use a device-to-device `clEnqueueCopyBuffer`
+  fast path; host tensor get/set remains only as fallback.
 - Android build validation succeeded for `hybrid_streaming_decode`,
   `opencl_streaming_decode`, `opencl_phase_mtmd`, and `hybrid_decode` in
   `build-hybrid-android-opencl`.
@@ -511,15 +512,37 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   init-16384 run closely, so the grow path does not appear to poison graph or
   scheduler caching across later prompts.
 
+## 2026-05-14: Dynamic KV Device-To-Device Copy Migration
+
+- Replaced the grow-time CPU snapshot migration with an OpenCL fast path:
+  `ggml_backend_opencl_tensor_copy_bytes()` validates that old/new tensors are
+  OpenCL-backed on the same device, then copies bytes with
+  `clEnqueueCopyBuffer`.
+- `llama_kv_cache::reset_capacity()` now preserves old buffer lifetime while
+  the new K/V tensors are allocated, grows `v_cells` metadata in place via
+  `llama_kv_cells::grow_to()`, and migrates K/V tensor bytes through
+  `copy_existing_data_from()`.
+- Validation: 2B Q8 hybrid single-buffer streaming with
+  `--dynamic-kv-cache --kv-init-size 1024 --kv-grow-step 15360` completed with
+  `foundation_exit_code.txt=0` under
+  `results/log/dynamic_kv_device_copy_2b_hybrid_retry/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic`.
+- Key log lines:
+  - initial OpenCL KV: `28.00 MiB` (`1024/32768` cells)
+  - grow: `1024 -> 16384`, OpenCL KV `448.00 MiB`
+  - migration: `reset_capacity: dynamic KV data migration used device-to-device copy`
+  - internal grow time: `202.135 ms`; finalizer `DynamicKVGrow` row:
+    `299 ms`, `1024->16384/32768 cells; 28.00->448.00 MiB`
+
 ## 2026-05-13: Sliding-Window And Vision-Prefill Streaming Modes
 
 - Added explicit streaming modes on top of `--streaming-video`:
   - `--stream-mode single-buffer`: the existing latest-frame baseline. It keeps
     chat/KV state across prompt events.
-  - `--stream-mode sliding-window`: a sliding-window singleton video baseline.
+  - `--stream-mode sliding-window`: a sliding-window multi-turn video baseline.
     Prompt arrival selects sampled frames up to the prompt timestamp, optionally
-    filters by `--window-sec`, evenly limits with `--window-max-frames`, resets
-    decoder chat/KV state, then evaluates the selected frames as a video clip.
+    filters by `--window-sec`, evenly limits with `--window-max-frames`, then
+    evaluates the selected frames as a video clip while preserving decoder
+    chat/KV state across prompt events.
   - `--stream-mode vision-prefill`: hybrid-only KV-level image-prefill cache.
     Every frame arrival enqueues a cache update. Each update builds a
     full-history video-prefix KV snapshot from all sampled frames up to that
