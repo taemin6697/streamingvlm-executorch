@@ -75,7 +75,7 @@ def build_streaming_video_prompt(frames: list[dict[str, object]], raw_prompt: st
     prefix_parts: list[str] = []
     for frame_i, frame in enumerate(frames):
         n_patches = int(frame.get("num_patches", 1) or 1)
-        prefix_parts.append(f"Frame {frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
+        prefix_parts.append(f"Frame{frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
     return "".join(prefix_parts) + raw_prompt
 
 
@@ -234,7 +234,7 @@ def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segment
 
     prefix_parts: list[str] = []
     for frame_i, n_patches in enumerate(num_patches_list):
-        prefix_parts.append(f"Frame {frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
+        prefix_parts.append(f"Frame{frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
     media_prompt = "".join(prefix_parts) + prompt
 
     metadata = {

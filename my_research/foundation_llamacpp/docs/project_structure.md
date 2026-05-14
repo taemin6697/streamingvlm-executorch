@@ -202,8 +202,8 @@ input video
   -> apply InternVL dynamic preprocessing per frame
   -> write one `.bin` and one layout `.png` per tile
   -> construct prompt:
-       Frame 1: <__media__>
-       Frame 2: <__media__>
+       Frame1: <__media__>
+       Frame2: <__media__>
        ...
        user prompt
   -> write media_manifest.json
@@ -279,11 +279,13 @@ chat/KV state is preserved across prompt events for multi-turn text context.
 
 In `--stream-mode vision-prefill`, every frame arrival enqueues a cache-update
 job. The first cache-update builds frame 0 from scratch. Later cache updates
-restore the previous full-history snapshot, append only the newly arrived
-frame's `Frame N:` text/image KV, save the llama sequence state, and replace
-the previous cache snapshot. Prompt events restore the latest matching
-full-history snapshot and evaluate only the text suffix. `--window-sec` and
-`--window-max-frames` are intentionally ignored in this mode.
+restore the previous snapshot, append only the newly arrived frame's global
+`FrameN:` text/image KV to the currently open streaming user turn, save the
+llama sequence state, and replace the previous cache snapshot. Prompt events
+restore the latest matching snapshot, evaluate only the text suffix that closes
+that user turn, decode the answer, and save the post-answer chat/KV state.
+Later frame arrivals then begin the next streaming user turn. `--window-sec`
+and `--window-max-frames` are intentionally ignored in this mode.
 
 ### `runner/remote.py`
 
@@ -706,10 +708,10 @@ The key contract is that the order of `frame_bins`, `layout_images`, prompt medi
 markers, and `.svlmemb` slices must match. For single-tile frames:
 
 ```text
-Frame 1 marker -> embedding slice 0
-Frame 2 marker -> embedding slice 1
+Frame1 marker -> embedding slice 0
+Frame2 marker -> embedding slice 1
 ...
-Frame N marker -> embedding slice N - 1
+FrameN marker -> embedding slice N - 1
 ```
 
 ### Streaming Single-Buffer OpenCL
@@ -765,7 +767,7 @@ run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-m
   -> prompt job selects frames with timestamp <= prompt time
   -> optional --window-sec filters to recent frames
   -> --window-max-frames evenly reduces the selected frame list when needed
-  -> build prompt as Frame 1/Frame 2/... plus the user question
+  -> build prompt as Frame1/Frame2/... plus the user question
   -> QNN-encode all selected frame/tile bins
   -> eval_with_external_embedding() runs mmproj, image prefill, text prefill
   -> generate_response() decodes while preserving prior text turns
@@ -787,24 +789,28 @@ run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-m
   -> every frame arrival enqueues a CacheUpdate job
   -> CacheUpdate selects all sampled frames up to that frame
   -> if frame 0, reset decoder context and tokenize the chat-formatted prefix
-  -> otherwise restore the previous cache snapshot and tokenize only Frame N
+  -> otherwise restore the previous cache snapshot and tokenize only global FrameN
   -> walk mtmd chunks in order
   -> for text chunks, run VisionPrefillT_Prefill
   -> for image chunks, QNN-encode only the newly appended frame bin on demand
   -> run VisionPrefillMmproj and VisionPrefillImagePrefill immediately
   -> save seq 0 with llama_state_seq_get_data_ext()
   -> prompt job restores the matching snapshot with llama_state_seq_set_data_ext()
-  -> tokenize/evaluate only the formatted question suffix
+  -> tokenize/evaluate only the formatted question suffix that closes the open user turn
   -> decode the answer
+  -> save the post-answer state so later frames become the next user turn
 ```
 
 This mode is a KV-level cached image-prefill observation path, not a chunk
-composition algorithm. The current cache is one full-history snapshot per
-sampled frame, built incrementally from the previous snapshot plus one new
-frame. It ignores `--window-sec` and `--window-max-frames`, because P0 must be
-able to use all cached frames before the question boundary. Future
+composition algorithm. The current cache is one active snapshot per sampled
+frame, built incrementally from the previous snapshot plus one new frame. The
+cache also stores closed chat history plus the open streaming user content, so
+prompt events behave as true multi-turn chat while still avoiding repeated
+vision prefill for already cached frames. It ignores `--window-sec` and
+`--window-max-frames`, because P0 must be able to use all cached frames before
+the question boundary. Future
 `--chunked-vision-prefill` should add independently reusable chunks controlled
-by `--chunk-count` instead of changing this single-snapshot full-history mode.
+by `--chunk-count` instead of changing this active-snapshot streaming-turn mode.
 
 The cache build is intentionally frame-ordered. Earlier prototypes encoded all
 selected bins first, which produced traces with several consecutive
@@ -989,14 +995,14 @@ When changing streaming:
    sampled frames; streaming is timestamped replay with prompt events.
 2. Preserve the explicit state model. Single-buffer is latest-frame state,
    sliding-window is bounded visual-window state with retained text/chat KV, and
-   vision-prefill is incrementally saved/restored full-history video-prefix KV
-   state.
+   vision-prefill is incrementally saved/restored streaming-turn KV with
+   retained closed chat history.
 3. Keep prompt arrival timestamp, selected buffered frame, and actual execution
    start distinguishable in stream_events.csv.
-4. Decoder context retention/eviction must remain explicit. Single-buffer
-   and sliding-window preserve chat history and KV across prompt events;
-   vision-prefill restores a cached prefix state and evaluates only the text
-   suffix.
+4. Decoder context retention/eviction must remain explicit. Single-buffer,
+   sliding-window, and vision-prefill preserve chat history and KV across prompt
+   events; vision-prefill restores a cached open user-turn prefix, evaluates
+   only the text suffix, then saves the post-answer state for later frames.
 5. Keep OpenCL and Hybrid streaming artifacts aligned so their timelines can be
    compared.
 6. If adding persistent prefill or vision-encoder-only streaming, add new mode

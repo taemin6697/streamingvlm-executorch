@@ -408,7 +408,8 @@ std::string normalize_stream_mode(std::string mode, bool single_buffer) {
 }
 
 bool is_singleton_video_mode(const Args& args) {
-  return args.stream_mode == "vision_prefill";
+  (void)args;
+  return false;
 }
 
 void reset_decode_context_for_singleton(decode_context& ctx) {
@@ -639,12 +640,30 @@ constexpr const char* SVLM_QUESTION_SENTINEL = "<SVLM_QUESTION_SENTINEL>";
 std::string build_video_prompt_prefix(const std::vector<FrameRecord>& frames) {
   std::string out;
   for (size_t frame_i = 0; frame_i < frames.size(); ++frame_i) {
-    out += "Frame " + std::to_string(frame_i + 1) + ": ";
+    out += "Frame" + std::to_string(frame_i + 1) + ": ";
     const size_t n_tiles = std::max<size_t>(1, frames[frame_i].tiles.size());
     for (size_t tile_i = 0; tile_i < n_tiles; ++tile_i) {
       out += mtmd_default_marker();
     }
     out += "\n";
+  }
+  return out;
+}
+
+std::string build_stream_frame_prompt_line(const FrameRecord& frame) {
+  std::string out = "Frame" + std::to_string(frame.index + 1) + ": ";
+  const size_t n_tiles = std::max<size_t>(1, frame.tiles.size());
+  for (size_t tile_i = 0; tile_i < n_tiles; ++tile_i) {
+    out += mtmd_default_marker();
+  }
+  out += "\n";
+  return out;
+}
+
+std::string build_stream_video_prompt_prefix(const std::vector<FrameRecord>& frames) {
+  std::string out;
+  for (const FrameRecord& frame : frames) {
+    out += build_stream_frame_prompt_line(frame);
   }
   return out;
 }
@@ -761,6 +780,9 @@ struct VisionPrefillCache {
   bool valid = false;
   std::vector<int> frame_indices;
   std::vector<std::string> images;
+  std::vector<common_chat_msg> chat_history;
+  std::string open_user_content;
+  bool open_user_prefix = false;
   std::vector<uint8_t> state;
   llama_state_seq_flags state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
   llama_pos n_past = 0;
@@ -783,11 +805,18 @@ bool vision_prefill_cache_is_immediate_prefix(
   return std::equal(cache.frame_indices.begin(), cache.frame_indices.end(), target.begin());
 }
 
-std::string format_singleton_user_message(decode_context& ctx, const std::string& content) {
+std::string format_user_message_for_current_history(decode_context& ctx, const std::string& content) {
   common_chat_msg msg;
   msg.role = "user";
   msg.content = content;
-  return common_chat_format_single(ctx.tmpls.get(), {}, msg, true, ctx.use_jinja);
+  return common_chat_format_single(ctx.tmpls.get(), ctx.chat_history, msg, true, ctx.use_jinja);
+}
+
+void append_user_message_to_history(decode_context& ctx, const std::string& content) {
+  common_chat_msg msg;
+  msg.role = "user";
+  msg.content = content;
+  ctx.chat_history.push_back(std::move(msg));
 }
 
 bool split_formatted_at_question_sentinel(
@@ -809,10 +838,10 @@ bool split_formatted_at_question_sentinel(
 
 bool build_formatted_vision_cache_prefix(
     decode_context& ctx,
-    const std::vector<FrameRecord>& frames,
+    const std::string& open_user_content,
     std::string& out) {
-  const std::string content = build_video_prompt_prefix(frames) + SVLM_QUESTION_SENTINEL;
-  return split_formatted_at_question_sentinel(format_singleton_user_message(ctx, content), &out, nullptr);
+  const std::string content = open_user_content + SVLM_QUESTION_SENTINEL;
+  return split_formatted_at_question_sentinel(format_user_message_for_current_history(ctx, content), &out, nullptr);
 }
 
 bool build_formatted_incremental_vision_cache_append(
@@ -821,23 +850,17 @@ bool build_formatted_incremental_vision_cache_append(
   if (frames.empty()) {
     return false;
   }
-  const FrameRecord& frame = frames.back();
-  out = "Frame " + std::to_string(frames.size()) + ": ";
-  const size_t n_tiles = std::max<size_t>(1, frame.tiles.size());
-  for (size_t tile_i = 0; tile_i < n_tiles; ++tile_i) {
-    out += mtmd_default_marker();
-  }
-  out += "\n";
+  out = build_stream_frame_prompt_line(frames.back());
   return true;
 }
 
 bool build_formatted_question_suffix(
     decode_context& ctx,
-    const std::vector<FrameRecord>& frames,
+    const std::string& open_user_content,
     const std::string& raw_prompt,
     std::string& out) {
-  const std::string content = build_video_prompt_prefix(frames) + SVLM_QUESTION_SENTINEL + raw_prompt;
-  return split_formatted_at_question_sentinel(format_singleton_user_message(ctx, content), nullptr, &out);
+  const std::string content = open_user_content + SVLM_QUESTION_SENTINEL + raw_prompt;
+  return split_formatted_at_question_sentinel(format_user_message_for_current_history(ctx, content), nullptr, &out);
 }
 
 bool eval_streaming_chunks_with_external_embedding(
@@ -1135,6 +1158,7 @@ bool save_vision_prefill_cache_state(
     return false;
   }
   cache.n_past = ctx.n_past;
+  cache.chat_history = ctx.chat_history;
   return true;
 }
 
@@ -1161,6 +1185,7 @@ bool restore_vision_prefill_cache_state(
     return false;
   }
   ctx.n_past = cache.n_past;
+  ctx.chat_history = cache.chat_history;
   return true;
 }
 
@@ -1191,6 +1216,7 @@ bool build_vision_prefill_cache(
   const bool can_append_incrementally = vision_prefill_cache_is_immediate_prefix(cache, frames);
   bool use_incremental_append = false;
   std::string formatted_prefix;
+  bool formatted_prefix_add_special = false;
   std::vector<std::string> bins;
   std::vector<std::string> images_to_load;
 
@@ -1204,16 +1230,30 @@ bool build_vision_prefill_cache(
       cache = std::move(next_cache);
       return false;
     }
+    next_cache.open_user_content = cache.open_user_content + formatted_prefix;
+    next_cache.open_user_prefix = true;
+    if (!cache.open_user_prefix) {
+      next_cache.open_user_content = formatted_prefix;
+      if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
+        LOG_ERR("failed to split formatted post-answer vision prefill cache prefix\n");
+        cache = std::move(next_cache);
+        return false;
+      }
+      formatted_prefix_add_special = ctx.chat_history.empty();
+    }
     use_incremental_append = true;
   } else {
     reset_decode_context_for_singleton(ctx);
     bins = bins_for_frames(frames);
     images_to_load = next_cache.images;
-    if (!build_formatted_vision_cache_prefix(ctx, frames, formatted_prefix)) {
+    next_cache.open_user_content = build_stream_video_prompt_prefix(frames);
+    next_cache.open_user_prefix = true;
+    if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
       LOG_ERR("failed to split formatted vision prefill cache prefix\n");
       cache = std::move(next_cache);
       return false;
     }
+    formatted_prefix_add_special = ctx.chat_history.empty();
   }
 
   if (bins.empty() || images_to_load.empty()) {
@@ -1236,7 +1276,7 @@ bool build_vision_prefill_cache(
           ctx,
           formatted_prefix,
           bitmaps,
-          true,
+          formatted_prefix_add_special,
           cache_phases,
           "VisionPrefillLayoutTokenize",
           chunks)) {
@@ -1281,7 +1321,7 @@ int run_single_buffer_prompt(
     const PromptEvent& prompt,
     int prompt_idx,
     long origin_ms,
-    const VisionPrefillCache* vision_cache) {
+    VisionPrefillCache* vision_cache) {
   const std::vector<std::string> bins = bins_for_frames(frames);
   const std::vector<std::string> images = layout_images_for_frames(frames);
   if (bins.empty()) {
@@ -1326,14 +1366,20 @@ int run_single_buffer_prompt(
       prompt_phases.row("VisionPrefillCacheHit", cache_check_ms, cache_check_ms);
       if (restore_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)) {
         std::string suffix;
-        if (build_formatted_question_suffix(ctx, frames, prompt.prompt, suffix)) {
+        const std::string user_content =
+            vision_cache->open_user_prefix ? (vision_cache->open_user_content + prompt.prompt) : prompt.prompt;
+        const bool add_special = ctx.chat_history.empty() && !vision_cache->open_user_prefix;
+        const bool suffix_ready = vision_cache->open_user_prefix
+            ? build_formatted_question_suffix(ctx, vision_cache->open_user_content, prompt.prompt, suffix)
+            : (suffix = format_user_message_for_current_history(ctx, prompt.prompt), true);
+        if (suffix_ready) {
           mtmd::bitmaps empty_bitmaps;
           mtmd::input_chunks suffix_chunks(mtmd_input_chunks_init());
           if (tokenize_formatted_text(
                   ctx,
                   suffix,
                   empty_bitmaps,
-                  false,
+                  add_special,
                   prompt_phases,
                   "VisionPrefillSuffixTokenize",
                   suffix_chunks) &&
@@ -1348,10 +1394,20 @@ int run_single_buffer_prompt(
                   "ImagePrefill",
                   "Mmproj",
                   false)) {
+            append_user_message_to_history(ctx, user_content);
             const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
             generated_text =
                 generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
             handled_with_cache = true;
+            vision_cache->frame_indices = frame_indices_for(frames);
+            vision_cache->images = images;
+            vision_cache->open_user_prefix = false;
+            vision_cache->open_user_content.clear();
+            if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)) {
+              rc = 1;
+            } else {
+              vision_cache->valid = true;
+            }
           } else {
             rc = 1;
           }

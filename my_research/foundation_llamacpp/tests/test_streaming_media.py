@@ -61,7 +61,7 @@ def test_build_streaming_video_prompt_uses_internvl_frame_format():
     prompt = build_streaming_video_prompt(frames, "What changed?")
 
     assert prompt == (
-        f"Frame 1: {MEDIA_MARKER}\n"
-        f"Frame 2: {MEDIA_MARKER}{MEDIA_MARKER}\n"
+        f"Frame1: {MEDIA_MARKER}\n"
+        f"Frame2: {MEDIA_MARKER}{MEDIA_MARKER}\n"
         "What changed?"
     )

@@ -348,8 +348,8 @@ Offline video mode samples a fixed number of frames before running inference.
 This is not streaming. The prompt sees all sampled frames at once:
 
 ```text
-Frame 1: <img>...</img>
-Frame 2: <img>...</img>
+Frame1: <img>...</img>
+Frame2: <img>...</img>
 ...
 question text
 ```
@@ -635,7 +635,7 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
 
 --stream-mode sliding-window
   Sliding video-window baseline. Each prompt selects recent sampled frames,
-  formats them as `Frame 1: <__media__>` / `Frame 2: <__media__>` / ... plus
+  formats them as `Frame1: <__media__>` / `Frame2: <__media__>` / ... plus
   the question, then runs full vision encode, mmproj, image prefill, text
   prefill, and decode. It preserves llama.cpp chat/KV state across prompt
   events, so previous user/assistant turns remain visible. It does not reuse a
@@ -643,15 +643,14 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
 
 --stream-mode vision-prefill
   KV-level cached vision-prefill mode for hybrid streaming. As frames arrive,
-  the bridge keeps the full-history video-prefix KV as an incremental snapshot.
-  The first frame is built from scratch. For each later frame, the bridge
-  restores the previous cache, evaluates only the new `Frame N:` label, QNN
-  vision encode, mmproj, and ImagePrefill for that frame/tile, then saves the
-  resulting llama sequence KV state. At prompt time it
-  restores the latest matching KV snapshot and pre-fills only the text question
-  suffix before decode. This mode is singleton at the text/chat level: each
-  prompt uses one restored full-history video-prefix KV snapshot, not a
-  multi-turn conversation.
+  the bridge keeps an incremental KV snapshot for the currently open streaming
+  user turn. The first frame is built from scratch. For each later frame, the
+  bridge restores the previous cache, evaluates only the new global `FrameN:`
+  label, QNN vision encode, mmproj, and ImagePrefill for that frame/tile, then
+  saves the resulting llama sequence KV state. At prompt time it restores the
+  latest matching KV snapshot, pre-fills only the text question suffix, decodes
+  the answer, and saves the post-answer chat/KV state. Later frames then start
+  the next user turn, so previous user/assistant turns remain visible.
 
 --chunked-vision-prefill
   Reserved future mode flag for independently reusable vision-prefill chunks.
@@ -733,11 +732,12 @@ Prompt wait
   The selected image/window remains frozen at prompt arrival.
 
 Multi-turn
-  Streaming single-buffer and sliding-window keep llama.cpp chat/KV state across
-  prompt events. In sliding-window, only the visual input is bounded to the
-  selected recent frame window; the text conversation remains multi-turn.
-  `vision-prefill` restores a cached video-prefix KV snapshot before the prompt
-  text suffix, so it is still a singleton video query at the chat level.
+  Streaming single-buffer, sliding-window, and vision-prefill keep llama.cpp
+  chat/KV state across prompt events. In sliding-window, only the visual input
+  is bounded to the selected recent frame window. In vision-prefill, frames
+  arriving before a prompt are cached as an open user turn; the prompt text
+  closes that turn, the answer is appended to chat history, and later frames are
+  cached under the next user turn.
   `foundation_inference_tokens.txt` appends all turns, and
   `stream_inference_tokens_<idx>.txt` stores each turn's raw trace.
 
@@ -779,8 +779,8 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 
 Swap `--stream-mode vision-prefill` to run the KV snapshot cached
 vision-prefill mode. In this mode the `--window-sec` and `--window-max-frames`
-limits are ignored and each frame incrementally appends to the full-history
-prefix cache.
+limits are ignored and each frame incrementally appends to the active streaming
+turn cache.
 
 Example vision-prefill run used for the current KV snapshot validation:
 
@@ -811,11 +811,14 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --results-root my_research/foundation_llamacpp/results/log/vision_prefill_kv_cache_2b_hybrid_frame_ordered
 ```
 
-Validated incremental result:
-`results/log/stream_modes_2b_hybrid_dynamic512_npredict64/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic`
-with `foundation_exit_code.txt=0`, sixteen `VisionPrefillCacheBuild` rows, four
-`VisionPrefillCacheHit` rows, and only sixteen `VisionPrefillV_Encode` /
-`VisionPrefillImagePrefill` rows for sixteen sampled frames.
+Validated incremental multi-turn result:
+`results/log/red_panda_vision_prefill_multiturn_interleaved_2b_dynamic512_frame1/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic`
+with `foundation_exit_code.txt=0`, fifteen `VisionPrefillCacheBuild` rows, four
+`VisionPrefillCacheHit` rows, zero `VisionPrefillCacheMiss` rows, zero
+`DynamicKVGrow` rows for the 512-cell dynamic-KV run, and fifteen
+`VisionPrefillV_Encode` / `VisionPrefillImagePrefill` rows for fifteen sampled
+frames. Prompt 1 answered that the previous question was about the red panda's
+activity, confirming chat history is preserved.
 
 ## Vision Tower Export
 

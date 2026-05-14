@@ -1186,7 +1186,7 @@ def _finalize_hybrid_outputs(result_dir: Path) -> None:
 
     phase_rows = _phase_rows_from_artifacts(result_dir)
     if phase_rows:
-        phase_rows.extend(_dynamic_kv_rows_from_stdout(stdout_path))
+        phase_rows.extend(_dynamic_kv_rows_from_stdout(decode_log))
         phase_rows.sort(key=lambda row: (_phase_float(row, "elapsed_s_start"), _phase_float(row, "elapsed_s_end")))
         _write_phase_csv(result_dir / "foundation_proc.csv", phase_rows)
         plot_phase_rows = _read_phase_rows(result_dir / "foundation_proc.csv")

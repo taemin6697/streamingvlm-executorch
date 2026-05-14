@@ -34,10 +34,11 @@ sliding-window:
   prompt latency includes full prompt-time vision encode and image prefill
 
 vision-prefill:
-  every frame arrival saves a full-history video-prefix KV snapshot
-  frame 0 is built from scratch; later frames append one new frame to the
-  previous restored snapshot
-  decoder chat state is singleton per prompt
+  every frame arrival saves an active streaming-turn KV snapshot
+  frame 0 is built from scratch; later frames append one new global FrameN to
+  the previous restored snapshot
+  prompt handling closes the open user turn, decodes, and saves post-answer KV
+  multi-turn chat/KV state is preserved across prompt events
   prompt latency restores cached image-prefix KV and evaluates only text suffix
 ```
 
@@ -148,8 +149,8 @@ if len(eligible) > --window-max-frames:
 The selected frames are formatted as a video prompt:
 
 ```text
-Frame 1: <__media__>
-Frame 2: <__media__>
+Frame1: <__media__>
+Frame2: <__media__>
 ...
 <user question>
 ```
@@ -185,10 +186,11 @@ capacity.
 
 ## Vision-Prefill Details
 
-`vision-prefill` is a hybrid-only incremental full-history KV snapshot cache.
+`vision-prefill` is a hybrid-only incremental streaming-turn KV snapshot cache.
 
-For every sampled frame, the bridge saves a cache representing all sampled
-frames up to that frame:
+For every sampled frame, the bridge saves a cache representing the decoder state
+after all sampled frames up to that frame have been consumed. Before the first
+prompt, those frames are inside one open user turn:
 
 ```text
 frame 0 cache: build [frame 0] from scratch
@@ -197,8 +199,12 @@ frame 2 cache: restore frame 1 cache, append [frame 2]
 ...
 ```
 
-At prompt time, the prompt uses the cached full-history snapshot matching the
-frame history available at prompt arrival.
+At prompt time, the prompt uses the cached snapshot matching the frame history
+available at prompt arrival. The prompt text is evaluated as the suffix that
+closes the open user turn. After decode, the user question and assistant answer
+are stored in chat history and the closed post-answer state is saved. Later
+frame arrivals append to a new open user turn, so this mode is multi-turn rather
+than singleton.
 
 The cache object stores:
 
@@ -209,20 +215,23 @@ images
 state bytes from llama_state_seq_get_data_ext()
 state_flags
 n_past
+chat_history
+open_user_content
+open_user_prefix
 ```
 
 The cache path uses a sentinel to preserve the exact chat-template boundary:
 
 ```text
-Frame 1: <__media__>
-Frame 2: <__media__>
+Frame1: <__media__>
+Frame2: <__media__>
 ...
 <SVLM_QUESTION_SENTINEL>
 <user question>
 ```
 
-The bridge formats this as the normal singleton user message, then splits the
-formatted string at `SVLM_QUESTION_SENTINEL`.
+The bridge formats this as the normal user message for the current chat history,
+then splits the formatted string at `SVLM_QUESTION_SENTINEL`.
 
 Cache build evaluates only the formatted prefix before the sentinel. Prompt
 handling restores the saved sequence state and evaluates only the formatted
@@ -244,6 +253,7 @@ Cache restore:
 reset_decode_context_for_singleton(ctx)
 llama_state_seq_set_data_ext(ctx.lctx, cache.state.data(), cache.state.size(), 0, flags)
 ctx.n_past = cache.n_past
+ctx.chat_history = cache.chat_history
 ```
 
 If the cache does not match or restore fails, the prompt records
@@ -286,7 +296,7 @@ image chunk:
 
 For incremental cache updates, each cache build after frame 0 first restores the
 previous snapshot (`VisionPrefillCacheAppendRestore`), then evaluates only the
-new frame's `Frame N:` text and image chunk.
+new frame's `FrameN:` text and image chunk.
 
 ```text
 Frame label text prefill
@@ -420,6 +430,25 @@ DynamicKVGrow = 8
 The `16` vision/image-prefill rows correspond to one newly appended frame per
 sampled frame, not `1 + 2 + ... + 16`.
 
+Interleaved multi-turn observation:
+
+```text
+result = results/log/red_panda_vision_prefill_multiturn_interleaved_2b_dynamic512_frame1/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic
+foundation_exit_code.txt = 0
+VisionPrefillCacheBuild = 15
+VisionPrefillCacheAppendRestore = 14
+VisionPrefillCacheHit = 4
+VisionPrefillCacheMiss = 0
+VisionPrefillCacheRestore = 4
+VisionPrefillV_Encode = 15
+VisionPrefillImagePrefill = 15
+DynamicKVGrow = 0
+```
+
+Prompt 1 in that run asked `What did I ask earlier???` and the model answered
+that the previous question was about the red panda's activity. This confirms the
+cached vision-prefill path now carries text chat history across prompt events.
+
 Additional closure validation:
 
 ```text
@@ -452,5 +481,6 @@ The planned chunk-size argument is:
 
 This should create independently reusable KV chunks, for example one frame per
 chunk or two frames per chunk. That future mode should not silently change the
-current `vision-prefill` semantics, which maintain one full-history snapshot at
-each frame by incrementally appending the newest frame.
+current `vision-prefill` semantics, which maintain one active streaming-turn
+snapshot at each frame by incrementally appending the newest frame and saving
+post-answer chat/KV state at prompt boundaries.

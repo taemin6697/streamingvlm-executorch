@@ -54,7 +54,7 @@ follow_up:
   writes one merged `.svlmemb`, and records one `V_Encode` phase per input.
   `hybrid_decode` now consumes external embeddings with a cursor so each mtmd
   IMAGE chunk gets the next slice instead of reusing the first buffer. The
-  video prompt is `Frame 1: <__media__>\n...` plus the raw prompt; mtmd expands
+  video prompt is `Frame1: <__media__>\n...` plus the raw prompt; mtmd expands
   each marker as InternVL `<img>` + vision slots + `</img>`. With `--max-num 1`
   this is exactly one image block per sampled frame; with `--max-num > 1`, each
   frame label contains multiple tile markers in frame/tile order. Phase plotting

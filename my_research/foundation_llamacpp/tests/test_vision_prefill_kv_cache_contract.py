@@ -83,11 +83,43 @@ def test_vision_prefill_cache_build_restores_previous_snapshot_and_appends_one_f
     assert "layout_images_for_frames(append_frames)" in build_fn
 
 
+def test_vision_prefill_preserves_chat_history_across_prompt_events():
+    source = STREAMING_CPP.read_text()
+    cache_struct = source.split("struct VisionPrefillCache {", 1)[1].split("\n};", 1)[0]
+    restore_fn = source.split("bool restore_vision_prefill_cache_state(", 1)[1].split("\n}\n\nbool build_vision_prefill_cache", 1)[0]
+    prompt_fn = source.split("int run_single_buffer_prompt(", 1)[1].split("\n#else\nint run_single_buffer_prompt", 1)[0]
+    singleton_fn = source.split("bool is_singleton_video_mode(", 1)[1].split("\n}\n\nvoid reset_decode_context_for_singleton", 1)[0]
+
+    assert "std::vector<common_chat_msg> chat_history" in cache_struct
+    assert "std::string open_user_content" in cache_struct
+    assert "bool open_user_prefix" in cache_struct
+    assert "ctx.chat_history = cache.chat_history" in restore_fn
+    assert "cache.chat_history = ctx.chat_history" in source
+    assert 'args.stream_mode == "vision_prefill"' not in singleton_fn
+    assert "vision_cache->open_user_prefix = false" in prompt_fn
+    assert "save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)" in prompt_fn
+
+
+def test_vision_prefill_uses_global_stream_frame_labels_for_interleaved_turns():
+    source = STREAMING_CPP.read_text()
+
+    assert "build_stream_frame_prompt_line" in source
+    assert '"Frame" + std::to_string(frame.index + 1) + ": "' in source
+
+
+def test_streaming_cpp_uses_internvl_video_frame_labels_without_space():
+    source = STREAMING_CPP.read_text()
+
+    assert '"Frame" + std::to_string(frame_i + 1) + ": "' in source
+    assert '"Frame" + std::to_string(frame.index + 1) + ": "' in source
+    assert '"Frame " + std::to_string' not in source
+
+
 def test_sliding_window_keeps_multiturn_text_history():
     source = STREAMING_CPP.read_text()
     singleton_fn = source.split("bool is_singleton_video_mode(", 1)[1].split("\n}\n\nvoid reset_decode_context_for_singleton", 1)[0]
 
-    assert 'args.stream_mode == "vision_prefill"' in singleton_fn
+    assert 'args.stream_mode == "vision_prefill"' not in singleton_fn
     assert 'args.stream_mode == "sliding_window"' not in singleton_fn
     assert 'if (args.stream_mode == "sliding_window") {\n    reset_decode_context_for_singleton(ctx);\n  }' not in source
 

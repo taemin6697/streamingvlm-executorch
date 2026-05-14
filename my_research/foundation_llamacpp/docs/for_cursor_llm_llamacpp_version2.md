@@ -544,12 +544,13 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     evaluates the selected frames as a video clip while preserving decoder
     chat/KV state across prompt events.
   - `--stream-mode vision-prefill`: hybrid-only KV-level image-prefill cache.
-    Every frame arrival enqueues a cache update. Frame 0 builds the
-    full-history video-prefix KV snapshot from scratch; later updates restore
-    the previous snapshot, append only the newly arrived frame's `Frame N:`
-    text/image KV, then save the next full-history snapshot. Prompt handling
-    restores the matching snapshot and evaluates only the formatted question
-    suffix.
+    Every frame arrival enqueues a cache update. Frame 0 builds the active
+    streaming user-turn KV snapshot from scratch; later updates restore the
+    previous snapshot, append only the newly arrived global `FrameN:`
+    text/image KV, then save the next snapshot. Prompt handling restores the
+    matching open-user snapshot, evaluates only the formatted question suffix,
+    decodes the answer, and saves the closed post-answer state for later
+    frames.
 - `runner/media.py` now writes streaming manifests with `stream_mode`,
   `window_sec`, and `window_max_frames`. Hybrid streaming modes write both
   layout PNGs and QNN `.bin` tensors for sampled frames.
@@ -566,9 +567,12 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     cache or prompt timestamp, ignoring `window_sec` and `window_max_frames`.
 - The current `vision-prefill` cache is one complete active snapshot, not a
   composable per-frame cache. It stores frame indices, layout image paths, saved
-  seq 0 bytes from `llama_state_seq_get_data_ext()`, state flags, and `n_past`.
-  Cache updates restore the previous snapshot for append, and prompt handling
-  restores the matched snapshot before suffix text prefill.
+  seq 0 bytes from `llama_state_seq_get_data_ext()`, state flags, `n_past`,
+  closed chat history, and the currently open streaming user content. Cache
+  updates restore the previous snapshot for append. Prompt handling restores
+  the matched open-user snapshot, evaluates the suffix question, records the
+  user turn and assistant answer into chat history, then saves the closed
+  post-answer snapshot so later frames become the next user turn.
 - Prompt boundary handling uses `SVLM_QUESTION_SENTINEL` inside the same
   chat-template formatted user message that the non-cached prompt would use.
   Cache build evaluates the formatted video prefix before the sentinel; prompt
@@ -595,7 +599,7 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - `--chunked-vision-prefill`
   - `--chunk-count`
   This should build independently reusable 1-frame, 2-frame, or larger chunks
-  instead of changing the current single-snapshot `vision-prefill` semantics.
+  instead of changing the current active-snapshot `vision-prefill` semantics.
 - Validation:
   - `pytest my_research/foundation_llamacpp/tests/test_vision_prefill_kv_cache_contract.py my_research/foundation_llamacpp/tests/test_streaming_media.py -q`
     passed with `12 passed`.
@@ -634,14 +638,20 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - `single-buffer` keeps latest frame plus multi-turn chat/KV state;
   - `sliding-window` keeps multi-turn chat/KV state while bounding only the
     visual frame window;
-  - `vision-prefill` remains a singleton restored full-history video-prefix KV
-    snapshot mode, but cache construction now appends only the newest frame to
-    the previous restored snapshot.
+  - `vision-prefill` keeps multi-turn chat/KV state by caching frames inside an
+    open streaming user turn, closing that turn at prompt time, saving the
+    post-answer state, and appending later frames to the next user turn.
 - Real 2B Q8 hybrid sliding-window validation after the multi-turn change used
   `--dynamic-kv-cache --kv-init-size 512 --kv-grow-step 512`, prompts at
   `5s/8s/11s/14s`, and returned code `0`. Prompt 1 answered that the earlier
   question was about the activity in the video, confirming text history was
   preserved.
+- Real 2B Q8 hybrid vision-prefill validation after the interleaved multi-turn
+  change used red-panda 448 input, `--dynamic-kv-cache --kv-init-size 512
+  --kv-grow-step 512`, prompts at `5s/8s/11s/14s`, and returned code `0`.
+  Prompt 1 answered that the previous question was about the red panda's
+  activity. The run produced `VisionPrefillCacheBuild 15`,
+  `VisionPrefillCacheHit 4`, `VisionPrefillCacheMiss 0`, and `DynamicKVGrow 0`.
 - Documentation closure:
   - `README.md` is the quick-run surface;
   - `project_structure.md` is the architecture/state map;
