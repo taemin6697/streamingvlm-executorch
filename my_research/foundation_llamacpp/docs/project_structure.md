@@ -274,8 +274,8 @@ decode.
 In `--stream-mode sliding-window`, prompt events capture a selected list of
 sampled frames rather than one latest frame. The selection is bounded by
 `--window-sec` and then evenly reduced to `--window-max-frames` when needed.
-The decoder context is reset before each prompt, so the selected frames behave
-like one independent video clip.
+The selected frames behave like the current visual window, while the decoder
+chat/KV state is preserved across prompt events for multi-turn text context.
 
 In `--stream-mode vision-prefill`, every frame arrival enqueues a cache-update
 job. Each cache-update rebuilds a full-history video prefix from all sampled
@@ -500,10 +500,10 @@ Responsibilities:
   maintain sampled-frame history and the latest-frame buffer
   capture prompt events against the correct frame/window snapshot
   for single-buffer, QNN-encode only the selected frame per prompt
-  for sliding-window, reset decoder state and evaluate the selected window
+  for sliding-window, evaluate the selected window while preserving chat/KV state
   for vision-prefill, build full-history KV snapshots as frames arrive
   run decoder-side mmproj, prefill, and decode
-  preserve chat history and KV state only in single-buffer mode
+  preserve chat history and KV state in single-buffer and sliding-window modes
   write stream events, phase rows, output, and per-turn token traces
 ```
 
@@ -764,17 +764,16 @@ run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-m
   -> prompt job selects frames with timestamp <= prompt time
   -> optional --window-sec filters to recent frames
   -> --window-max-frames evenly reduces the selected frame list when needed
-  -> consumer lane resets llama memory, sampler, chat history, and n_past
   -> build prompt as Frame 1/Frame 2/... plus the user question
   -> QNN-encode all selected frame/tile bins
   -> eval_with_external_embedding() runs mmproj, image prefill, text prefill
-  -> generate_response() decodes as a singleton video-window question
+  -> generate_response() decodes while preserving prior text turns
 ```
 
 This mode is the sliding-window baseline. It preserves prompt-arrival selection
-semantics, but it intentionally does not preserve chat/KV state between prompt
-events and does not reuse image-prefix KV. It is useful for measuring how much
-latency remains when the model receives a bounded recent video clip.
+semantics and multi-turn chat/KV state, but it does not reuse image-prefix KV.
+It is useful for measuring how much latency remains when each prompt receives a
+bounded recent video clip while the text conversation continues.
 
 ### Streaming Vision-Prefill Hybrid
 
@@ -985,14 +984,14 @@ When changing streaming:
 1. Keep video_file and streaming semantics separate. Video_file is offline
    sampled frames; streaming is timestamped replay with prompt events.
 2. Preserve the explicit state model. Single-buffer is latest-frame state,
-   sliding-window is reset singleton window state, and vision-prefill is restored
-   full-history video-prefix KV state.
+   sliding-window is bounded visual-window state with retained text/chat KV, and
+   vision-prefill is restored full-history video-prefix KV state.
 3. Keep prompt arrival timestamp, selected buffered frame, and actual execution
    start distinguishable in stream_events.csv.
 4. Decoder context retention/eviction must remain explicit. Single-buffer
-   preserves chat history and KV across prompt events; sliding-window clears
-   them; vision-prefill restores a cached prefix state and evaluates only the
-   text suffix.
+   and sliding-window preserve chat history and KV across prompt events;
+   vision-prefill restores a cached prefix state and evaluates only the text
+   suffix.
 5. Keep OpenCL and Hybrid streaming artifacts aligned so their timelines can be
    compared.
 6. If adding persistent prefill or vision-encoder-only streaming, add new mode

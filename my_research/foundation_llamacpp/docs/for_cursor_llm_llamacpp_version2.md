@@ -538,10 +538,11 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 - Added explicit streaming modes on top of `--streaming-video`:
   - `--stream-mode single-buffer`: the existing latest-frame baseline. It keeps
     chat/KV state across prompt events.
-  - `--stream-mode sliding-window`: a sliding-window singleton video baseline.
+  - `--stream-mode sliding-window`: a sliding-window multi-turn video baseline.
     Prompt arrival selects sampled frames up to the prompt timestamp, optionally
-    filters by `--window-sec`, evenly limits with `--window-max-frames`, resets
-    decoder chat/KV state, then evaluates the selected frames as a video clip.
+    filters by `--window-sec`, evenly limits with `--window-max-frames`, then
+    evaluates the selected frames as a video clip while preserving decoder
+    chat/KV state across prompt events.
   - `--stream-mode vision-prefill`: hybrid-only KV-level image-prefill cache.
     Every frame arrival enqueues a cache update. Each update builds a
     full-history video-prefix KV snapshot from all sampled frames up to that

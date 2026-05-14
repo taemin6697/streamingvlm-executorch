@@ -459,7 +459,8 @@ The host samples the video first and pushes frame files plus `media_manifest.jso
 to Android. The device runner then replays those frames according to their
 timestamps. `--stream-mode single-buffer` keeps only the latest sampled frame.
 `--stream-mode sliding-window` turns the recent sampled frames into one
-singleton video clip at prompt arrival. `--stream-mode vision-prefill` is the
+video clip at prompt arrival while preserving multi-turn chat/KV state.
+`--stream-mode vision-prefill` is the
 hybrid KV-cache observation mode: every sampled frame builds a full-history
 video-prefix KV snapshot, and prompt handling restores that snapshot before
 evaluating only the text question suffix.
@@ -629,9 +630,10 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
 --stream-mode sliding-window
   Sliding video-window baseline. Each prompt selects recent sampled frames,
   formats them as `Frame 1: <__media__>` / `Frame 2: <__media__>` / ... plus
-  the question, clears decoder chat/KV state, then runs full vision encode,
-  mmproj, image prefill, text prefill, and decode. It does not reuse a KV
-  snapshot across prompts.
+  the question, then runs full vision encode, mmproj, image prefill, text
+  prefill, and decode. It preserves llama.cpp chat/KV state across prompt
+  events, so previous user/assistant turns remain visible. It does not reuse a
+  cached image-prefix KV snapshot across prompts.
 
 --stream-mode vision-prefill
   KV-level cached vision-prefill mode for hybrid streaming. As frames arrive,
@@ -725,10 +727,11 @@ Prompt wait
   The selected image/window remains frozen at prompt arrival.
 
 Multi-turn
-  Streaming single-buffer keeps llama.cpp chat/KV state across prompt events.
-  `sliding-window` intentionally clears llama.cpp chat/KV state before each
-  prompt. `vision-prefill` restores a cached video-prefix KV snapshot before the
-  prompt text suffix, so it is still a singleton video query at the chat level.
+  Streaming single-buffer and sliding-window keep llama.cpp chat/KV state across
+  prompt events. In sliding-window, only the visual input is bounded to the
+  selected recent frame window; the text conversation remains multi-turn.
+  `vision-prefill` restores a cached video-prefix KV snapshot before the prompt
+  text suffix, so it is still a singleton video query at the chat level.
   `foundation_inference_tokens.txt` appends all turns, and
   `stream_inference_tokens_<idx>.txt` stores each turn's raw trace.
 
