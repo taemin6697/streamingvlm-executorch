@@ -230,12 +230,6 @@ llama_kv_cache::llama_kv_cache(
 
 bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
     GGML_ASSERT(kv_size % n_pad == 0);
-    GGML_ASSERT(!paged_kv_cache || !copy_existing);
-
-    const uint32_t backing_kv_size = paged_kv_cache ? logical_kv_size : kv_size;
-    GGML_ASSERT(backing_kv_size >= kv_size);
-    GGML_ASSERT(backing_kv_size % n_pad == 0);
-    this->backing_kv_size = backing_kv_size;
 
     llama_kv_io_write_host snapshot;
     if (copy_existing) {
@@ -346,8 +340,8 @@ bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, cache_type_k, n_embd_k_gqa, backing_kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, cache_type_v, n_embd_v_gqa, backing_kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, cache_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, cache_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -356,8 +350,8 @@ bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, backing_kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, backing_kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
@@ -414,8 +408,8 @@ bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u active / %6u backing / %6u logical cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, backing_kv_size, logical_kv_size, (int) layers.size(), n_seq_max, n_stream,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u/%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, logical_kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(cache_type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(cache_type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
@@ -754,15 +748,6 @@ std::pair<uint32_t, uint32_t> llama_kv_cache::logical_pos_to_page_offset(uint32_
     return { paged_block_table.logical_to_physical[logical_page], offset };
 }
 
-uint32_t llama_kv_cache::logical_pos_to_physical_pos(uint32_t logical_pos) const {
-    if (!paged_kv_cache) {
-        return logical_pos;
-    }
-
-    const auto [physical_page, offset] = logical_pos_to_page_offset(logical_pos);
-    return physical_page*kv_page_size + offset;
-}
-
 bool llama_kv_cache::grow_to(uint32_t new_size) {
     const uint32_t old_size = get_size();
     new_size = std::min(GGML_PAD(new_size, n_pad), logical_kv_size);
@@ -776,36 +761,16 @@ bool llama_kv_cache::grow_to(uint32_t new_size) {
     }
 
     if (paged_kv_cache) {
-        const int64_t t_start_us = ggml_time_us();
-        const int64_t t_start_ms = ggml_time_ms();
         const uint32_t old_pages = paged_block_table.n_logical_pages();
         const uint32_t needed_pages = (new_size + kv_page_size - 1) / kv_page_size;
-        GGML_ASSERT(new_size <= backing_kv_size);
-
         for (uint32_t i = old_pages; i < needed_pages; ++i) {
             if (!allocate_paged_kv_page()) {
                 return false;
             }
         }
 
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            v_cells[s].grow_to(new_size);
-        }
-
-        const int64_t t_end_us = ggml_time_us();
-        const int64_t t_end_ms = ggml_time_ms();
-        LLAMA_LOG_INFO("%s: paged KV grow metadata-only: old = %u, new = %u, backing = %u, logical = %u, pages = %u -> %u, page_size = %u, elapsed = %.3f ms, clock_start_ms = %" PRId64 ", clock_end_ms = %" PRId64 "\n",
-                __func__,
-                old_size,
-                new_size,
-                backing_kv_size,
-                logical_kv_size,
-                old_pages,
-                paged_block_table.n_logical_pages(),
-                kv_page_size,
-                (t_end_us - t_start_us) / 1000.0,
-                t_start_ms,
-                t_end_ms);
+        LLAMA_LOG_INFO("%s: paged KV grow metadata: old_pages = %u, new_pages = %u, page_size = %u, logical = %u\n",
+                __func__, old_pages, paged_block_table.n_logical_pages(), kv_page_size, logical_kv_size);
         return true;
     }
 
@@ -1324,10 +1289,6 @@ bool llama_kv_cache::is_paged_kv() const {
     return paged_kv_cache;
 }
 
-uint32_t llama_kv_cache::get_kv_page_size() const {
-    return kv_page_size;
-}
-
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1367,6 +1328,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
+    const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
@@ -1377,8 +1339,8 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
-            k->nb[2],
-            k->nb[2]*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1386,7 +1348,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * v = layers[ikv].v;
 
-    const uint64_t kv_size      = v->ne[1];
+    const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
 
     // [TAG_V_CACHE_VARIABLE]
@@ -1400,8 +1362,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                v->nb[2],                                                // v->nb[3]
-                v->nb[2]*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1409,8 +1371,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
-            v->nb[2],                                                // v->nb[3]
-            v->nb[2]*sinfo.s0);
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1593,7 +1555,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + logical_pos_to_physical_pos(sinfo.idxs[s][i]);
+            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
     }
 }
@@ -1626,7 +1588,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + logical_pos_to_physical_pos(sinfo.idxs[s][i]);
+                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
             }
         }
     } else {
@@ -1639,10 +1601,8 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                const uint32_t row_idx = sinfo.idxs[s][i];
-                const uint32_t physical_row = logical_pos_to_physical_pos(row_idx);
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + physical_row;
+                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
                 }
             }
         }
@@ -2683,10 +2643,6 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 
 bool llama_kv_cache_context::is_paged_kv() const {
     return kv->is_paged_kv();
-}
-
-uint32_t llama_kv_cache_context::get_kv_page_size() const {
-    return kv->get_kv_page_size();
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

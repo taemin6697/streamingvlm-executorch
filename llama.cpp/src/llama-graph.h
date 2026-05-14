@@ -902,9 +902,7 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
-            ggml_tensor * kv_page_table,
                   float   kq_scale,
-               uint32_t   kv_page_size,
                     int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;

@@ -878,20 +878,6 @@ DynamicKVGrow:
   synthetic dynamic KV expansion row inserted during finalization. New runs use
   the full grow/retry window from `llama_context::decode()`, including
   `grow_to()`, KV copy/restore, scheduler reserve, and retry preparation.
-  Paged KV grow rows are also reported here. For paged KV, `grow_to()` is
-  metadata-only because the OpenCL KV backing tensor is reserved at logical
-  context size during init; the row therefore mainly captures scheduler reserve
-  and retry overhead. Validated 2B Q8 hybrid `1024 -> 16384` active-cell grow:
-  contiguous dynamic retry window `369-394 ms`, paged retry window `113 ms`,
-  paged `grow_to()` metadata update `0.201 ms`.
-
-Paged KV active/backing/logical cells:
-  `reset_capacity` logs three sizes for paged KV. `active` is the current
-  logical cell capacity exposed to slot search, `backing` is the reserved
-  physical OpenCL tensor rows, and `logical` is the advertised max context. The
-  current implementation uses page-table addressing inside a single reserved
-  backing allocation, so grow avoids KV realloc/copy but starts with max-context
-  KV memory already committed.
 
 retry-side ImagePrefill:
   if an `ImagePrefill` row overlaps the grow window, finalization clips the row

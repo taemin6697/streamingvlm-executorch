@@ -24,23 +24,6 @@ inline float get_alibi_slope(
 
     return pow(base, exph);
 }
-
-inline int paged_kv_row(
-    const int logical_row,
-    const global void * page_table_void,
-    const ulong page_table_offset,
-    const int kv_page_size
-) {
-    if (page_table_void == NULL || kv_page_size <= 0) {
-        return logical_row;
-    }
-
-    const global int * page_table = (const global int *)((const global char *)page_table_void + page_table_offset);
-    const int logical_page = logical_row / kv_page_size;
-    const int page_offset = logical_row - logical_page * kv_page_size;
-    return page_table[logical_page] * kv_page_size + page_offset;
-}
-
 __kernel void flash_attn_f32(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -69,10 +52,7 @@ __kernel void flash_attn_f32(
     const int mask_ne2,
     const int mask_ne3,
     const global void* sinks_void,
-    const ulong sinks_offset,
-    const global void* page_table_void,
-    const ulong page_table_offset,
-    const int kv_page_size
+    const ulong sinks_offset
 ) {
     const int tid = get_local_id(0);
     const int block_q_idx = get_group_id(0);
@@ -127,8 +107,7 @@ __kernel void flash_attn_f32(
             const int col = i % DK_VEC;
             const int k_row_idx = k_start + row;
             if (k_row_idx < n_kv) {
-                const int physical_k_row_idx = paged_kv_row(k_row_idx, page_table_void, page_table_offset, kv_page_size);
-                const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + physical_k_row_idx * k_nb1;
+                const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
                 l_k[row][col] = ((__global DATA_TYPE4*)(k_base + k_row_offset))[col];
             }
         }
@@ -137,8 +116,7 @@ __kernel void flash_attn_f32(
             const int col = i % DV_VEC;
             const int v_row_idx = k_start + row;
             if (v_row_idx < n_kv) {
-                const int physical_v_row_idx = paged_kv_row(v_row_idx, page_table_void, page_table_offset, kv_page_size);
-                const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + physical_v_row_idx * v_nb1;
+                const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
                 l_v[row][col] = ((__global DATA_TYPE4*)(v_base + v_row_offset))[col];
             }
         }
@@ -255,10 +233,7 @@ __kernel void flash_attn_f32_q1(
     const int mask_ne2,
     const int mask_ne3,
     const global void* sinks_void,
-    const ulong sinks_offset,
-    const global void* page_table_void,
-    const ulong page_table_offset,
-    const int kv_page_size
+    const ulong sinks_offset
 ) {
     const int tid = get_local_id(0);
     const int head_batch_idx = get_global_id(1);
@@ -298,8 +273,7 @@ __kernel void flash_attn_f32_q1(
 
     ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
-        const int physical_k_row_idx = paged_kv_row(k_idx, page_table_void, page_table_offset, kv_page_size);
-        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + physical_k_row_idx * k_nb1;
+        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global DATA_TYPE4* k_ptr = (const global DATA_TYPE4*)(k_base + k_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
         #pragma unroll
@@ -333,10 +307,8 @@ __kernel void flash_attn_f32_q1(
     ACC_TYPE l_i = 0.0f;
 
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
-        const int physical_k_row_idx = paged_kv_row(k_idx, page_table_void, page_table_offset, kv_page_size);
-        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + physical_k_row_idx * k_nb1;
-        const int physical_v_row_idx = paged_kv_row(k_idx, page_table_void, page_table_offset, kv_page_size);
-        const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + physical_v_row_idx * v_nb1;
+        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
         const global DATA_TYPE4* k_ptr = (const global DATA_TYPE4*)(k_base + k_row_offset);
         const global DATA_TYPE4* v_ptr = (const global DATA_TYPE4*)(v_base + v_row_offset);
         ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);

@@ -69,24 +69,6 @@ public:
         reset();
     }
 
-    void grow_to(uint32_t n) {
-        const uint32_t old_size = pos.size();
-        assert(n >= old_size);
-        if (n == old_size) {
-            return;
-        }
-
-        pos.resize(n, -1);
-        ext.resize(n);
-        shift.resize(n, 0);
-        seq.resize(n);
-
-        for (uint32_t i = old_size; i < n; ++i) {
-            ext[i].reset();
-            seq[i].reset();
-        }
-    }
-
     bool is_empty(uint32_t i) const {
         assert(i < pos.size());
         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);

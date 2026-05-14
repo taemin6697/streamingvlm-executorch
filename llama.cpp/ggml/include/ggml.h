@@ -2416,11 +2416,6 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    GGML_API void ggml_flash_attn_ext_set_page_table(
-            struct ggml_tensor * a,
-            struct ggml_tensor * page_table,
-            int32_t              page_size);
-
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

@@ -423,40 +423,17 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path, *, clock_origin_ms: int | No
     if load_origin is None:
         load_origin = 0.0
 
-    paged_backing_mib = 0.0
-    paged_backing_cells = 0
-    for line in lines:
-        paged_size = re.search(
-            r"reset_capacity: size =\s*([0-9.]+) MiB \(\s*\d+ active /\s*(\d+) backing /\s*\d+ logical cells",
-            line,
-        )
-        if paged_size:
-            paged_backing_mib = float(paged_size.group(1))
-            paged_backing_cells = int(paged_size.group(2))
-            break
-
     rows: list[dict[str, str]] = []
     for idx, line in enumerate(lines):
         grow = re.search(r"grow_to: growing dynamic KV cache: old = (\d+), new = (\d+), logical = (\d+)(?:, clock_ms = (-?\d+))?", line)
-        paged_grow = re.search(
-            r"grow_to: paged KV grow metadata-only: old = (\d+), new = (\d+), backing = (\d+), logical = (\d+), pages = \d+ -> \d+, page_size = \d+, elapsed = ([0-9.]+) ms, clock_start_ms = (-?\d+), clock_end_ms = (-?\d+)",
-            line,
-        )
-        is_paged_grow = grow is None and paged_grow is not None
-        if grow:
-            old_cells, new_cells, logical_cells = (int(grow.group(1)), int(grow.group(2)), int(grow.group(3)))
-            start_clock_ms = int(grow.group(4)) if grow.group(4) is not None else None
-        elif paged_grow:
-            old_cells = int(paged_grow.group(1))
-            new_cells = int(paged_grow.group(2))
-            logical_cells = int(paged_grow.group(4))
-            start_clock_ms = int(paged_grow.group(6))
-        else:
+        if not grow:
             continue
 
-        duration_ms = float(paged_grow.group(5)) if is_paged_grow and paged_grow is not None else 0.0
+        old_cells, new_cells, logical_cells = (int(grow.group(1)), int(grow.group(2)), int(grow.group(3)))
+        start_clock_ms = int(grow.group(4)) if grow.group(4) is not None else None
+        duration_ms = 0.0
         new_mib = 0.0
-        end_clock_ms: int | None = int(paged_grow.group(7)) if is_paged_grow and paged_grow is not None else None
+        end_clock_ms: int | None = None
         retry_start_clock_ms: int | None = None
         retry_end_clock_ms: int | None = None
         for follow in lines[idx + 1 : idx + 32]:
@@ -476,10 +453,6 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path, *, clock_origin_ms: int | No
                 retry_end_clock_ms = int(retry_window.group(5))
                 break
 
-        backing_mib = 0.0
-        if is_paged_grow and paged_backing_mib and paged_backing_cells:
-            backing_mib = paged_backing_mib
-            new_mib = backing_mib * new_cells / paged_backing_cells
         old_mib = new_mib * old_cells / new_cells if new_cells and new_mib else 0.0
         if clock_origin_ms is not None and start_clock_ms is not None:
             start = ((retry_start_clock_ms if retry_start_clock_ms is not None else start_clock_ms) - clock_origin_ms) / 1000.0
@@ -499,10 +472,7 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path, *, clock_origin_ms: int | No
                 continue
             start = start_abs - load_origin
             end = start + duration_ms / 1000.0
-        if is_paged_grow:
-            detail = f"{old_cells}->{new_cells}/{logical_cells} cells; {old_mib:.2f}->{new_mib:.2f} MiB; paged metadata-only; backing {backing_mib:.2f} MiB"
-        else:
-            detail = f"{old_cells}->{new_cells}/{logical_cells} cells; {old_mib:.2f}->{new_mib:.2f} MiB"
+        detail = f"{old_cells}->{new_cells}/{logical_cells} cells; {old_mib:.2f}->{new_mib:.2f} MiB"
         rows.append({
             "row_type": "DynamicKVGrow",
             "elapsed_s_start": f"{start:.6f}",
@@ -517,7 +487,7 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path, *, clock_origin_ms: int | No
             "kv_used_pct": "",
             "kv_estimated_used_kb": str(int(round(old_mib * 1024))) if old_mib else "",
             "kv_total_kb": str(int(round(new_mib * 1024))) if new_mib else "",
-            "kv_physical_committed_kb": str(int(round((backing_mib or new_mib) * 1024))) if (backing_mib or new_mib) else "",
+            "kv_physical_committed_kb": str(int(round(new_mib * 1024))) if new_mib else "",
             "token_idx": detail,
         })
     return rows
@@ -1588,7 +1558,8 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
         cmd.append("--no-kv-offload")
     if getattr(args, "no_warmup", False):
         cmd.append("--no-warmup")
-    _extend_paged_kv_cli(cmd, args)
+    if getattr(args, "paged_kv_cache", False):
+        cmd.extend(["--paged-kv-cache", "--kv-page-size", str(args.kv_page_size)])
     _extend_llama_rope_cli(cmd, args)
     return cmd
 
@@ -1644,7 +1615,8 @@ def _build_text_only_command(args: argparse.Namespace) -> list[str]:
         cmd.append("--no-kv-offload")
     if getattr(args, "no_warmup", False):
         cmd.append("--no-warmup")
-    _extend_paged_kv_cli(cmd, args)
+    if getattr(args, "paged_kv_cache", False):
+        cmd.extend(["--paged-kv-cache", "--kv-page-size", str(args.kv_page_size)])
     _extend_llama_rope_cli(cmd, args)
     return cmd
 
@@ -1676,24 +1648,9 @@ def _flash_attn_kv_shell_suffix(args: argparse.Namespace) -> str:
     return (" " + " ".join(parts)) if parts else ""
 
 
-def _extend_paged_kv_cli(cmd: list[str], args: argparse.Namespace) -> None:
-    if not getattr(args, "paged_kv_cache", False):
-        return
-    cmd.extend(["--paged-kv-cache", "--kv-page-size", str(args.kv_page_size)])
-    if getattr(args, "kv_init_size", None):
-        cmd.extend(["--kv-init-size", str(args.kv_init_size)])
-    if getattr(args, "kv_grow_step", None):
-        cmd.extend(["--kv-grow-step", str(args.kv_grow_step)])
-
-
 def _ctx_dynamic_kv_shell_suffix(args: argparse.Namespace) -> str:
     if getattr(args, "paged_kv_cache", False):
-        parts = ["-c", str(args.ctx_size), "--paged-kv-cache", "--kv-page-size", str(args.kv_page_size)]
-        if getattr(args, "kv_init_size", None):
-            parts.extend(["--kv-init-size", str(args.kv_init_size)])
-        if getattr(args, "kv_grow_step", None):
-            parts.extend(["--kv-grow-step", str(args.kv_grow_step)])
-        return " " + " ".join(parts)
+        return f" --paged-kv-cache --kv-page-size {args.kv_page_size}"
     if getattr(args, "dynamic_kv_cache", False):
         parts = ["--dynamic-kv-cache"]
         if getattr(args, "kv_init_size", None):
