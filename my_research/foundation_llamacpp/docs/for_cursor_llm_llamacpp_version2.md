@@ -274,7 +274,7 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   multi-image, offline video, and streaming runs:
   - `csv/`: `foundation_proc.csv`, `foundation_summary.csv`, phase/event CSVs,
     and Android memory CSVs.
-  - `png/`: memory, phase-duration, streaming timeline, and dynamic-KV
+  - `png/`: memory, common phase-duration, common phase-timeline, and dynamic-KV
     breakdown plots.
   - `txt_json/`: stdout, generated output, token traces, exit codes,
     `media_manifest.json`, and handoff/debug artifacts.
@@ -284,7 +284,8 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - `csv/streaming_phase_stats.csv`: setup, frame-buffer, vision, mmproj,
     prefill, and decode phase rows.
   - `csv/foundation_proc.csv`: normalized copy of streaming phase rows.
-  - `png/streaming_phase_timeline.png`: prompt timeline plot.
+  - `png/phase_timeline.png`: common phase timeline plot. Offline runs use
+    elapsed time; streaming runs use stream/video time from `stream_events.csv`.
   - `txt_json/stream_response_<idx>.txt`, `txt_json/stream_token_io_<idx>.txt`,
     `stream_inference_tokens_<idx>.txt`: per-prompt output and token traces.
 - Initial Q8 2B hybrid streaming validation:
@@ -378,8 +379,8 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - GPU streaming pushes/runs `opencl_streaming_decode`;
   - Hybrid streaming pushes/runs `hybrid_streaming_decode`;
   - both paths share `stream_events.csv`, `streaming_phase_stats.csv`,
-    `foundation_proc.csv`, `streaming_phase_timeline.png`, and per-turn token
-    trace finalization;
+    `foundation_proc.csv`, `phase_duration_stacked_bar.png`,
+    `phase_timeline.png`, and per-turn token trace finalization;
   - `HYBRID_STREAMING_PULL_ARTIFACTS` includes both
     `hybrid_streaming_stdout.txt` and `opencl_streaming_stdout.txt`.
 - Build validation:
@@ -395,10 +396,12 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - second-answer quality did not recall the earlier question as cleanly as the
     hybrid QNN run, but execution and logs are correct.
 
-## 2026-05-12: Streaming Timeline Plot Uses Stream Time
+## 2026-05-12: Phase Timeline Plot Uses Stream Time For Streaming Runs
 
-- Updated `runner/cli.py::_write_png_streaming_phase_timeline()` so the x-axis
-  is stream/video time rather than first-prompt-relative time.
+- Updated `runner/cli.py::_write_png_phase_timeline()` so the x-axis
+  is stream/video time rather than first-prompt-relative time for streaming
+  runs. The same function now also writes offline image, multi-image, and video
+  phase timelines as `png/phase_timeline.png`.
 - The function reads `stream_events.csv`, derives the elapsed-time to video-time
   offset from the first frame/buffer event, and converts all phase rows before
   plotting.
@@ -481,7 +484,7 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     `DynamicKVGrow` rows. The validated row records `kv_pos=1024`,
     `kv_total=2048`, `kv_estimated_used_kb=28672`,
     `kv_physical_committed_kb=57344`, and token detail
-    `1024->2048/32768 cells; 28.00->56.00 MiB`. The streaming timeline plot
+    `1024->2048/32768 cells; 28.00->56.00 MiB`. The common phase timeline plot
     includes this row as a visible KV grow marker. The runner also writes
     `memory_timeline_decode_window.png`, a zoomed memory plot from the first
     `V_Encode` start to the final decode end with `DynamicKVGrow` annotated.

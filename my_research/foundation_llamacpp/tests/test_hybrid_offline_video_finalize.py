@@ -25,6 +25,7 @@ def test_hybrid_offline_finalize_writes_phase_csv_when_phase_artifacts_exist(tmp
     monkeypatch.setattr(runner_cli, "_write_png_memory_timeline", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner_cli, "_write_png_phase_duration_from_rows", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner_cli, "_write_png_phase_duration", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_cli, "_write_png_phase_timeline", lambda *_args, **_kwargs: None)
 
     runner_cli._finalize_hybrid_outputs(result_dir)
 

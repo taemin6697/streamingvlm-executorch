@@ -38,16 +38,16 @@ def test_future_chunked_mode_name_is_documented():
 def test_streaming_timeline_aliases_vision_prefill_to_standard_lanes():
     source = STREAMING_CPP.read_text()
 
-    assert runner_cli._streaming_timeline_phase_name("VisionPrefillV_Encode") == "V_Encode"
-    assert runner_cli._streaming_timeline_phase_name("VisionPrefillMmproj") == "Mmproj"
-    assert runner_cli._streaming_timeline_phase_name("VisionPrefillImagePrefill") == "ImagePrefill"
-    assert runner_cli._streaming_timeline_phase_name("VisionPrefillT_Prefill") == "T_Prefill"
-    assert runner_cli._streaming_timeline_phase_name("SingleBufferUpdate") == "SingleBufferUpdate"
-    assert runner_cli._streaming_timeline_phase_name("D") == "D"
+    assert runner_cli._phase_timeline_name("VisionPrefillV_Encode") == "V_Encode"
+    assert runner_cli._phase_timeline_name("VisionPrefillMmproj") == "Mmproj"
+    assert runner_cli._phase_timeline_name("VisionPrefillImagePrefill") == "ImagePrefill"
+    assert runner_cli._phase_timeline_name("VisionPrefillT_Prefill") == "T_Prefill"
+    assert runner_cli._phase_timeline_name("SingleBufferUpdate") == "SingleBufferUpdate"
+    assert runner_cli._phase_timeline_name("D") == "Decode"
 
-    assert runner_cli._streaming_timeline_phase_name("VisionPrefillCacheBuild") is None
-    assert runner_cli._streaming_timeline_phase_name("VisionPrefillCacheSave") is None
-    assert runner_cli._streaming_timeline_phase_name("VisionPrefillCacheRestore") is None
+    assert runner_cli._phase_timeline_name("VisionPrefillCacheBuild") is None
+    assert runner_cli._phase_timeline_name("VisionPrefillCacheSave") is None
+    assert runner_cli._phase_timeline_name("VisionPrefillCacheRestore") is None
 
     assert "drop_pending_cache_updates" not in source
 
@@ -125,4 +125,4 @@ def test_sliding_window_keeps_multiturn_text_history():
 
 
 def test_streaming_timeline_starts_at_stream_origin():
-    assert runner_cli._streaming_timeline_origin(0.0, [5.0, 8.0], []) == 0.0
+    assert runner_cli._phase_timeline_origin(0.0, [5.0, 8.0], [], stream_time=True) == 0.0

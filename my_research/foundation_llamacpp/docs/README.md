@@ -128,7 +128,7 @@ csv/
 
 png/
   Plots such as memory_timeline_plot.png, phase_duration_stacked_bar.png,
-  streaming_phase_timeline.png, and dynamic_kv_grow_breakdown_stacked_bar.png.
+  phase_timeline.png, and dynamic_kv_grow_breakdown_stacked_bar.png.
 
 txt_json/
   Text and JSON logs such as foundation_output.txt, token traces, exit codes,
@@ -165,8 +165,9 @@ csv/foundation_proc.csv
 csv/streaming_phase_stats.csv / csv/stream_events.csv
   Streaming-only timing and event logs.
 
-png/streaming_phase_timeline.png
-  Streaming timeline plot.
+png/phase_timeline.png
+  Common phase timeline plot. Image, multi-image, and offline-video runs use
+  elapsed time; streaming runs use stream/video time from the first frame event.
 
 txt_json/memory_usage_summary.txt / png/memory_timeline_plot.png
   Android system memory summary and plot.
@@ -179,6 +180,13 @@ png/dynamic_kv_grow_breakdown_stacked_bar.png
   Grow breakdown builds only. Separate stacked bar chart for the alloc,
   metadata, copy, and scheduler-reserve sub-spans inside each `DynamicKVGrow`
   window.
+
+png/phase_duration_stacked_bar.png
+  Common runtime duration stack. It uses the same visible phase labels as
+  `phase_timeline.png`: `V_Encode`, `Mmproj`, `ImagePrefill`, `T_Prefill`,
+  `DynamicKVGrow`, and `Decode`. Dynamic KV breakdown sub-rows are excluded
+  from this aggregate plot and remain in
+  `dynamic_kv_grow_breakdown_stacked_bar.png`.
 ```
 
 Artifact layout smoke:
@@ -694,7 +702,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
 
 The second run should report a `DynamicKVGrow` row like
 `1024->16384/32768 cells; 28.00->448.00 MiB` in `foundation_proc.csv`, and the
-same marker should appear in `streaming_phase_timeline.png` and
+same marker should appear in `phase_timeline.png` and
 `memory_timeline_decode_window.png`. Current OpenCL builds should also log
 `reset_capacity: dynamic KV data migration used device-to-device copy`; the
 validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
@@ -778,7 +786,7 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
   the active `main` implementation.
   New builds write grow timestamps with the same `ggml_time_ms()` clock used by
   streaming phase timers, so retry-side prefill rows can be separated from grow
-  time in `foundation_proc.csv` and `streaming_phase_timeline.png`. On the
+  time in `foundation_proc.csv` and `phase_timeline.png`. On the
   `codex/dynamic-kv-grow-breakdown` branch, stdout also records alloc,
   metadata, copy, and scheduler-reserve sub-spans. Those sub-spans stay out of
   the main streaming timeline and are visualized in
@@ -799,9 +807,11 @@ streaming_phase_stats.csv / foundation_proc.csv
   `VisionPrefillImagePrefill`, and `VisionPrefillT_Prefill` onto the normal
   lanes, while cache-management rows are hidden.
 
-streaming_phase_timeline.png
-  Prompt-time timeline plot. The x-axis uses stream/video time, so a prompt at
-  3s is labeled around 3s rather than being rebased to 0s.
+phase_timeline.png
+  Common phase timeline plot. For streaming runs, the x-axis uses stream/video
+  time, so a prompt at 3s is labeled around 3s rather than being rebased to 0s.
+  For image, multi-image, and offline-video runs, the x-axis uses elapsed run
+  time.
 ```
 
 Notes:

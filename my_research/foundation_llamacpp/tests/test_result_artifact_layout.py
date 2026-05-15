@@ -12,7 +12,7 @@ def test_organize_result_artifacts_moves_run_files_into_three_folders(tmp_path):
     result_dir.mkdir()
     for name, text in {
         "foundation_proc.csv": "row_type,total_ms\nDecode,1\n",
-        "streaming_phase_timeline.png": "png-bytes",
+        "phase_timeline.png": "png-bytes",
         "foundation_output.txt": "assistant output",
         "media_manifest.json": "{}\n",
         "vision_embedding.svlmemb": "raw embedding",
@@ -22,7 +22,7 @@ def test_organize_result_artifacts_moves_run_files_into_three_folders(tmp_path):
     runner_cli._organize_result_artifacts(result_dir)
 
     assert (result_dir / "csv" / "foundation_proc.csv").exists()
-    assert (result_dir / "png" / "streaming_phase_timeline.png").exists()
+    assert (result_dir / "png" / "phase_timeline.png").exists()
     assert (result_dir / "txt_json" / "foundation_output.txt").exists()
     assert (result_dir / "txt_json" / "media_manifest.json").exists()
     assert (result_dir / "txt_json" / "vision_embedding.svlmemb").exists()

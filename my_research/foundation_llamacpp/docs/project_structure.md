@@ -727,7 +727,7 @@ run_android_hybrid_bridge.py --processor gpu --streaming-video ... --single-buff
   -> prompt job records current frame at arrival time
   -> consumer lane serially runs eval_message() and generate_response()
   -> output stream_events.csv, streaming_phase_stats.csv, per-turn token traces
-  -> runner finalizes foundation_proc.csv and streaming_phase_timeline.png
+  -> runner finalizes foundation_proc.csv, phase_duration_stacked_bar.png, and phase_timeline.png
 ```
 
 OpenCL streaming uses llama.cpp/mtmd for `V_Encode` and `Mmproj`. It is useful
@@ -749,7 +749,7 @@ run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --single-b
   -> eval_with_external_embedding() runs decoder-side mmproj and prefill
   -> generate_response() decodes with preserved chat/KV state
   -> output stream_events.csv, streaming_phase_stats.csv, per-turn token traces
-  -> runner finalizes foundation_proc.csv and streaming_phase_timeline.png
+  -> runner finalizes foundation_proc.csv, phase_duration_stacked_bar.png, and phase_timeline.png
 ```
 
 Hybrid streaming QNN phase timing is rebased onto the llama.cpp `ggml_time_ms()`
@@ -869,7 +869,9 @@ txt_json/memory_usage_summary.txt:
   post-processed memory summary
 
 png/phase_duration_stacked_bar.png:
-  runtime phase plot when matplotlib is available
+  common runtime duration stack when matplotlib is available. It uses the same
+  visible labels as `phase_timeline.png` and keeps dynamic-KV breakdown
+  sub-spans out of the aggregate bar.
 
 png/memory_timeline_plot.png:
   memory timeline plot when matplotlib is available
@@ -886,9 +888,10 @@ csv/streaming_phase_stats.csv:
   hybrid streaming runs include a `clock_origin_ms` comment so stdout
   `DynamicKVGrow` logs can be aligned to the same `ggml_time_ms()` source.
 
-png/streaming_phase_timeline.png:
-  horizontal prompt timeline plot. X-axis is stream/video time, not first-prompt
-  relative time.
+png/phase_timeline.png:
+  common phase timeline plot. Image, multi-image, and offline-video runs use
+  elapsed time; streaming runs use stream/video time, not first-prompt relative
+  time.
 
 DynamicKVGrow:
   synthetic dynamic KV expansion row inserted during finalization. New runs use

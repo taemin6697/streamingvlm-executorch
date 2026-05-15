@@ -44,18 +44,19 @@ def test_streaming_timeline_shows_only_aggregate_dynamic_kv_grow_lane():
     runner_cli_source = RUNNER_CLI.read_text()
 
     phase_name_body = runner_cli_source[
-        runner_cli_source.index("def _streaming_timeline_phase_name"):
-        runner_cli_source.index("def _streaming_timeline_origin")
+        runner_cli_source.index("def _phase_timeline_name"):
+        runner_cli_source.index("def _phase_timeline_origin")
     ]
     timeline_body = runner_cli_source[
-        runner_cli_source.index("def _write_png_streaming_phase_timeline"):
+        runner_cli_source.index("def _write_png_phase_timeline"):
         runner_cli_source.index("def _finalize_hybrid_outputs")
     ]
 
-    assert "\"DynamicKVGrow\"" in phase_name_body
-    assert "\"DynamicKVGrow\"," in timeline_body
+    assert "PHASE_TIMELINE_VISIBLE" in phase_name_body
+    assert "PHASE_TIMELINE_VISIBLE" in timeline_body
+    assert runner_cli._phase_timeline_name("DynamicKVGrow") == "DynamicKVGrow"
     for phase in runner_cli.DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values():
-        assert runner_cli._streaming_timeline_phase_name(phase) is None
+        assert runner_cli._phase_timeline_name(phase) is None
         assert f'"{phase}",' not in timeline_body
 
 

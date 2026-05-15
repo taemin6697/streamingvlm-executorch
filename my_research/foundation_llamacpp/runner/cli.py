@@ -47,6 +47,42 @@ DYNAMIC_KV_GROW_BREAKDOWN_PHASES = {
     "scheduler_reserve": "DynamicKVGrowSchedulerReserve",
 }
 RESULT_ARTIFACT_DIRS = ("csv", "png", "txt_json")
+PHASE_PLOT_ALIASES = {
+    "D": "Decode",
+    "I_Prefill": "ImagePrefill",
+    "VisionPrefillV_Encode": "V_Encode",
+    "VisionPrefillMmproj": "Mmproj",
+    "VisionPrefillImagePrefill": "ImagePrefill",
+    "VisionPrefillT_Prefill": "T_Prefill",
+}
+PHASE_PLOT_EXCLUDED = {
+    "EmbeddingFileWrite",
+    "ExternalEmbeddingRead",
+    "ImageLoad",
+    "L_DecoderLoad",
+    "L_DecoderRuntimeInit",
+    "L_VisionLoad",
+    "LayoutTokenize",
+    "StreamPromptPrefill",
+    "VisionPrefillCacheAppendRestore",
+    "VisionPrefillCacheBuild",
+    "VisionPrefillCacheHit",
+    "VisionPrefillCacheRestore",
+    "VisionPrefillCacheSave",
+    "VisionPrefillImageLoad",
+    "VisionPrefillLayoutTokenize",
+    "VisionPrefillSuffixTokenize",
+    *DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values(),
+}
+PHASE_TIMELINE_VISIBLE = [
+    "SingleBufferUpdate",
+    "V_Encode",
+    "Mmproj",
+    "ImagePrefill",
+    "T_Prefill",
+    "DynamicKVGrow",
+    "Decode",
+]
 
 
 def _result_artifact_folder(path: Path) -> str:
@@ -908,6 +944,45 @@ def _write_png_memory_timeline_decode_window(
     plt.close(fig)
 
 
+def _phase_plot_name(name: str) -> str | None:
+    canonical = PHASE_PLOT_ALIASES.get(name, name)
+    if canonical in PHASE_PLOT_EXCLUDED or name in PHASE_PLOT_EXCLUDED:
+        return None
+    return canonical
+
+
+def _phase_duration_breakdown(phase_rows: list[dict[str, str]]) -> list[tuple[str, float]]:
+    durations: dict[str, float] = {}
+    first_start_s: dict[str, float] = {}
+    has_decode_summary = any(row.get("row_type") == "Decode" for row in phase_rows)
+    has_detailed_prefill = any(
+        _phase_plot_name(row.get("row_type", "")) in {"ImagePrefill", "T_Prefill", "Mmproj"}
+        for row in phase_rows
+    )
+    for row in phase_rows:
+        raw_name = row.get("row_type", "")
+        name = _phase_plot_name(raw_name)
+        if name is None:
+            continue
+        if name == "Prefill" and has_detailed_prefill:
+            continue
+        if raw_name == "D" and has_decode_summary:
+            continue
+        start_s = _phase_float(row, "elapsed_s_start")
+        duration = max(_phase_float(row, "elapsed_s_end") - start_s, 0.0)
+        if duration > 0:
+            durations[name] = durations.get(name, 0.0) + duration
+            first_start_s[name] = min(first_start_s.get(name, start_s), start_s)
+    return sorted(
+        durations.items(),
+        key=lambda item: (
+            PHASE_TIMELINE_VISIBLE.index(item[0]) if item[0] in PHASE_TIMELINE_VISIBLE else 999,
+            first_start_s.get(item[0], float("inf")),
+            item[0],
+        ),
+    )
+
+
 def _write_png_phase_duration(output_dir: Path, perf: dict[str, float]) -> None:
     try:
         import matplotlib
@@ -918,10 +993,10 @@ def _write_png_phase_duration(output_dir: Path, perf: dict[str, float]) -> None:
         return
     phases = [
         ("Load", perf.get("load_time_ms", 0.0)),
-        ("QNN Vision Encoder", perf.get("qnn_vision_encode_ms", 0.0)),
-        ("External Image Decode", perf.get("external_image_decode_ms", 0.0)),
-        ("Prompt Eval", perf.get("prompt_eval_time_ms", 0.0)),
-        ("Token Decode", perf.get("decode_eval_time_ms", 0.0)),
+        ("V_Encode", perf.get("qnn_vision_encode_ms", 0.0)),
+        ("ImagePrefill", perf.get("external_image_decode_ms", 0.0)),
+        ("Prefill", perf.get("prompt_eval_time_ms", 0.0)),
+        ("Decode", perf.get("decode_eval_time_ms", 0.0)),
     ]
     phases = [(name, value) for name, value in phases if value > 0]
     if not phases:
@@ -929,7 +1004,8 @@ def _write_png_phase_duration(output_dir: Path, perf: dict[str, float]) -> None:
     total = sum(value for _, value in phases)
     fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=160)
     bottom = 0.0
-    colors = ["#6c5ce7", "#00b894", "#0984e3", "#e17055", "#d63031"]
+    phase_colors = _phase_colors()
+    colors = [phase_colors.get(name, "#636e72") for name, _ in phases]
     for idx, (name, value) in enumerate(phases):
         color = colors[idx % len(colors)]
         ax.bar(["total"], [value], bottom=bottom, color=color, edgecolor="white")
@@ -969,41 +1045,7 @@ def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[
         import matplotlib.pyplot as plt
     except Exception:
         return
-    excluded_from_plot = {
-        "EmbeddingFileWrite",
-        "ExternalEmbeddingRead",
-        "ImageLoad",
-        "L_DecoderLoad",
-        "L_DecoderRuntimeInit",
-        "L_VisionLoad",
-        "LayoutTokenize",
-        *DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values(),
-    }
-    durations: dict[str, float] = {}
-    first_start_s: dict[str, float] = {}
-    has_decode_summary = any(row.get("row_type") == "Decode" for row in phase_rows)
-    has_detailed_prefill = any(row.get("row_type") in {"ImagePrefill", "T_Prefill", "Mmproj"} for row in phase_rows)
-    for row in phase_rows:
-        name = row.get("row_type", "")
-        if name in excluded_from_plot:
-            continue
-        if name == "Prefill" and has_detailed_prefill:
-            continue
-        if name == "D" and has_decode_summary:
-            continue
-        if name == "ImagePrefill":
-            normalized = "I_Prefill"
-        else:
-            normalized = "Decode" if name == "D" else name
-        start_s = _phase_float(row, "elapsed_s_start")
-        duration = max(_phase_float(row, "elapsed_s_end") - start_s, 0.0)
-        if duration > 0:
-            durations[normalized] = durations.get(normalized, 0.0) + duration
-            first_start_s[normalized] = min(first_start_s.get(normalized, start_s), start_s)
-    phases = sorted(
-        durations.items(),
-        key=lambda item: (first_start_s.get(item[0], float("inf")), item[0]),
-    )
+    phases = _phase_duration_breakdown(phase_rows)
     if not phases:
         return
     total = sum(value for _, value in phases)
@@ -1153,36 +1195,34 @@ def _write_png_dynamic_kv_grow_breakdown(output_dir: Path, phase_rows: list[dict
     plt.close(fig)
 
 
-def _streaming_timeline_phase_name(name: str) -> str | None:
-    aliases = {
-        "VisionPrefillV_Encode": "V_Encode",
-        "VisionPrefillMmproj": "Mmproj",
-        "VisionPrefillImagePrefill": "ImagePrefill",
-        "VisionPrefillT_Prefill": "T_Prefill",
-    }
-    name = aliases.get(name, name)
-    if name in {
-        "SingleBufferUpdate",
-        "V_Encode",
-        "Mmproj",
-        "ImagePrefill",
-        "T_Prefill",
-        "DynamicKVGrow",
-        "D",
-    }:
-        return name
+def _result_artifact_path(result_dir: Path, name: str) -> Path:
+    path = result_dir / name
+    if path.exists():
+        return path
+    return result_dir / _result_artifact_folder(path) / name
+
+
+def _phase_timeline_name(name: str) -> str | None:
+    canonical = _phase_plot_name(name)
+    if canonical in PHASE_TIMELINE_VISIBLE:
+        return canonical
     return None
 
 
-def _streaming_timeline_origin(
+def _phase_timeline_origin(
     stream_origin_video: float,
     prompt_markers: list[float],
     phases: list[tuple[str, float, float, int]],
+    *,
+    stream_time: bool,
 ) -> float:
-    return stream_origin_video
+    if stream_time:
+        return stream_origin_video
+    starts = [start for _, start, _, _ in phases]
+    return min(starts) if starts else 0.0
 
 
-def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]) -> None:
+def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]], *, stream_time: bool = False) -> None:
     if not phase_rows:
         return
     try:
@@ -1194,9 +1234,9 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
     except Exception:
         return
 
-    stream_origin_elapsed = 0.0
+    stream_origin_elapsed = min((_phase_float(row, "elapsed_s_start") for row in phase_rows), default=0.0)
     stream_origin_video = 0.0
-    events_path = output_dir / "stream_events.csv"
+    events_path = _result_artifact_path(output_dir, "stream_events.csv")
     if events_path.exists():
         for event_row in _read_csv_dicts(events_path):
             if event_row.get("event") not in {"StreamFrameEnqueue", "SingleBufferUpdate"}:
@@ -1208,7 +1248,9 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
             except ValueError:
                 continue
 
-    def to_stream_time(elapsed_s: float) -> float:
+    def to_plot_time(elapsed_s: float) -> float:
+        if not stream_time:
+            return elapsed_s
         return elapsed_s - stream_origin_elapsed + stream_origin_video
 
     phases: list[tuple[str, float, float, int]] = []
@@ -1220,21 +1262,21 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
         end = _phase_float(row, "elapsed_s_end")
         if name == "StreamPromptPrefill":
             prompt_idx += 1
-            prompt_markers.append(to_stream_time(start))
+            prompt_markers.append(to_plot_time(start))
             continue
-        display_name = _streaming_timeline_phase_name(name)
+        display_name = _phase_timeline_name(name)
         if display_name is None:
             continue
         if end <= start:
             if display_name != "SingleBufferUpdate":
                 continue
             end = start + 0.015
-        phases.append((display_name, to_stream_time(start), to_stream_time(end), max(prompt_idx, 0)))
+        phases.append((display_name, to_plot_time(start), to_plot_time(end), max(prompt_idx, 0)))
     if not phases:
         return
 
-    timeline_origin = _streaming_timeline_origin(stream_origin_video, prompt_markers, phases)
-    decode_ends = [end for name, _, end, _ in phases if name == "D" and end >= timeline_origin]
+    timeline_origin = _phase_timeline_origin(stream_origin_video, prompt_markers, phases, stream_time=stream_time)
+    decode_ends = [end for name, _, end, _ in phases if name == "Decode" and end >= timeline_origin]
     timeline_end = max(decode_ends) if decode_ends else max(end for _, _, end, _ in phases)
     phases = [
         (name, start, end, idx)
@@ -1249,15 +1291,7 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
     if not phases:
         return
 
-    visible = [
-        "SingleBufferUpdate",
-        "V_Encode",
-        "Mmproj",
-        "ImagePrefill",
-        "T_Prefill",
-        "DynamicKVGrow",
-        "D",
-    ]
+    visible = [name for name in PHASE_TIMELINE_VISIBLE if any(phase[0] == name for phase in phases)]
     y_for = {name: idx for idx, name in enumerate(visible)}
     colors = _phase_colors()
     fig_height = max(4.8, 0.48 * len(visible) + 1.8)
@@ -1289,14 +1323,12 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
             alpha=alpha,
         )
         duration_ms = (end - start) * 1000.0
-        if name != "D" and duration_ms >= 20.0:
+        if name != "Decode" and duration_ms >= 20.0:
             label = f"{duration_ms:.0f}ms"
             if name in {"V_Encode", "ImagePrefill", "T_Prefill"}:
                 label = f"P{idx} {label}"
             if name == "DynamicKVGrow":
                 label = f"KV +{duration_ms:.0f}ms"
-            if name in DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values():
-                label = f"{name.removeprefix('DynamicKVGrow')}\n{duration_ms:.0f}ms"
             ax.text(
                 start + (end - start) / 2.0,
                 y,
@@ -1325,8 +1357,8 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
     ax.set_yticks(list(y_for.values()))
     ax.set_yticklabels(visible)
     ax.invert_yaxis()
-    ax.set_xlabel("Stream Time (s)")
-    ax.set_title(f"Streaming Prompt Timeline: {output_dir.name}")
+    ax.set_xlabel("Stream Time (s)" if stream_time else "Elapsed Time (s)")
+    ax.set_title(f"Phase Timeline: {output_dir.name}")
     ax.grid(True, axis="x", linestyle=":", alpha=0.35)
     xmax = max(timeline_end, timeline_origin + 0.1)
     ax.set_xlim(left=timeline_origin, right=max(xmax * 1.02, xmax + 0.1))
@@ -1335,7 +1367,7 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
     if handles:
         ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
     fig.tight_layout()
-    fig.savefig(output_dir / "streaming_phase_timeline.png", bbox_inches="tight")
+    fig.savefig(output_dir / "phase_timeline.png", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1422,6 +1454,7 @@ def _finalize_hybrid_outputs(result_dir: Path) -> None:
     if plot_phase_rows:
         _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
         _write_png_dynamic_kv_grow_breakdown(result_dir, plot_phase_rows)
+        _write_png_phase_timeline(result_dir, plot_phase_rows)
     else:
         _write_png_phase_duration(result_dir, perf)
 
@@ -1476,7 +1509,7 @@ def _finalize_hybrid_streaming_outputs(result_dir: Path) -> None:
     if plot_phase_rows:
         _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
         _write_png_dynamic_kv_grow_breakdown(result_dir, plot_phase_rows)
-        _write_png_streaming_phase_timeline(result_dir, plot_phase_rows)
+        _write_png_phase_timeline(result_dir, plot_phase_rows, stream_time=True)
 
 
 def _finalize_standalone_outputs(
@@ -1547,6 +1580,7 @@ def _finalize_standalone_outputs(
     _write_png_memory_timeline(result_dir, memory_rows, memory_phase_rows)
     if plot_phase_rows:
         _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
+        _write_png_phase_timeline(result_dir, plot_phase_rows)
     else:
         perf = {key: float(value) for key, value in summary.items() if key.endswith("_ms") and isinstance(value, (int, float))}
         _write_png_phase_duration(result_dir, perf)
