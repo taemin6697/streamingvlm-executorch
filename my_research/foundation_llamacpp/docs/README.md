@@ -104,33 +104,53 @@ Common arguments used by most runs:
 Result directory format:
 
 ```text
-<GGUF_stem>_<processor>_ctx_<N>[_text|_streaming]_kv<KV>
+<GGUF_stem>_<processor>_ctx_<N>_<media>_kv<KV>
 ```
 
 Examples:
 
 ```text
 InternVL3-2B-Instruct-Q8_0_cpu_ctx_4096_text_kv16
-InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_kv16
+InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_image_kv16
+InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_multi_image_kv16
+InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_video_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_kv16
+InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_sliding_window_kv16
+InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16
+```
+
+Each run directory is normalized into three report folders after finalization:
+
+```text
+csv/
+  CSV tables such as foundation_proc.csv, foundation_summary.csv,
+  android_memory_timeline.csv, stream_events.csv, and phase stats.
+
+png/
+  Plots such as memory_timeline_plot.png, phase_duration_stacked_bar.png,
+  streaming_phase_timeline.png, and dynamic_kv_grow_breakdown_stacked_bar.png.
+
+txt_json/
+  Text and JSON logs such as foundation_output.txt, token traces, exit codes,
+  host_adb_output.txt, media_manifest.json, and raw handoff/debug artifacts.
 ```
 
 Important output files:
 
 ```text
-foundation_output.txt
+txt_json/foundation_output.txt
   Model output transcript.
 
-foundation_token_io.txt
+txt_json/foundation_token_io.txt
   Compact token input/output transcript.
 
-foundation_inference_tokens.txt
+txt_json/foundation_inference_tokens.txt
   Raw token trace. Streaming mode appends every prompt turn.
 
-stream_inference_tokens_<idx>.txt
+txt_json/stream_inference_tokens_<idx>.txt
   Per-turn raw token traces for streaming mode.
 
-foundation_proc.csv
+csv/foundation_proc.csv
   Canonical phase timing CSV. Dynamic KV runs add `DynamicKVGrow` rows when
   physical KV capacity increases. For these rows, `kv_pos` is the old cell
   count, `kv_total` is the new cell count, `kv_estimated_used_kb` is the old
@@ -142,24 +162,36 @@ foundation_proc.csv
   `DynamicKVGrowSchedulerReserve` rows. These are sub-spans inside the aggregate
   `DynamicKVGrow` window.
 
-streaming_phase_stats.csv / stream_events.csv
+csv/streaming_phase_stats.csv / csv/stream_events.csv
   Streaming-only timing and event logs.
 
-streaming_phase_timeline.png
+png/streaming_phase_timeline.png
   Streaming timeline plot.
 
-memory_usage_summary.txt / memory_timeline_plot.png
+txt_json/memory_usage_summary.txt / png/memory_timeline_plot.png
   Android system memory summary and plot.
 
-memory_timeline_decode_window.png
+png/memory_timeline_decode_window.png
   Zoomed memory plot from first `V_Encode` start to final decode end. Dynamic
   KV runs mark `DynamicKVGrow` with the cell and MiB growth detail.
 
-dynamic_kv_grow_breakdown_stacked_bar.png
+png/dynamic_kv_grow_breakdown_stacked_bar.png
   Grow breakdown builds only. Separate stacked bar chart for the alloc,
   metadata, copy, and scheduler-reserve sub-spans inside each `DynamicKVGrow`
   window.
 ```
+
+Artifact layout smoke:
+
+```bash
+my_research/foundation_llamacpp/scripts/run_artifact_layout_1b_q8.sh
+```
+
+This runs 1B Q8 hybrid single-image, multi-image, offline video, single-buffer
+streaming, sliding-window streaming, vision-prefill streaming, and
+vision-prefill streaming with dynamic KV growth (`--kv-init-size 512`,
+`--kv-grow-step 512`). It deliberately does not force-push models; the remote
+root must already contain the 1B Q8 GGUF, mmproj, and vision PTE files.
 
 ## Single Text Input
 
@@ -349,6 +381,46 @@ Useful:
 
   --force-push
     Recreate remote workdir and avoid stale inputs.
+```
+
+## Multiple Image Input
+
+Use `--images` for InternVL-style multi-image prompts. The runner normalizes
+each image as one 448 x 448 input, builds this prompt prefix, and writes the
+same `csv/`, `png/`, `txt_json/` artifact folders as single-image runs:
+
+```text
+Image-1: <img>...</img>
+Image-2: <img>...</img>
+question text
+```
+
+Example:
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor gpu \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --images \
+    my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+    my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg \
+  --prompt "Compare these two images briefly." \
+  --n-predict 64 \
+  --threads 4 \
+  --gpu-layers 99 \
+  --device GPUOpenCL \
+  --ctx-size 4096 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --temperature 0.0 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --fit off \
+  --baseline-window 5.0 \
+  --remote-root /data/local/tmp/streamingvlm_unified \
+  --results-root my_research/foundation_llamacpp/results/log
 ```
 
 ## Video Input

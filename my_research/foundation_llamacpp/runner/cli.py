@@ -46,6 +46,40 @@ DYNAMIC_KV_GROW_BREAKDOWN_PHASES = {
     "copy": "DynamicKVGrowCopy",
     "scheduler_reserve": "DynamicKVGrowSchedulerReserve",
 }
+RESULT_ARTIFACT_DIRS = ("csv", "png", "txt_json")
+
+
+def _result_artifact_folder(path: Path) -> str:
+    if path.suffix == ".csv":
+        return "csv"
+    if path.suffix == ".png":
+        return "png"
+    return "txt_json"
+
+
+def _clear_result_artifact_dirs(result_dir: Path) -> None:
+    for path in result_dir.iterdir():
+        if path.is_file():
+            path.unlink()
+    for dirname in RESULT_ARTIFACT_DIRS:
+        artifact_dir = result_dir / dirname
+        if not artifact_dir.exists():
+            continue
+        for path in artifact_dir.iterdir():
+            if path.is_file():
+                path.unlink()
+
+
+def _organize_result_artifacts(result_dir: Path) -> None:
+    for dirname in RESULT_ARTIFACT_DIRS:
+        (result_dir / dirname).mkdir(parents=True, exist_ok=True)
+    for path in list(result_dir.iterdir()):
+        if not path.is_file():
+            continue
+        destination = result_dir / _result_artifact_folder(path) / path.name
+        if destination.exists():
+            destination.unlink()
+        path.replace(destination)
 
 
 def _standalone_completion_mode(args: argparse.Namespace) -> bool:
@@ -53,6 +87,7 @@ def _standalone_completion_mode(args: argparse.Namespace) -> bool:
     return (
         args.processor in ("cpu", "gpu")
         and getattr(args, "image", None) is None
+        and getattr(args, "images", None) is None
         and getattr(args, "video", None) is None
         and getattr(args, "streaming_video", None) is None
     )
@@ -1544,6 +1579,7 @@ def _result_model_name(
     cache_type_v: str | None = None,
     *,
     text_only: bool = False,
+    media_mode: str | None = None,
     streaming: bool = False,
     stream_mode: str | None = None,
     dynamic_kv_cache: bool = False,
@@ -1553,8 +1589,16 @@ def _result_model_name(
     if streaming:
         mode_suffix = "" if stream_mode in (None, "single_buffer") else f"_{stream_mode}"
         mid = f"_streaming{mode_suffix}"
+    elif text_only:
+        mid = "_text"
+    elif media_mode == "multi_image":
+        mid = "_multi_image"
+    elif media_mode == "video_file":
+        mid = "_video"
+    elif media_mode == "image":
+        mid = "_image"
     else:
-        mid = "_text" if text_only else ""
+        mid = ""
     dynamic = "_dynamic" if dynamic_kv_cache else ""
     return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}"
 
@@ -2099,6 +2143,13 @@ def main() -> int:
         help="Input image for vision. Omit on cpu/gpu for text-only generation (llama-completion). Mutually exclusive with --video.",
     )
     parser.add_argument(
+        "--images",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="Multiple input images for InternVL multi-image prompts. Mutually exclusive with --image/--video/--streaming-video.",
+    )
+    parser.add_argument(
         "--warmup-image",
         type=Path,
         default=DEFAULT_WARMUP_IMAGE,
@@ -2335,9 +2386,9 @@ def main() -> int:
         raise SystemExit("--window-sec must be positive when provided.")
     if args.window_max_frames <= 0:
         raise SystemExit("--window-max-frames must be positive.")
-    selected_media_count = sum(x is not None for x in (args.image, args.video, args.streaming_video))
+    selected_media_count = sum(x is not None for x in (args.image, args.images, args.video, args.streaming_video))
     if selected_media_count > 1:
-        raise SystemExit("--image, --video, and --streaming-video are mutually exclusive.")
+        raise SystemExit("--image, --images, --video, and --streaming-video are mutually exclusive.")
     if args.streaming_video is not None:
         if args.sampling_fps is None or args.sampling_fps <= 0:
             raise SystemExit("--streaming-video requires positive --sampling-fps.")
@@ -2358,13 +2409,15 @@ def main() -> int:
         args.vision_build_dir = args.vision_build_dir.resolve()
 
     if args.processor == "hybrid":
-        if args.image is None and args.video is None and args.streaming_video is None:
-            raise SystemExit("--processor hybrid requires --image, --video, or --streaming-video.")
+        if args.image is None and args.images is None and args.video is None and args.streaming_video is None:
+            raise SystemExit("--processor hybrid requires --image, --images, --video, or --streaming-video.")
         if args.mmproj is None:
             raise SystemExit("--processor hybrid requires --mmproj.")
         args.mmproj = args.mmproj.resolve()
         if args.image is not None:
             args.image = args.image.resolve()
+        if args.images is not None:
+            args.images = [image.resolve() for image in args.images]
         if args.video is not None:
             args.video = args.video.resolve()
         if args.streaming_video is not None:
@@ -2381,6 +2434,8 @@ def main() -> int:
         args.mmproj = args.mmproj.resolve()
         if args.image is not None:
             args.image = args.image.resolve()
+        if args.images is not None:
+            args.images = [image.resolve() for image in args.images]
         if args.video is not None:
             args.video = args.video.resolve()
         if args.streaming_video is not None and args.processor != "gpu":
@@ -2391,6 +2446,8 @@ def main() -> int:
         exist_paths.append(args.mmproj)
     if args.image is not None:
         exist_paths.append(args.image)
+    if args.images is not None:
+        exist_paths.extend(args.images)
     if args.video is not None:
         exist_paths.append(args.video)
     if args.streaming_video is not None:
@@ -2425,11 +2482,13 @@ def main() -> int:
         args.cache_type_k,
         args.cache_type_v,
         text_only=_standalone_completion_mode(args),
+        media_mode=args.media_mode.value,
         streaming=args.streaming_video is not None,
         stream_mode=getattr(args, "stream_mode", None),
         dynamic_kv_cache=getattr(args, "dynamic_kv_cache", False),
     )
     result_dir.mkdir(parents=True, exist_ok=True)
+    _clear_result_artifact_dirs(result_dir)
 
     _push_llama_runtime(
         adb,
@@ -2540,6 +2599,7 @@ def main() -> int:
                 if not (result_dir / "foundation_exit_code.txt").exists():
                     (result_dir / "foundation_exit_code.txt").write_text(str(run_res.returncode), encoding="utf-8")
                 _finalize_hybrid_streaming_outputs(result_dir)
+                _organize_result_artifacts(result_dir)
                 return run_res.returncode
             else:
                 llama_cli = _find_executable(args.llama_build_dir, "llama-mtmd-cli")
@@ -2576,6 +2636,7 @@ def main() -> int:
             prompt=args.prompt,
             text_only=_standalone_completion_mode(args),
         )
+    _organize_result_artifacts(result_dir)
     return run_res.returncode
 
 

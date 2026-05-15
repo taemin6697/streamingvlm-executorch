@@ -827,52 +827,66 @@ Each run writes under:
 my_research/foundation_llamacpp/results/log/<model>_<backend>_ctx_<ctx>_kv<kv>/
 ```
 
+New runner outputs normalize each run directory into three subfolders:
+
+```text
+csv/
+  CSV phase, summary, event, and Android memory tables
+
+png/
+  matplotlib plots
+
+txt_json/
+  stdout, generated text, token traces, exit codes, manifests, and binary
+  handoff/debug artifacts
+```
+
 Core artifacts:
 
 ```text
-foundation_exit_code.txt:
+txt_json/foundation_exit_code.txt:
   runner-level exit code; must be 0 for success
 
-foundation_summary.csv:
+csv/foundation_summary.csv:
   high-level backend, runtime, throughput, and memory summary
 
-foundation_proc.csv:
+csv/foundation_proc.csv:
   normalized phase rows used for runtime plots
 
-foundation_output.txt:
+txt_json/foundation_output.txt:
   raw model output or decoder stdout copy
 
-foundation_token_io.txt:
+txt_json/foundation_token_io.txt:
   user/assistant text plus trace appendix when available
 
-foundation_inference_tokens.txt:
+txt_json/foundation_inference_tokens.txt:
   detailed chunk/token trace; best file for checking media chunk count
 
-android_memory_timeline.csv:
+csv/android_memory_timeline.csv:
   sampled Android memory timeline
 
-memory_usage_summary.txt:
+txt_json/memory_usage_summary.txt:
   post-processed memory summary
 
-phase_duration_stacked_bar.png:
+png/phase_duration_stacked_bar.png:
   runtime phase plot when matplotlib is available
 
-memory_timeline_plot.png:
+png/memory_timeline_plot.png:
   memory timeline plot when matplotlib is available
 ```
 
 Streaming artifacts:
 
 ```text
-stream_events.csv:
+csv/stream_events.csv:
   frame enqueue, SingleBufferUpdate, prompt arrival, and prompt decode spans
 
-streaming_phase_stats.csv:
+csv/streaming_phase_stats.csv:
   setup, buffer update, vision, mmproj, prefill, and decode phase rows. New
   hybrid streaming runs include a `clock_origin_ms` comment so stdout
   `DynamicKVGrow` logs can be aligned to the same `ggml_time_ms()` source.
 
-streaming_phase_timeline.png:
+png/streaming_phase_timeline.png:
   horizontal prompt timeline plot. X-axis is stream/video time, not first-prompt
   relative time.
 

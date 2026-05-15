@@ -195,6 +195,62 @@ def prepare_image_media(image: Path, work_dir: Path, prompt: str) -> PreparedMed
     )
 
 
+def prepare_multi_image_media(images: list[Path], work_dir: Path, prompt: str) -> PreparedMedia:
+    if not images:
+        raise SystemExit("--images requires at least one image path")
+    load_image = importlib.import_module("transformers.image_utils").load_image
+
+    frame_bins: list[Path] = []
+    layout_images: list[Path] = []
+    image_records: list[dict[str, object]] = []
+    for image_i, image in enumerate(images):
+        frame_bin = work_dir / f"image_{image_i:04d}.bin"
+        suffix = image.suffix if image.suffix else ".png"
+        layout_image = work_dir / f"image_{image_i + 1:04d}{suffix}"
+        normalize_image_to_bin(load_image(str(image)), frame_bin)
+        if image.resolve() != layout_image.resolve():
+            layout_image.write_bytes(image.read_bytes())
+        frame_bins.append(frame_bin)
+        layout_images.append(layout_image)
+        image_records.append(
+            {
+                "image": image_i + 1,
+                "source": str(image),
+                "num_patches": 1,
+                "bin": frame_bin.name,
+                "layout_image": layout_image.name,
+            }
+        )
+
+    media_prompt = "".join(
+        f"Image-{image_i + 1}: {MEDIA_MARKER}\n"
+        for image_i in range(len(images))
+    ) + prompt
+    metadata = {
+        "schema_version": MEDIA_MANIFEST_VERSION,
+        "source_kind": "multi_image",
+        "sources": [str(image) for image in images],
+        "num_patches_list": [1 for _ in images],
+        "frame_indices": list(range(len(images))),
+        "frame_bins": [path.name for path in frame_bins],
+        "layout_images": [path.name for path in layout_images],
+        "images": image_records,
+        "prompt": media_prompt,
+        "raw_prompt": prompt,
+    }
+    metadata_path = work_dir / "media_manifest.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return PreparedMedia(
+        frame_bins=frame_bins,
+        layout_images=layout_images,
+        prompt=media_prompt,
+        metadata_path=metadata_path,
+        num_patches_list=[1 for _ in images],
+        frame_indices=list(range(len(images))),
+        source_kind="multi_image",
+    )
+
+
 def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segments: int, max_num: int) -> PreparedMedia:
     from PIL import Image
 
@@ -399,6 +455,8 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
             window_max_frames=getattr(args, "window_max_frames", 8),
             single_buffer=getattr(args, "single_buffer", False),
         )
+    if getattr(args, "images", None) is not None:
+        return prepare_multi_image_media(args.images, work_dir, args.prompt)
     if args.video is not None:
         return prepare_video_media(
             args.video,
@@ -408,5 +466,5 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
             max_num=args.max_num,
         )
     if args.image is None:
-        raise SystemExit("media preparation requires --image or --video")
+        raise SystemExit("media preparation requires --image, --images, or --video")
     return prepare_image_media(args.image, work_dir, args.prompt)

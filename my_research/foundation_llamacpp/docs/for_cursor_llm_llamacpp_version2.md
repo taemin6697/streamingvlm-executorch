@@ -270,14 +270,22 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   - `--max-video-time` / `--max_video_time` caps sampled duration.
 - Result folder names now include `_streaming` for streaming runs, e.g.
   `InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_kv16`.
+- Finalized result folders now use a common artifact layout for image,
+  multi-image, offline video, and streaming runs:
+  - `csv/`: `foundation_proc.csv`, `foundation_summary.csv`, phase/event CSVs,
+    and Android memory CSVs.
+  - `png/`: memory, phase-duration, streaming timeline, and dynamic-KV
+    breakdown plots.
+  - `txt_json/`: stdout, generated output, token traces, exit codes,
+    `media_manifest.json`, and handoff/debug artifacts.
 - Streaming artifacts:
-  - `stream_events.csv`: frame enqueue, `SingleBufferUpdate`, prompt arrival,
-    and prompt decode spans.
-  - `streaming_phase_stats.csv`: setup, frame-buffer, vision, mmproj, prefill,
-    and decode phase rows.
-  - `foundation_proc.csv`: normalized copy of streaming phase rows.
-  - `streaming_phase_timeline.png`: prompt timeline plot.
-  - `stream_response_<idx>.txt`, `stream_token_io_<idx>.txt`,
+  - `csv/stream_events.csv`: frame enqueue, `SingleBufferUpdate`, prompt
+    arrival, and prompt decode spans.
+  - `csv/streaming_phase_stats.csv`: setup, frame-buffer, vision, mmproj,
+    prefill, and decode phase rows.
+  - `csv/foundation_proc.csv`: normalized copy of streaming phase rows.
+  - `png/streaming_phase_timeline.png`: prompt timeline plot.
+  - `txt_json/stream_response_<idx>.txt`, `txt_json/stream_token_io_<idx>.txt`,
     `stream_inference_tokens_<idx>.txt`: per-prompt output and token traces.
 - Initial Q8 2B hybrid streaming validation:
   - command used `InternVL3-2B-Instruct-Q8_0.gguf`,

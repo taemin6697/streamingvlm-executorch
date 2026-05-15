@@ -8,6 +8,7 @@ from pathlib import Path
 class MediaMode(str, Enum):
     TEXT = "text"
     IMAGE = "image"
+    MULTI_IMAGE = "multi_image"
     VIDEO_FILE = "video_file"
     STREAMING = "streaming"
 
@@ -34,6 +35,8 @@ def media_mode_from_args(args) -> MediaMode:
         return MediaMode.STREAMING
     if getattr(args, "video", None) is not None:
         return MediaMode.VIDEO_FILE
+    if getattr(args, "images", None) is not None:
+        return MediaMode.MULTI_IMAGE
     if getattr(args, "image", None) is not None:
         return MediaMode.IMAGE
     return MediaMode.TEXT
@@ -47,4 +50,3 @@ def backend_mode_from_processor(processor: str) -> BackendMode:
     if processor == "hybrid":
         return BackendMode.HYBRID_QNN_OPENCL
     raise ValueError(f"unsupported processor: {processor}")
-
