@@ -652,10 +652,11 @@ def _clip_phase_retry_start(row: dict[str, str], intervals: list[tuple[float, fl
         return row
 
     new_start = start
+    phase_name = PHASE_PLOT_ALIASES.get(row.get("row_type", ""), row.get("row_type", ""))
     for cut_start, cut_end in intervals:
         if cut_start < new_start < cut_end < end:
             new_start = cut_end
-        elif new_start <= cut_start < cut_end < end and row.get("row_type") in {"ImagePrefill", "T_Prefill", "Mmproj"}:
+        elif new_start <= cut_start < cut_end < end and phase_name in {"ImagePrefill", "T_Prefill", "Mmproj"}:
             new_start = cut_end
 
     if new_start <= start:
@@ -687,9 +688,10 @@ def _separate_dynamic_kv_grow_overlaps(phase_rows: list[dict[str, str]]) -> list
     retry_clip_phase_names = {"ImagePrefill", "T_Prefill", "Mmproj"}
     separated: list[dict[str, str]] = []
     for row in phase_rows:
-        if row.get("row_type") in split_phase_names:
+        phase_name = PHASE_PLOT_ALIASES.get(row.get("row_type", ""), row.get("row_type", ""))
+        if phase_name in split_phase_names:
             separated.extend(_split_phase_around_intervals(row, intervals))
-        elif row.get("row_type") in retry_clip_phase_names:
+        elif phase_name in retry_clip_phase_names:
             separated.append(_clip_phase_retry_start(row, intervals))
         else:
             separated.append(row)

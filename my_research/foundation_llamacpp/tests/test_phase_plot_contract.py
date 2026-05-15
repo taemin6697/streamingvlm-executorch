@@ -88,6 +88,21 @@ def test_offline_phase_timeline_rebases_after_hidden_setup(tmp_path):
     assert end == pytest.approx(3.0)
 
 
+def test_dynamic_kv_grow_separation_clips_vision_prefill_rows():
+    rows = [
+        _row("VisionPrefillMmproj", 1.30, 1.32),
+        _row("DynamicKVGrow", 1.32, 1.46),
+        _row("VisionPrefillImagePrefill", 1.32, 1.66),
+        _row("VisionPrefillT_Prefill", 1.66, 1.72),
+    ]
+
+    separated = runner_cli._separate_dynamic_kv_grow_overlaps(rows)
+    by_name = {row["row_type"]: row for row in separated}
+
+    assert by_name["VisionPrefillImagePrefill"]["elapsed_s_start"] == "1.460000"
+    assert by_name["VisionPrefillImagePrefill"]["total_ms"] == "200"
+
+
 def test_hybrid_offline_vision_measured_encode_waits_for_start_gate():
     source = HYBRID_VISION_DUMP.read_text()
 
