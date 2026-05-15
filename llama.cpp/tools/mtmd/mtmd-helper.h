@@ -89,6 +89,42 @@ MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
                                                 int32_t n_batch,
                                                 llama_pos * new_n_past);
 
+typedef bool (*mtmd_decode_abort_callback)(void * user_data);
+typedef void (*mtmd_decode_batch_callback)(int32_t batch_idx,
+                                           int32_t n_batches,
+                                           int32_t n_tokens_batch,
+                                           int64_t start_ms,
+                                           int64_t end_ms,
+                                           void * user_data);
+
+// same as mtmd_helper_decode_image_chunk(), but checks should_abort before and
+// after each image sub-batch. Returns 2 when should_abort requests cancellation.
+MTMD_API int32_t mtmd_helper_decode_image_chunk_with_abort(mtmd_context * ctx,
+                                                           struct llama_context * lctx,
+                                                           const mtmd_input_chunk * chunk,
+                                                           float * encoded_embd,
+                                                           llama_pos n_past,
+                                                           llama_seq_id seq_id,
+                                                           int32_t n_batch,
+                                                           llama_pos * new_n_past,
+                                                           mtmd_decode_abort_callback should_abort,
+                                                           void * abort_user_data);
+
+// same as mtmd_helper_decode_image_chunk_with_abort(), but reports each decoded
+// image sub-batch so callers can display preemptible work instead of one long bar.
+MTMD_API int32_t mtmd_helper_decode_image_chunk_with_abort_and_progress(mtmd_context * ctx,
+                                                                        struct llama_context * lctx,
+                                                                        const mtmd_input_chunk * chunk,
+                                                                        float * encoded_embd,
+                                                                        llama_pos n_past,
+                                                                        llama_seq_id seq_id,
+                                                                        int32_t n_batch,
+                                                                        llama_pos * new_n_past,
+                                                                        mtmd_decode_abort_callback should_abort,
+                                                                        void * abort_user_data,
+                                                                        mtmd_decode_batch_callback on_batch_done,
+                                                                        void * batch_user_data);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

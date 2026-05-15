@@ -54,6 +54,7 @@ PHASE_PLOT_ALIASES = {
     "VisionPrefillV_Encode": "V_Encode",
     "VisionPrefillMmproj": "Mmproj",
     "VisionPrefillImagePrefill": "ImagePrefill",
+    "VisionPrefillImagePrefillBatch": "ImagePrefill",
     "VisionPrefillT_Prefill": "T_Prefill",
 }
 PHASE_PLOT_EXCLUDED = {
@@ -67,8 +68,11 @@ PHASE_PLOT_EXCLUDED = {
     "StreamPromptPrefill",
     "VisionPrefillCacheAppendRestore",
     "VisionPrefillCacheBuild",
+    "VisionPrefillCacheHostSave",
     "VisionPrefillCacheHit",
+    "VisionPrefillCachePreempt",
     "VisionPrefillCacheRestore",
+    "VisionPrefillCacheRollback",
     "VisionPrefillCacheSave",
     "VisionPrefillImageLoad",
     "VisionPrefillLayoutTokenize",
@@ -1301,6 +1305,10 @@ def _phase_timeline_data(
     return phases, prompt_markers, timeline_origin, timeline_end
 
 
+def _phase_timeline_label_min_ms(name: str, *, stream_time: bool) -> float:
+    return float("inf")
+
+
 def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]], *, stream_time: bool = False) -> None:
     if not phase_rows:
         return
@@ -1349,7 +1357,7 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
             alpha=alpha,
         )
         duration_ms = (end - start) * 1000.0
-        if name != "Decode" and duration_ms >= 20.0:
+        if name != "Decode" and duration_ms >= _phase_timeline_label_min_ms(name, stream_time=stream_time):
             label = f"{duration_ms:.0f}ms"
             if stream_time and name in {"V_Encode", "ImagePrefill", "T_Prefill"}:
                 label = f"P{idx} {label}"

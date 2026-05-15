@@ -47,8 +47,11 @@ def test_streaming_timeline_aliases_vision_prefill_to_standard_lanes():
     assert runner_cli._phase_timeline_name("D") == "Decode"
 
     assert runner_cli._phase_timeline_name("VisionPrefillCacheBuild") is None
+    assert runner_cli._phase_timeline_name("VisionPrefillCacheHostSave") is None
+    assert runner_cli._phase_timeline_name("VisionPrefillCachePreempt") is None
     assert runner_cli._phase_timeline_name("VisionPrefillCacheSave") is None
     assert runner_cli._phase_timeline_name("VisionPrefillCacheRestore") is None
+    assert runner_cli._phase_timeline_name("VisionPrefillCacheRollback") is None
 
     assert "drop_pending_cache_updates" in source
 
@@ -71,13 +74,19 @@ def test_online_buffer_uses_latest_frame_at_processing_start():
     assert "resolve_online_buffer_frames" in source
     assert "prompt_frame_lag_s" in source
     assert "stream_buffer_summary.txt" in source
+    assert "committed_cache_fps=" in source
+    assert "cache_worker_fps=" in source
+    assert "note_committed_cache_update" in source
+    assert "note_prompt_decode_job" in source
     assert "rm -f android_memory_timeline.csv" in runner_source
     assert "stream_buffer_summary.txt stream_response_*.txt" in runner_source
 
 
 def test_vision_prefill_cache_build_encodes_frames_on_demand():
     source = STREAMING_CPP.read_text()
-    build_fn = source.split("bool build_vision_prefill_cache(", 1)[1].split("\n}\n\nint run_single_buffer_prompt", 1)[0]
+    build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
+        "\n}\n\nint run_vision_prefill_prompt_from_committed_cache", 1
+    )[0]
 
     assert "eval_streaming_chunks_with_on_demand_vision" in source
     assert "eval_streaming_chunks_with_on_demand_vision(" in build_fn
@@ -85,22 +94,66 @@ def test_vision_prefill_cache_build_encodes_frames_on_demand():
     assert "bins[image_chunk_idx]" in source
 
 
-def test_vision_prefill_cache_build_restores_previous_snapshot_and_appends_one_frame():
+def test_vision_prefill_cache_build_restores_previous_snapshot_and_appends_latest_frame_only():
     source = STREAMING_CPP.read_text()
-    build_fn = source.split("bool build_vision_prefill_cache(", 1)[1].split("\n}\n\nint run_single_buffer_prompt", 1)[0]
+    build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
+        "\n}\n\nint run_vision_prefill_prompt_from_committed_cache", 1
+    )[0]
 
     assert "build_formatted_incremental_vision_cache_append" in source
     assert "restore_vision_prefill_cache_state(ctx, cache, cache_phases, \"VisionPrefillCacheAppendRestore\")" in build_fn
-    assert "std::vector<FrameRecord> append_frames{frames.back()}" in build_fn
+    assert "std::vector<FrameRecord> append_frames{target_frames.back()}" in build_fn
+    assert "frames.begin() + static_cast<std::ptrdiff_t>(cached_prefix_size)" not in build_fn
     assert "bins_for_frames(append_frames)" in build_fn
     assert "layout_images_for_frames(append_frames)" in build_fn
+
+
+def test_vision_prefill_prompt_uses_committed_cache_snapshot_without_video_fallback():
+    source = STREAMING_CPP.read_text()
+    prompt_fn = source.split("int run_vision_prefill_prompt_from_committed_cache(", 1)[1].split(
+        "\n}\n\nint run_single_buffer_prompt", 1
+    )[0]
+
+    assert "vision_cache->frames" in prompt_fn
+    assert "vision_cache->images" in prompt_fn
+    assert "prefer_host_restore" in prompt_fn
+    assert "vision_prefill_cache_matches" not in prompt_fn
+    assert "encoder.encode(bins)" not in prompt_fn
+
+
+def test_vision_prefill_cache_update_preempts_for_pending_prompt():
+    source = STREAMING_CPP.read_text()
+    build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
+        "\n}\n\nint run_vision_prefill_prompt_from_committed_cache", 1
+    )[0]
+    mtmd_helper_header = (ROOT / "llama.cpp/tools/mtmd/mtmd-helper.h").read_text()
+
+    assert "#include <atomic>" in source
+    assert "std::atomic<int> pending_prompt_jobs" in source
+    assert "pending_prompt_jobs.fetch_add" in source
+    assert "pending_prompt_jobs.fetch_sub" in source
+    assert "cache_preempt_requested" in source
+    assert "VisionPrefillCachePreempt" in source
+    assert "VisionPrefillCacheRollback" in source
+    assert "host_state" in source
+    assert "VisionPrefillCacheBuildStatus::Preempted" in build_fn
+    assert "drop_pending_cache_updates(stream_jobs)" in source
+    assert "mtmd_helper_decode_image_chunk_with_abort" in mtmd_helper_header
+    assert "mtmd_helper_decode_image_chunk_with_abort_and_progress" in mtmd_helper_header
+    assert "mtmd_decode_batch_callback" in mtmd_helper_header
+    assert "k_preemptible_image_prefill_batch" in source
+    assert "preemptible_image_batch" in source
+    assert "mtmd_helper_decode_image_chunk_with_abort_and_progress" in source
+    assert "VisionPrefillImagePrefillBatch" in source
 
 
 def test_vision_prefill_preserves_chat_history_across_prompt_events():
     source = STREAMING_CPP.read_text()
     cache_struct = source.split("struct VisionPrefillCache {", 1)[1].split("\n};", 1)[0]
     restore_fn = source.split("bool restore_vision_prefill_cache_state(", 1)[1].split("\n}\n\nbool build_vision_prefill_cache", 1)[0]
-    prompt_fn = source.split("int run_single_buffer_prompt(", 1)[1].split("\n#else\nint run_single_buffer_prompt", 1)[0]
+    prompt_fn = source.split("int run_vision_prefill_prompt_from_committed_cache(", 1)[1].split(
+        "\n}\n\nint run_single_buffer_prompt", 1
+    )[0]
     singleton_fn = source.split("bool is_singleton_video_mode(", 1)[1].split("\n}\n\nvoid reset_decode_context_for_singleton", 1)[0]
 
     assert "std::vector<common_chat_msg> chat_history" in cache_struct

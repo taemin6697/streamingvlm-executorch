@@ -242,6 +242,58 @@ int32_t mtmd_helper_decode_image_chunk(
         llama_seq_id seq_id,
         int32_t n_batch,
         llama_pos * new_n_past) {
+    return mtmd_helper_decode_image_chunk_with_abort(
+        ctx,
+        lctx,
+        chunk,
+        encoded_embd,
+        n_past,
+        seq_id,
+        n_batch,
+        new_n_past,
+        nullptr,
+        nullptr);
+}
+
+int32_t mtmd_helper_decode_image_chunk_with_abort(
+        mtmd_context * ctx,
+        struct llama_context * lctx,
+        const mtmd_input_chunk * chunk,
+        float * encoded_embd,
+        llama_pos n_past,
+        llama_seq_id seq_id,
+        int32_t n_batch,
+        llama_pos * new_n_past,
+        mtmd_decode_abort_callback should_abort,
+        void * abort_user_data) {
+    return mtmd_helper_decode_image_chunk_with_abort_and_progress(
+        ctx,
+        lctx,
+        chunk,
+        encoded_embd,
+        n_past,
+        seq_id,
+        n_batch,
+        new_n_past,
+        should_abort,
+        abort_user_data,
+        nullptr,
+        nullptr);
+}
+
+int32_t mtmd_helper_decode_image_chunk_with_abort_and_progress(
+        mtmd_context * ctx,
+        struct llama_context * lctx,
+        const mtmd_input_chunk * chunk,
+        float * encoded_embd,
+        llama_pos n_past,
+        llama_seq_id seq_id,
+        int32_t n_batch,
+        llama_pos * new_n_past,
+        mtmd_decode_abort_callback should_abort,
+        void * abort_user_data,
+        mtmd_decode_batch_callback on_batch_done,
+        void * batch_user_data) {
     GGML_ASSERT(n_batch > 0);
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
     const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
@@ -285,7 +337,17 @@ int32_t mtmd_helper_decode_image_chunk(
         // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
     }
 
+    auto abort_requested = [&]() {
+        return should_abort != nullptr && should_abort(abort_user_data);
+    };
+
     while (i_batch < n_img_batches) { // split into batches
+        if (abort_requested()) {
+            if (use_non_causal) {
+                llama_set_causal_attn(lctx, true);
+            }
+            return 2;
+        }
         int pos_offset = i_batch*n_batch;
         int n_tokens_batch = std::min(n_batch, n_tokens - pos_offset);
         llama_batch batch_embd_view = batch_embd.get_view(pos_offset, n_tokens_batch);
@@ -294,15 +356,26 @@ int32_t mtmd_helper_decode_image_chunk(
 
         int64_t t1 = ggml_time_ms();
         int32_t ret = llama_decode(lctx, batch_embd_view);
+        int64_t t2 = ggml_time_ms();
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
             llama_set_causal_attn(lctx, true); // restore causal attn
             return ret;
         }
 
-        LOG_INF("%s decoded (batch %d/%d) in %" PRId64 " ms\n", name, i_batch+1, n_img_batches, ggml_time_ms() - t1);
+        if (on_batch_done != nullptr) {
+            on_batch_done(i_batch, n_img_batches, n_tokens_batch, t1, t2, batch_user_data);
+        }
+
+        LOG_INF("%s decoded (batch %d/%d) in %" PRId64 " ms\n", name, i_batch+1, n_img_batches, t2 - t1);
 
         i_batch++;
+        if (abort_requested()) {
+            if (use_non_causal) {
+                llama_set_causal_attn(lctx, true);
+            }
+            return 2;
+        }
     }
 
     n_past += mtmd_input_chunk_get_n_pos(chunk);
