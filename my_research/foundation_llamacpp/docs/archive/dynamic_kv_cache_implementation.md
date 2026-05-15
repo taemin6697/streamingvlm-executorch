@@ -357,8 +357,13 @@ InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic
 
 ```text
 grow_to: growing dynamic KV cache: old = <old>, new = <new>, logical = <logical>, clock_ms = <ggml_time_ms>
+reset_capacity: dynamic KV grow breakdown alloc clock_start_ms = <ms>, clock_end_ms = <ms>
+reset_capacity: dynamic KV grow breakdown metadata clock_start_ms = <ms>, clock_end_ms = <ms>
+reset_capacity: dynamic KV grow breakdown copy clock_start_ms = <ms>, clock_end_ms = <ms>
 reset_capacity: size = <MiB> MiB
 grow_to: dynamic KV grow completed in <ms> ms, clock_ms = <ggml_time_ms>
+decode: dynamic KV grow breakdown scheduler_reserve clock_start_ms = <ms>, clock_end_ms = <ms>
+decode: dynamic KV grow retry window: old = <old>, new = <new>, logical = <logical>, clock_start_ms = <ms>, clock_end_ms = <ms>
 ```
 
 `hybrid_streaming_decode.cpp`는 `streaming_phase_stats.csv` header comment에
@@ -406,11 +411,43 @@ attempt 계측일 수 있으므로 해석에 주의해야 한다.
 DynamicKVGrow,41.154632,41.427575,,,273,,273,1024,16384,,28672,458752,458752,1024->16384/32768 cells; 28.00->448.00 MiB
 ```
 
+Grow breakdown branch에서는 같은 grow window 안에 아래 sub-row도 추가된다.
+이 row들은 aggregate `DynamicKVGrow`를 대체하지 않고, 내부 비용을 관찰하기 위한
+중첩 span이다.
+
+- `DynamicKVGrowAlloc`: 새 K/V tensor graph 생성, 새 backend buffer allocation,
+  새 KV buffer clear.
+- `DynamicKVGrowMetadata`: `v_cells`/`v_heads` metadata 보존 및 새 capacity까지
+  확장.
+- `DynamicKVGrowCopy`: 기존 K/V payload를 old tensor에서 new tensor로 복사.
+  OpenCL-backed tensor이면 `clEnqueueCopyBuffer` device-to-device copy가 여기에
+  들어간다.
+- `DynamicKVGrowSchedulerReserve`: grow 이후 새 tensor shape 기준으로 ggml
+  backend scheduler가 graph/workspace를 다시 reserve하는 구간.
+
+예:
+
+```text
+DynamicKVGrowAlloc,41.164000,41.274000,,,110,,110,1024,16384,,28672,458752,458752,1024->16384/32768 cells; 28.00->448.00 MiB; stage=alloc
+DynamicKVGrowMetadata,41.274000,41.284000,,,10,,10,1024,16384,,28672,458752,458752,1024->16384/32768 cells; 28.00->448.00 MiB; stage=metadata
+DynamicKVGrowCopy,41.284000,41.454000,,,170,,170,1024,16384,,28672,458752,458752,1024->16384/32768 cells; 28.00->448.00 MiB; stage=copy
+DynamicKVGrowSchedulerReserve,41.459000,41.548000,,,89,,89,1024,16384,,28672,458752,458752,1024->16384/32768 cells; 28.00->448.00 MiB; stage=scheduler_reserve
+```
+
 ## 13. plot 변경
 
 `runner/cli.py`의 `_phase_colors()`에 `DynamicKVGrow` 색을 추가했다.
 
 `_write_png_streaming_phase_timeline()`의 visible phase list에도 `DynamicKVGrow`를 넣었다. 이 plot에서는 grow duration을 `KV +<ms>ms` 형태로 표시한다.
+Grow breakdown branch에서도 main streaming timeline에는 aggregate
+`DynamicKVGrow`만 표시하고, `DynamicKVGrowAlloc`, `DynamicKVGrowMetadata`,
+`DynamicKVGrowCopy`, `DynamicKVGrowSchedulerReserve`는 별도 chart로 분리한다.
+
+`_write_png_dynamic_kv_grow_breakdown()`는
+`dynamic_kv_grow_breakdown_stacked_bar.png`를 생성한다. 이 plot은 각 grow를
+하나의 horizontal stacked bar로 두고, alloc / metadata / copy /
+scheduler-reserve duration을 나눠 보여준다. aggregate `DynamicKVGrow`와
+sub-row duration 합이 rounding 때문에 조금 다르면 `Other` segment로 표시한다.
 
 최신 구현에서는 `DynamicKVGrow`가 단순 `llama_kv_cache::grow_to()` 시간만
 뜻하지 않는다. `llama_context::decode()`가 `memory->grow_to()` 성공 후
@@ -553,6 +590,44 @@ grow full-window P5:
 - P4의 retry-side `ImagePrefill=2215 ms`는 init-16384의 `2144 ms`와 가까워졌다.
 - P5는 no-grow와 grow run이 거의 동일하다. 따라서 dynamic grow가 이후 prompt의
   graph/scheduler cache를 지속적으로 망가뜨리는 현상은 관찰되지 않았다.
+
+### 14.4 grow breakdown branch validation
+
+목적: contiguous OpenCL KV reallocation spike를 하나의 `DynamicKVGrow`로만 보지
+않고, allocation / metadata / K/V copy / scheduler reserve 구간으로 분해한다.
+
+실행:
+
+```text
+branch: codex/dynamic-kv-grow-breakdown
+result: results/log/dynamic_kv_grow_breakdown_2b_hybrid_single_buffer/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_kv16_dynamic
+model: InternVL3-2B-Instruct-Q8_0 hybrid
+input: red-panda_448.mp4
+dynamic flags: --dynamic-kv-cache --kv-init-size 512 --kv-grow-step 512
+foundation_exit_code.txt = 0
+```
+
+결과:
+
+```text
+grow 0:
+  DynamicKVGrow = 174 ms, 512 -> 1024 cells, 14.00 -> 28.00 MiB
+  DynamicKVGrowAlloc = 13 ms
+  DynamicKVGrowMetadata = 0 ms
+  DynamicKVGrowCopy = 7 ms
+  DynamicKVGrowSchedulerReserve = 153 ms
+
+grow 1:
+  DynamicKVGrow = 179 ms, 1024 -> 1536 cells, 28.00 -> 42.00 MiB
+  DynamicKVGrowAlloc = 20 ms
+  DynamicKVGrowMetadata = 0 ms
+  DynamicKVGrowCopy = 7 ms
+  DynamicKVGrowSchedulerReserve = 148 ms
+```
+
+이 run에서는 K/V device-to-device copy 자체보다 scheduler reserve가 spike의
+대부분을 차지했다. 이는 작은 step grow에서 K/V byte copy만 최적화해도 black
+grow bar 전체가 크게 줄지 않을 수 있음을 보여준다.
 
 ## 15. 성능 해석
 

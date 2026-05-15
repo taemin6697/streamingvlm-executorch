@@ -262,6 +262,7 @@ bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t old_size = copy_existing ? get_size() : 0;
+    const int64_t alloc_start_ms = copy_existing ? ggml_time_ms() : 0;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> old_ctxs_bufs;
     std::vector<kv_layer> old_layers;
     std::vector<llama_kv_cells> old_v_cells;
@@ -453,20 +454,32 @@ bool llama_kv_cache::reset_capacity(uint32_t kv_size, bool copy_existing) {
     }
 
     if (copy_existing) {
+        const int64_t alloc_end_ms = ggml_time_ms();
+        LLAMA_LOG_INFO("%s: dynamic KV grow breakdown alloc clock_start_ms = %" PRId64 ", clock_end_ms = %" PRId64 "\n",
+                __func__, alloc_start_ms, alloc_end_ms);
+
         if (old_v_cells.size() != v_cells.size()) {
             throw std::runtime_error("failed to preserve dynamic KV cell metadata");
         }
 
+        const int64_t metadata_start_ms = ggml_time_ms();
         for (uint32_t s = 0; s < n_stream; ++s) {
             v_cells[s] = std::move(old_v_cells[s]);
             v_cells[s].grow_to(kv_size);
         }
         v_heads = std::move(old_v_heads);
+        const int64_t metadata_end_ms = ggml_time_ms();
+        LLAMA_LOG_INFO("%s: dynamic KV grow breakdown metadata clock_start_ms = %" PRId64 ", clock_end_ms = %" PRId64 "\n",
+                __func__, metadata_start_ms, metadata_end_ms);
 
         bool used_device_copy = false;
+        const int64_t copy_start_ms = ggml_time_ms();
         if (!copy_existing_data_from(old_layers, old_size, kv_size, used_device_copy)) {
             return false;
         }
+        const int64_t copy_end_ms = ggml_time_ms();
+        LLAMA_LOG_INFO("%s: dynamic KV grow breakdown copy clock_start_ms = %" PRId64 ", clock_end_ms = %" PRId64 "\n",
+                __func__, copy_start_ms, copy_end_ms);
 
         LLAMA_LOG_INFO("%s: dynamic KV data migration used %s copy\n",
                 __func__, used_device_copy ? "device-to-device" : "host fallback");

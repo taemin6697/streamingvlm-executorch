@@ -267,13 +267,34 @@ backend scheduler reserve
 failed batch retry preparation
 ```
 
+`codex/dynamic-kv-grow-breakdown` branch에서는 이 opaque grow window를 아래
+sub-span으로 나눠 기록한다.
+
+```text
+DynamicKVGrowAlloc
+  새 K/V tensor graph 생성, 새 OpenCL backend buffer allocation, clear
+
+DynamicKVGrowMetadata
+  v_cells / v_heads metadata 보존 및 capacity 확장
+
+DynamicKVGrowCopy
+  old OpenCL KV buffer -> new OpenCL KV buffer device-to-device copy
+
+DynamicKVGrowSchedulerReserve
+  새 KV tensor shape 기준 backend scheduler workspace/graph reserve
+```
+
 실측 예:
 
 ```text
 grow_to: growing dynamic KV cache: old = 1024, new = 16384, logical = 32768
 reset_capacity:     OpenCL KV buffer size =   448.00 MiB
+reset_capacity: dynamic KV grow breakdown alloc clock_start_ms = ...
+reset_capacity: dynamic KV grow breakdown metadata clock_start_ms = ...
+reset_capacity: dynamic KV grow breakdown copy clock_start_ms = ...
 reset_capacity: dynamic KV data migration used device-to-device copy
 grow_to: dynamic KV grow completed in 202.135 ms
+decode: dynamic KV grow breakdown scheduler_reserve clock_start_ms = ...
 DynamicKVGrow finalizer row: 299 ms
 ```
 
