@@ -1,0 +1,13 @@
+# pip install -r requirements-internvl-video.txt
+#
+# InternVL remote code on HF is not compatible with transformers v5 yet
+# (loads fail with all_tied_weights_keys / tied weights init).
+torch>=2.1
+torchvision
+transformers>=4.45,<5
+accelerate
+sentencepiece
+Pillow
+numpy
+decord
+huggingface_hub>=0.23
