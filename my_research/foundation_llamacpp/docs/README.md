@@ -9,7 +9,9 @@ buffer/memory-architecture explanation lives in
 `archive/dynamic_kv_opencl_buffer_memory_architecture.md`. Legacy
 single-buffer details live in `archive/streaming_single_buffer_implementation.md`;
 the current on-demand/sliding-window/KV vision-prefill details live in
-`archive/streaming_sliding_window_and_vision_prefill.md`.
+`archive/streaming_sliding_window_and_vision_prefill.md`, and partial
+vision-prefill KV preemption details live in
+`archive/partial_vision_prefill_kv.md`.
 
 ## Current Baseline
 
@@ -42,6 +44,13 @@ User-facing CLI cleanup:
   configured sampling FPS. If processing is delayed, prompt/cache work selects
   frames from the latest buffer at processing start, and stale pending
   vision-prefill cache updates are coalesced.
+
+--partial-vision-kv
+  Hybrid vision-prefill preemption mode. If a prompt arrives while an image
+  prefill cache update is running, the current image micro-batch is finished,
+  the committed partial image KV is kept, and the answer starts without waiting
+  for the rest of that frame image prefill. The commit granularity is
+  controlled by `--ubatch-size`.
 ```
 
 ## Common Setup
@@ -151,6 +160,7 @@ InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_on_demand_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_sliding_window_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16_dynamic_online
+InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic_partialkv
 ```
 
 Each run directory is normalized into three report folders after finalization:
@@ -610,6 +620,14 @@ jobs capture their selected frame/window at request timestamp. Add
 and processing cadence are decoupled, stale pending cache updates are dropped,
 and delayed prompt/cache work uses the latest frame/window at processing start.
 
+Add `--partial-vision-kv` with hybrid `--stream-mode vision-prefill` when TTFT
+has priority over finishing the current frame image prefill. If the prompt
+arrives while a frame image prefill is running, the bridge finishes only the
+current `--ubatch-size` image micro-batch, closes the image wrapper, and answers
+from the committed partial KV. For the current InternVL3 one-tile setup, each
+frame has 256 vision tokens, so `--ubatch-size 64` can answer from 64, 128, 192,
+or 256 committed vision KV tokens.
+
 ### CPU
 
 Not supported for `--streaming-video`.
@@ -791,6 +809,16 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
   the answer, and saves the post-answer chat/KV state. Later frames then start
   the next user turn, so previous user/assistant turns remain visible.
 
+--partial-vision-kv
+  Hybrid vision-prefill only. This changes prompt preemption inside cache
+  update work, not the outer streaming mode. When a prompt arrives during an
+  image-prefill cache update, the current image micro-batch is allowed to
+  finish and the remaining batches for that stale frame are skipped. The
+  question then uses all committed KV up to that partial point. The partial
+  size is `--ubatch-size`; with InternVL3 one-tile frames, `--ubatch-size 64`
+  gives four possible 64-token image KV commit points inside the 256-token
+  visual placeholder.
+
 --chunked-vision-prefill
   Reserved future mode flag for independently reusable vision-prefill chunks.
   The planned `--chunk-count` argument will control how many frames are grouped
@@ -862,7 +890,10 @@ streaming_phase_stats.csv / foundation_proc.csv
   `VisionPrefillCacheHit`, and `VisionPrefillCacheRestore`. Timeline plotting
   aliases `VisionPrefillV_Encode`, `VisionPrefillMmproj`,
   `VisionPrefillImagePrefill`, and `VisionPrefillT_Prefill` onto the normal
-  lanes, while cache-management rows are hidden.
+  lanes, while cache-management rows are hidden. With `--partial-vision-kv`,
+  ImagePrefill can appear as multiple committed micro-batch spans for one
+  frame; these spans represent the partial KV commit points used for prompt
+  preemption.
 
 phase_timeline.png
   Common phase timeline plot. For streaming runs, the x-axis uses stream/video
@@ -901,6 +932,13 @@ Vision-prefill scheduling
   then moves to the next cache job or prompt job. This keeps the phase trace to
   one `VisionPrefillV_Encode` / `VisionPrefillImagePrefill` pair per sampled
   frame.
+
+Partial vision-prefill scheduling
+  With `--partial-vision-kv`, a prompt can interrupt cache work after the
+  current image micro-batch commits. The answer uses only committed image KV,
+  and uncommitted visual placeholder slots are not counted as present. For a
+  256-token InternVL3 image and `--ubatch-size 64`, the cache can be visible to
+  the prompt after 64, 128, 192, or 256 image tokens.
 ```
 
 Example sliding-window run:
@@ -971,6 +1009,51 @@ with `foundation_exit_code.txt=0`, fifteen `VisionPrefillCacheBuild` rows, four
 `VisionPrefillV_Encode` / `VisionPrefillImagePrefill` rows for fifteen sampled
 frames. Prompt 1 answered that the previous question was about the red panda's
 activity, confirming chat history is preserved.
+
+Example partial vision-prefill run, using 64-token image KV commit points:
+
+```bash
+python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
+  --processor hybrid \
+  --vision my_research/foundation/results/model/qnn/internvl3_1b_hybrid_16p_16k_16a4w/vision_encoder_qnn.pte \
+  --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --vision-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
+  --executorch-build-dir executorch/build-android-unified \
+  --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
+  --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
+  --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8_20sec.mp4 \
+  --stream-mode vision-prefill \
+  --partial-vision-kv \
+  --sampling-fps 1.0 \
+  --max-video-time 20 \
+  --time '[5.0, 8.0, 11.0, 14.0]' \
+  --prompt '["What is this situation?", "What did I ask earlier???", "What changed in the scene?", "Summarize the full situation so far."]' \
+  --max-num 1 \
+  --n-predict 64 \
+  --ctx-size 32768 \
+  --dynamic-kv-cache \
+  --kv-init-size 512 \
+  --kv-grow-step 512 \
+  --batch-size 1024 \
+  --ubatch-size 64 \
+  --gpu-layers 99 \
+  --threads 4 \
+  --temperature 0.0 \
+  --device GPUOpenCL \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --fit off \
+  --remote-root /data/local/tmp/streamingvlm_1b_partial_vprefill \
+  --results-root my_research/foundation_llamacpp/results/log/partial_vprefill_clean_surveillance_1b_q8_batch64_20s_4prompt
+```
+
+Validated partial result:
+`results/log/partial_vprefill_clean_surveillance_1b_q8_batch64_20s_4prompt/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv8_dynamic`
+completed with `foundation_exit_code.txt=0`. Prompt 1 recovered the previous
+question, and `phase_timeline.png` shows the 64-token image-prefill batch
+boundaries used for partial KV preemption. A 2B Q8 retry is still pending
+because the Android device disconnected during adb push before inference
+started.
 
 ## Vision Tower Export
 

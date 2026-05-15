@@ -5,6 +5,55 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-15: Partial Vision-Prefill KV Commit
+
+- Added `--partial-vision-kv` for hybrid `--stream-mode vision-prefill`.
+  This is a TTFT-first preemption path for image-prefill work:
+  - normal vision-prefill still commits a full image KV for each frame;
+  - partial mode lets a prompt arriving during `ImagePrefill` wait only until
+    the current image micro-batch finishes, then answers from the already
+    committed partial image KV.
+- `--ubatch-size` is the partial image-prefill granularity. InternVL3 one-tile
+  frames currently expand to 256 vision tokens, so `--ubatch-size 64` exposes
+  64/128/192/256-token commit points inside one frame image prefill.
+- `hybrid_bridge/mtmd-helper.cpp` now reports image-prefill progress after each
+  image batch through
+  `mtmd_helper_decode_image_chunk_with_abort_and_progress()`, including the
+  updated `n_past` value. `hybrid_streaming_decode.cpp` uses that progress to
+  decide whether a pending prompt can preempt cache work.
+- Partial preemption rules:
+  - if a prompt arrives before the first image batch commits, finish the first
+    batch and answer from that partial frame KV;
+  - if a prompt arrives while batch N is running, finish batch N and answer
+    from all committed batches up to N;
+  - skipped later batches belong to stale frame work and are dropped after the
+    prompt because TTFT has priority.
+- The prompt path drains the following text chunks after a partial image commit
+  so the InternVL image wrapper is closed before the question suffix is
+  evaluated. This preserves the multi-turn chat behavior used by the existing
+  vision-prefill path.
+- Cache snapshot saving now separates normal and partial semantics:
+  - normal vision-prefill keeps the seq-state snapshot path;
+  - partial mode saves live committed metadata only, so the next prompt does
+    not assume uncommitted vision slots exist.
+- Incremental online cache updates append at most the next missing frame rather
+  than rebuilding the whole delayed history. In online mode, dropped stale
+  frames are acceptable because the streaming buffer models a live camera, not
+  a lossless video queue.
+- Validation:
+  - `pytest -q my_research/foundation_llamacpp/tests` passed with `51 passed`
+    after merging the clean partial implementation.
+  - 1B Q8 surveillance partial run completed with `--ubatch-size 64`,
+    `--dynamic-kv-cache --kv-init-size 512 --kv-grow-step 512`, prompts at
+    `5s/8s/11s/14s`, and `--n-predict 64`.
+    Result:
+    `results/log/partial_vprefill_clean_surveillance_1b_q8_batch64_20s_4prompt/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv8_dynamic`.
+    Prompt 1 recovered the previous question, confirming multi-turn chat state
+    remained visible with partial image KV commits.
+  - 2B Q8 retry is pending because the Android device disconnected during adb
+    push before inference started. Do not treat that attempt as a model
+    validation run.
+
 ## 2026-05-15: Unified Hybrid Streaming Baseline
 
 - Created feature branch `codex/unified-online-buffer-baseline` for the current

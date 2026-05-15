@@ -60,6 +60,11 @@ online buffer
   optional --online-buffer decouples input frame cadence from processing
   cadence; delayed work uses the latest frame/window at processing start and
   vision-prefill coalesces stale pending cache jobs.
+
+partial vision prefill
+  optional --partial-vision-kv for hybrid vision_prefill lets a prompt preempt
+  image-prefill cache work after the current image micro-batch commits. The
+  partial commit size is controlled by --ubatch-size.
 ```
 
 ## Top-Level Layout
@@ -143,6 +148,8 @@ Important responsibilities still in `cli.py`:
 - llama.cpp command rendering for standalone CPU/OpenCL.
 - remote shell script construction for standalone and hybrid flows.
 - result directory naming.
+- streaming flag forwarding, including `--stream-mode`, `--online-buffer`,
+  `--dynamic-kv-cache`, and `--partial-vision-kv`.
 - memory timeline shell snippets.
 - summary extraction from logs.
 - final artifact pulling and post-processing.
@@ -822,6 +829,9 @@ run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-m
   -> for text chunks, run VisionPrefillT_Prefill
   -> for image chunks, QNN-encode only the newly appended frame bin on demand
   -> run VisionPrefillMmproj and VisionPrefillImagePrefill immediately
+  -> with --partial-vision-kv, expose ImagePrefill progress after each
+     --ubatch-size image micro-batch and allow prompt preemption after the
+     current batch commits
   -> save seq 0 with llama_state_seq_get_data_ext()
   -> prompt job restores the matching snapshot with llama_state_seq_set_data_ext()
   -> tokenize/evaluate only the formatted question suffix that closes the open user turn
@@ -846,6 +856,14 @@ selected bins first, which produced traces with several consecutive
 `eval_streaming_chunks_with_on_demand_vision()` QNN-encodes one frame/tile only
 when its IMAGE chunk is reached, then immediately runs mmproj and image prefill
 before advancing to the next chunk.
+
+With `--partial-vision-kv`, image prefill is still ordered, but the active
+image chunk may be committed in smaller pieces. A prompt arriving during image
+prefill does not wait for the remaining image batches. It waits for the current
+batch to finish, closes the image wrapper with the following text chunks, and
+then evaluates the question suffix from the partial KV state. For the current
+InternVL3 one-tile path, a 256-token visual image with `--ubatch-size 64` can
+therefore answer from 64, 128, 192, or 256 committed visual KV tokens.
 
 ## Result Artifacts
 
@@ -1060,6 +1078,9 @@ When changing streaming:
    sliding-window, and vision-prefill preserve chat history and KV across prompt
    events; vision-prefill restores a cached open user-turn prefix, evaluates
    only the text suffix, then saves the post-answer state for later frames.
+   Partial vision-prefill is a preemption policy inside this same state model:
+   it may shorten the latest frame image KV, but it must not drop closed chat
+   history or pretend uncommitted vision slots exist.
 5. Keep OpenCL and Hybrid streaming artifacts aligned so their timelines can be
    compared.
 6. If adding persistent prefill or vision-encoder-only streaming, add new mode
