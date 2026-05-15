@@ -137,6 +137,10 @@ foundation_proc.csv
   KV MiB converted to KiB, and `kv_physical_committed_kb` is the new committed
   KV size. New runs record the full grow/retry window, including scheduler
   reserve, so retry-side `ImagePrefill` timing starts after `DynamicKVGrow`.
+  Grow breakdown builds also add `DynamicKVGrowAlloc`,
+  `DynamicKVGrowMetadata`, `DynamicKVGrowCopy`, and
+  `DynamicKVGrowSchedulerReserve` rows. These are sub-spans inside the aggregate
+  `DynamicKVGrow` window.
 
 streaming_phase_stats.csv / stream_events.csv
   Streaming-only timing and event logs.
@@ -150,6 +154,11 @@ memory_usage_summary.txt / memory_timeline_plot.png
 memory_timeline_decode_window.png
   Zoomed memory plot from first `V_Encode` start to final decode end. Dynamic
   KV runs mark `DynamicKVGrow` with the cell and MiB growth detail.
+
+dynamic_kv_grow_breakdown_stacked_bar.png
+  Grow breakdown builds only. Separate stacked bar chart for the alloc,
+  metadata, copy, and scheduler-reserve sub-spans inside each `DynamicKVGrow`
+  window.
 ```
 
 ## Single Text Input
@@ -697,7 +706,11 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
   the active `main` implementation.
   New builds write grow timestamps with the same `ggml_time_ms()` clock used by
   streaming phase timers, so retry-side prefill rows can be separated from grow
-  time in `foundation_proc.csv` and `streaming_phase_timeline.png`.
+  time in `foundation_proc.csv` and `streaming_phase_timeline.png`. On the
+  `codex/dynamic-kv-grow-breakdown` branch, stdout also records alloc,
+  metadata, copy, and scheduler-reserve sub-spans. Those sub-spans stay out of
+  the main streaming timeline and are visualized in
+  `dynamic_kv_grow_breakdown_stacked_bar.png`.
 
 stream_events.csv
   Frame arrival, `SingleBufferUpdate`, prompt arrival, and prompt decode events.

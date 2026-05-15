@@ -40,6 +40,12 @@ from my_research.foundation_llamacpp.runner.remote import (
 WORKSPACE = Path(__file__).resolve().parents[3]
 FOUNDATION_LLAMA = Path(__file__).resolve().parents[1]
 DEFAULT_WARMUP_IMAGE = FOUNDATION_LLAMA / "sample_images" / "golden_gate_bridge_448.jpg"
+DYNAMIC_KV_GROW_BREAKDOWN_PHASES = {
+    "alloc": "DynamicKVGrowAlloc",
+    "metadata": "DynamicKVGrowMetadata",
+    "copy": "DynamicKVGrowCopy",
+    "scheduler_reserve": "DynamicKVGrowSchedulerReserve",
+}
 
 
 def _standalone_completion_mode(args: argparse.Namespace) -> bool:
@@ -436,10 +442,19 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path, *, clock_origin_ms: int | No
         end_clock_ms: int | None = None
         retry_start_clock_ms: int | None = None
         retry_end_clock_ms: int | None = None
-        for follow in lines[idx + 1 : idx + 32]:
+        breakdown_segments: list[tuple[str, int, int]] = []
+        for follow in lines[idx + 1 : idx + 64]:
             size = re.search(r"reset_capacity: size =\s*([0-9.]+) MiB", follow)
             if size:
                 new_mib = float(size.group(1))
+            breakdown = re.search(
+                r"dynamic KV grow breakdown ([a-z_]+) clock_start_ms = (-?\d+), clock_end_ms = (-?\d+)",
+                follow,
+            )
+            if breakdown:
+                stage = breakdown.group(1)
+                if stage in DYNAMIC_KV_GROW_BREAKDOWN_PHASES:
+                    breakdown_segments.append((stage, int(breakdown.group(2)), int(breakdown.group(3))))
             done = re.search(r"dynamic KV grow completed in\s*([0-9.]+) ms(?:, clock_ms = (-?\d+))?", follow)
             if done:
                 duration_ms = float(done.group(1))
@@ -490,6 +505,33 @@ def _dynamic_kv_rows_from_stdout(stdout_path: Path, *, clock_origin_ms: int | No
             "kv_physical_committed_kb": str(int(round(new_mib * 1024))) if new_mib else "",
             "token_idx": detail,
         })
+        for stage, stage_start_clock_ms, stage_end_clock_ms in breakdown_segments:
+            if clock_origin_ms is not None:
+                stage_start = (stage_start_clock_ms - clock_origin_ms) / 1000.0
+                stage_end = (stage_end_clock_ms - clock_origin_ms) / 1000.0
+            elif start_clock_ms is not None:
+                stage_start = start + (stage_start_clock_ms - start_clock_ms) / 1000.0
+                stage_end = start + (stage_end_clock_ms - start_clock_ms) / 1000.0
+            else:
+                continue
+            stage_duration_ms = max((stage_end - stage_start) * 1000.0, 0.0)
+            rows.append({
+                "row_type": DYNAMIC_KV_GROW_BREAKDOWN_PHASES[stage],
+                "elapsed_s_start": f"{stage_start:.6f}",
+                "elapsed_s_end": f"{stage_end:.6f}",
+                "rss_kb_start": "",
+                "rss_kb_end": "",
+                "col_a_ms": f"{stage_duration_ms:.0f}",
+                "col_b_ms": "",
+                "total_ms": f"{stage_duration_ms:.0f}",
+                "kv_pos": str(old_cells),
+                "kv_total": str(new_cells),
+                "kv_used_pct": "",
+                "kv_estimated_used_kb": str(int(round(old_mib * 1024))) if old_mib else "",
+                "kv_total_kb": str(int(round(new_mib * 1024))) if new_mib else "",
+                "kv_physical_committed_kb": str(int(round(new_mib * 1024))) if new_mib else "",
+                "token_idx": f"{detail}; stage={stage}",
+            })
     return rows
 
 
@@ -654,6 +696,10 @@ def _phase_colors() -> dict[str, str]:
         "T_Prefill": "#e17055",
         "Mmproj": "#00cec9",
         "DynamicKVGrow": "#2d3436",
+        "DynamicKVGrowAlloc": "#636e72",
+        "DynamicKVGrowMetadata": "#b2bec3",
+        "DynamicKVGrowCopy": "#0984e3",
+        "DynamicKVGrowSchedulerReserve": "#6c5ce7",
         "D": "#ff7675",
         "Decode": "#d63031",
     }
@@ -896,6 +942,7 @@ def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[
         "L_DecoderRuntimeInit",
         "L_VisionLoad",
         "LayoutTokenize",
+        *DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values(),
     }
     durations: dict[str, float] = {}
     first_start_s: dict[str, float] = {}
@@ -954,6 +1001,123 @@ def _write_png_phase_duration_from_rows(output_dir: Path, phase_rows: list[dict[
     plt.close(fig)
 
 
+def _write_png_dynamic_kv_grow_breakdown(output_dir: Path, phase_rows: list[dict[str, str]]) -> None:
+    grow_rows = [row for row in phase_rows if row.get("row_type") == "DynamicKVGrow"]
+    if not grow_rows:
+        return
+    breakdown_rows = [
+        row
+        for row in phase_rows
+        if row.get("row_type") in DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values()
+    ]
+    if not breakdown_rows:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    stage_order = [
+        ("DynamicKVGrowAlloc", "Alloc"),
+        ("DynamicKVGrowMetadata", "Metadata"),
+        ("DynamicKVGrowCopy", "Copy"),
+        ("DynamicKVGrowSchedulerReserve", "SchedulerReserve"),
+        ("DynamicKVGrowOther", "Other"),
+    ]
+    colors = {
+        **_phase_colors(),
+        "DynamicKVGrowOther": "#dfe6e9",
+    }
+    grouped: list[dict[str, object]] = []
+    for grow_idx, grow in enumerate(grow_rows):
+        start = _phase_float(grow, "elapsed_s_start")
+        end = _phase_float(grow, "elapsed_s_end")
+        total_ms = max((end - start) * 1000.0, 0.0)
+        if total_ms <= 0:
+            continue
+        stages: dict[str, float] = {}
+        for row in breakdown_rows:
+            row_start = _phase_float(row, "elapsed_s_start")
+            row_end = _phase_float(row, "elapsed_s_end")
+            if row_start < start - 1e-6 or row_end > end + 1e-6:
+                continue
+            name = row.get("row_type", "")
+            stages[name] = stages.get(name, 0.0) + max((row_end - row_start) * 1000.0, 0.0)
+        accounted_ms = sum(stages.values())
+        other_ms = max(total_ms - accounted_ms, 0.0)
+        if other_ms >= 0.5:
+            stages["DynamicKVGrowOther"] = other_ms
+        grouped.append({
+            "label": f"G{grow_idx}: {grow.get('token_idx', '')}",
+            "total_ms": total_ms,
+            "stages": stages,
+        })
+    if not grouped:
+        return
+
+    fig_height = max(4.6, 0.75 * len(grouped) + 2.0)
+    fig, ax = plt.subplots(figsize=(13, fig_height), dpi=160)
+    y_positions = list(range(len(grouped)))
+    for y, group in zip(y_positions, grouped):
+        left = 0.0
+        stages = group["stages"]
+        assert isinstance(stages, dict)
+        for stage_name, stage_label in stage_order:
+            value = float(stages.get(stage_name, 0.0))
+            if value <= 0:
+                continue
+            ax.barh(
+                y,
+                value,
+                left=left,
+                height=0.52,
+                color=colors.get(stage_name, "#636e72"),
+                edgecolor="white",
+                linewidth=0.6,
+            )
+            if value >= max(float(group["total_ms"]) * 0.08, 8.0):
+                ax.text(
+                    left + value / 2.0,
+                    y,
+                    f"{stage_label}\n{value:.0f}ms",
+                    ha="center",
+                    va="center",
+                    color="white" if stage_name != "DynamicKVGrowOther" else "#2d3436",
+                    fontsize=7,
+                    fontweight="bold",
+                )
+            left += value
+        total_ms = float(group["total_ms"])
+        ax.text(
+            total_ms,
+            y,
+            f"  total {total_ms:.0f}ms",
+            ha="left",
+            va="center",
+            fontsize=8,
+            color="#2d3436",
+        )
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels([str(group["label"]) for group in grouped], fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Duration (ms)")
+    ax.set_title(f"Dynamic KV Grow Breakdown: {output_dir.name}")
+    ax.grid(True, axis="x", linestyle=":", alpha=0.35)
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=colors.get(stage_name, "#636e72"))
+        for stage_name, _ in stage_order
+    ]
+    labels = [stage_label for _, stage_label in stage_order]
+    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_dir / "dynamic_kv_grow_breakdown_stacked_bar.png", bbox_inches="tight")
+    plt.close(fig)
+
+
 def _streaming_timeline_phase_name(name: str) -> str | None:
     aliases = {
         "VisionPrefillV_Encode": "V_Encode",
@@ -962,7 +1126,15 @@ def _streaming_timeline_phase_name(name: str) -> str | None:
         "VisionPrefillT_Prefill": "T_Prefill",
     }
     name = aliases.get(name, name)
-    if name in {"SingleBufferUpdate", "V_Encode", "Mmproj", "ImagePrefill", "T_Prefill", "DynamicKVGrow", "D"}:
+    if name in {
+        "SingleBufferUpdate",
+        "V_Encode",
+        "Mmproj",
+        "ImagePrefill",
+        "T_Prefill",
+        "DynamicKVGrow",
+        "D",
+    }:
         return name
     return None
 
@@ -1088,6 +1260,8 @@ def _write_png_streaming_phase_timeline(output_dir: Path, phase_rows: list[dict[
                 label = f"P{idx} {label}"
             if name == "DynamicKVGrow":
                 label = f"KV +{duration_ms:.0f}ms"
+            if name in DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values():
+                label = f"{name.removeprefix('DynamicKVGrow')}\n{duration_ms:.0f}ms"
             ax.text(
                 start + (end - start) / 2.0,
                 y,
@@ -1212,6 +1386,7 @@ def _finalize_hybrid_outputs(result_dir: Path) -> None:
     _write_png_memory_timeline(result_dir, memory_rows, plot_phase_rows)
     if plot_phase_rows:
         _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
+        _write_png_dynamic_kv_grow_breakdown(result_dir, plot_phase_rows)
     else:
         _write_png_phase_duration(result_dir, perf)
 
@@ -1265,6 +1440,7 @@ def _finalize_hybrid_streaming_outputs(result_dir: Path) -> None:
     _write_png_memory_timeline_decode_window(result_dir, memory_rows, plot_phase_rows)
     if plot_phase_rows:
         _write_png_phase_duration_from_rows(result_dir, plot_phase_rows)
+        _write_png_dynamic_kv_grow_breakdown(result_dir, plot_phase_rows)
         _write_png_streaming_phase_timeline(result_dir, plot_phase_rows)
 
 

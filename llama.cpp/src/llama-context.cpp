@@ -1674,7 +1674,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                         if (requested > old_size && memory->grow_to(requested)) {
                             sched_need_reserve = true;
+                            const int64_t sched_reserve_start_ms = ggml_time_ms();
                             sched_reserve();
+                            const int64_t sched_reserve_end_ms = ggml_time_ms();
+                            LLAMA_LOG_INFO("%s: dynamic KV grow breakdown scheduler_reserve clock_start_ms = %" PRId64 ", clock_end_ms = %" PRId64 "\n",
+                                    __func__, sched_reserve_start_ms, sched_reserve_end_ms);
                             const int64_t grow_full_end_ms = ggml_time_ms();
                             LLAMA_LOG_INFO("%s: dynamic KV grow retry window: old = %u, new = %u, logical = %u, clock_start_ms = %" PRId64 ", clock_end_ms = %" PRId64 "\n",
                                     __func__, old_size, memory->get_physical_size(), logical_size, grow_full_start_ms, grow_full_end_ms);
