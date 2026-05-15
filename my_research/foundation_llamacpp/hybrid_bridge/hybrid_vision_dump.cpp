@@ -34,25 +34,23 @@ int main(int argc, char** argv) {
   const std::vector<size_t> group_sizes = streamingvlm::hybrid_bridge::split_csv_sizes(FLAGS_group_sizes);
   streamingvlm::hybrid_bridge::validate_group_sizes(group_sizes, image_paths.size());
 
-  const auto result = streamingvlm::hybrid_bridge::encode_images_with_executorch(
-      FLAGS_encoder_path,
-      image_paths,
-      FLAGS_warmup_image_path);
-
+  streamingvlm::hybrid_bridge::VisionEncoderSession session(FLAGS_encoder_path);
+  const auto warmup_result = session.warmup(FLAGS_warmup_image_path);
+  if (!FLAGS_warmup_output_path.empty() && !warmup_result.warmup_values.empty()) {
+    streamingvlm::hybrid_bridge::write_embedding_file(
+        FLAGS_warmup_output_path,
+        warmup_result.warmup_output_shape,
+        warmup_result.warmup_values.data(),
+        warmup_result.warmup_values.size());
+  }
   streamingvlm::hybrid_bridge::write_text_file(FLAGS_ready_path, "ready\n");
   streamingvlm::hybrid_bridge::wait_for_file(
       FLAGS_wait_path,
       FLAGS_wait_timeout_ms,
       executorch::extension::llm::time_in_ms);
 
+  const auto result = session.encode(image_paths);
   const long write_start_ms = executorch::extension::llm::time_in_ms();
-  if (!FLAGS_warmup_output_path.empty() && !result.warmup_values.empty()) {
-    streamingvlm::hybrid_bridge::write_embedding_file(
-        FLAGS_warmup_output_path,
-        result.warmup_output_shape,
-        result.warmup_values.data(),
-        result.warmup_values.size());
-  }
   streamingvlm::hybrid_bridge::write_embedding_file(
       FLAGS_output_path,
       result.output_shape,

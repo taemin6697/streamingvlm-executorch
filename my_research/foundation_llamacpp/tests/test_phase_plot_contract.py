@@ -1,6 +1,12 @@
 import pytest
+from pathlib import Path
 
 from my_research.foundation_llamacpp.runner import cli as runner_cli
+
+
+ROOT = Path(__file__).resolve().parents[3]
+HYBRID_VISION_DUMP = ROOT / "my_research/foundation_llamacpp/hybrid_bridge/hybrid_vision_dump.cpp"
+HYBRID_DECODE = ROOT / "my_research/foundation_llamacpp/hybrid_bridge/hybrid_decode.cpp"
 
 
 def _row(name: str, start: float, end: float) -> dict[str, str]:
@@ -62,3 +68,42 @@ def test_common_phase_timeline_writer_outputs_phase_timeline_for_stream_rows(tmp
 
     assert (tmp_path / "phase_timeline.png").exists()
     assert not (tmp_path / "streaming_phase_timeline.png").exists()
+
+
+def test_offline_phase_timeline_rebases_after_hidden_setup(tmp_path):
+    rows = [
+        _row("L_DecoderLoad", 0.0, 20.0),
+        _row("Mmproj", 20.0, 21.0),
+        _row("ImagePrefill", 21.0, 22.0),
+        _row("D", 22.0, 23.0),
+    ]
+
+    phases, _markers, origin, end = runner_cli._phase_timeline_data(tmp_path, rows)
+    by_name = {name: (start, phase_end) for name, start, phase_end, _idx in phases}
+
+    assert origin == pytest.approx(0.0)
+    assert by_name["Mmproj"] == (pytest.approx(0.0), pytest.approx(1.0))
+    assert by_name["ImagePrefill"] == (pytest.approx(1.0), pytest.approx(2.0))
+    assert by_name["Decode"] == (pytest.approx(2.0), pytest.approx(3.0))
+    assert end == pytest.approx(3.0)
+
+
+def test_hybrid_offline_vision_measured_encode_waits_for_start_gate():
+    source = HYBRID_VISION_DUMP.read_text()
+
+    session_idx = source.index("VisionEncoderSession session")
+    ready_idx = source.index("write_text_file(FLAGS_ready_path")
+    wait_idx = source.index("wait_for_file(")
+    encode_idx = source.index("session.encode(image_paths)")
+
+    assert session_idx < ready_idx < wait_idx < encode_idx
+
+
+def test_hybrid_offline_decoder_warmup_finishes_before_ready_gate():
+    source = HYBRID_DECODE.read_text()
+
+    warmup_idx = source.index("warmup_mmproj_with_embedding(ctx, warmup_embedding)")
+    ready_idx = source.index("write_text_file(custom.ready_path")
+    measured_wait_idx = source.index("wait_for_file(custom.embedding_path")
+
+    assert warmup_idx < ready_idx < measured_wait_idx

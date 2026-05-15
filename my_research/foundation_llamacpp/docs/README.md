@@ -167,7 +167,8 @@ csv/streaming_phase_stats.csv / csv/stream_events.csv
 
 png/phase_timeline.png
   Common phase timeline plot. Image, multi-image, and offline-video runs use
-  elapsed time; streaming runs use stream/video time from the first frame event.
+  ready-relative time after bridge load/warmup; streaming runs use stream/video
+  time from the first frame event.
 
 txt_json/memory_usage_summary.txt / png/memory_timeline_plot.png
   Android system memory summary and plot.
@@ -810,8 +811,8 @@ streaming_phase_stats.csv / foundation_proc.csv
 phase_timeline.png
   Common phase timeline plot. For streaming runs, the x-axis uses stream/video
   time, so a prompt at 3s is labeled around 3s rather than being rebased to 0s.
-  For image, multi-image, and offline-video runs, the x-axis uses elapsed run
-  time.
+  For image, multi-image, and offline-video runs, the bridge loads and warms up
+  first, then the x-axis is rebased to that ready point.
 ```
 
 Notes:

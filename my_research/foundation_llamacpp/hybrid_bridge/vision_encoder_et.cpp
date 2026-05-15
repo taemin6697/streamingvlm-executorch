@@ -123,6 +123,33 @@ long VisionEncoderSession::load_end_ms() const {
   return impl_->load_end_ms;
 }
 
+VisionEncodeResult VisionEncoderSession::warmup(const std::string& warmup_image_path) {
+  VisionEncodeResult result;
+  result.load_start_ms = impl_->load_start_ms;
+  result.load_end_ms = impl_->load_end_ms;
+  result.input_shape = impl_->input_shape;
+  if (warmup_image_path.empty()) {
+    return result;
+  }
+  executorch::extension::llm::Image warmup_image;
+  example::load_image(warmup_image_path, warmup_image, impl_->expected_size, impl_->expected_dtype);
+  auto warmup_tensor_res = warmup_image.toTensor(/*with_batch=*/true);
+  auto warmup_res = impl_->encoder.encode(warmup_tensor_res.get());
+  ET_CHECK_MSG(warmup_res.ok(), "Encoder warmup execution failed for %s.", warmup_image_path.c_str());
+  Tensor warmup_output = warmup_res.get();
+  ET_CHECK_MSG(
+      warmup_output.scalar_type() == ScalarType::Float,
+      "Hybrid bridge expects float32 warmup encoder output.");
+  result.warmup_output_shape = tensor_shape(warmup_output);
+  const size_t warmup_values = product(result.warmup_output_shape);
+  const float* warmup_output_data = warmup_output.const_data_ptr<float>();
+  result.warmup_values.insert(
+      result.warmup_values.end(),
+      warmup_output_data,
+      warmup_output_data + warmup_values);
+  return result;
+}
+
 VisionEncodeResult VisionEncoderSession::encode(const std::vector<std::string>& image_paths) {
   VisionEncodeResult result;
   result.load_start_ms = impl_->load_start_ms;
@@ -192,25 +219,7 @@ VisionEncodeResult VisionEncoderSession::encode(const std::vector<std::string>& 
 VisionEncodeResult VisionEncoderSession::encode_with_optional_warmup(
     const std::vector<std::string>& image_paths,
     const std::string& warmup_image_path) {
-  VisionEncodeResult result;
-  if (!warmup_image_path.empty()) {
-    executorch::extension::llm::Image warmup_image;
-    example::load_image(warmup_image_path, warmup_image, impl_->expected_size, impl_->expected_dtype);
-    auto warmup_tensor_res = warmup_image.toTensor(/*with_batch=*/true);
-    auto warmup_res = impl_->encoder.encode(warmup_tensor_res.get());
-    ET_CHECK_MSG(warmup_res.ok(), "Encoder warmup execution failed for %s.", warmup_image_path.c_str());
-    Tensor warmup_output = warmup_res.get();
-    ET_CHECK_MSG(
-        warmup_output.scalar_type() == ScalarType::Float,
-        "Hybrid bridge expects float32 warmup encoder output.");
-    result.warmup_output_shape = tensor_shape(warmup_output);
-    const size_t warmup_values = product(result.warmup_output_shape);
-    const float* warmup_output_data = warmup_output.const_data_ptr<float>();
-    result.warmup_values.insert(
-        result.warmup_values.end(),
-        warmup_output_data,
-        warmup_output_data + warmup_values);
-  }
+  VisionEncodeResult result = warmup(warmup_image_path);
   VisionEncodeResult measured = encode(image_paths);
   measured.warmup_output_shape = std::move(result.warmup_output_shape);
   measured.warmup_values = std::move(result.warmup_values);
@@ -249,4 +258,3 @@ void write_vision_stats(
 }
 
 } // namespace streamingvlm::hybrid_bridge
-

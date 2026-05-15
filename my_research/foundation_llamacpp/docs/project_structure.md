@@ -890,8 +890,8 @@ csv/streaming_phase_stats.csv:
 
 png/phase_timeline.png:
   common phase timeline plot. Image, multi-image, and offline-video runs use
-  elapsed time; streaming runs use stream/video time, not first-prompt relative
-  time.
+  ready-relative time after bridge load/warmup; streaming runs use stream/video
+  time, not first-prompt relative time.
 
 DynamicKVGrow:
   synthetic dynamic KV expansion row inserted during finalization. New runs use

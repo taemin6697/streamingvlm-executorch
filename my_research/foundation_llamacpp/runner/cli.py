@@ -1222,18 +1222,22 @@ def _phase_timeline_origin(
     return min(starts) if starts else 0.0
 
 
-def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]], *, stream_time: bool = False) -> None:
-    if not phase_rows:
-        return
-    try:
-        import matplotlib
+def _rebase_phase_timeline_phases(phases: list[tuple[str, float, float, int]]) -> list[tuple[str, float, float, int]]:
+    if not phases:
+        return []
+    origin = min(start for _, start, _, _ in phases)
+    return [
+        (name, start - origin, end - origin, idx)
+        for name, start, end, idx in phases
+    ]
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Patch
-    except Exception:
-        return
 
+def _phase_timeline_data(
+    output_dir: Path,
+    phase_rows: list[dict[str, str]],
+    *,
+    stream_time: bool = False,
+) -> tuple[list[tuple[str, float, float, int]], list[float], float, float]:
     stream_origin_elapsed = min((_phase_float(row, "elapsed_s_start") for row in phase_rows), default=0.0)
     stream_origin_video = 0.0
     events_path = _result_artifact_path(output_dir, "stream_events.csv")
@@ -1262,7 +1266,8 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
         end = _phase_float(row, "elapsed_s_end")
         if name == "StreamPromptPrefill":
             prompt_idx += 1
-            prompt_markers.append(to_plot_time(start))
+            if stream_time:
+                prompt_markers.append(to_plot_time(start))
             continue
         display_name = _phase_timeline_name(name)
         if display_name is None:
@@ -1272,8 +1277,10 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
                 continue
             end = start + 0.015
         phases.append((display_name, to_plot_time(start), to_plot_time(end), max(prompt_idx, 0)))
+    if not stream_time:
+        phases = _rebase_phase_timeline_phases(phases)
     if not phases:
-        return
+        return [], [], 0.0, 0.0
 
     timeline_origin = _phase_timeline_origin(stream_origin_video, prompt_markers, phases, stream_time=stream_time)
     decode_ends = [end for name, _, end, _ in phases if name == "Decode" and end >= timeline_origin]
@@ -1288,6 +1295,22 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
         for marker in prompt_markers
         if marker >= timeline_origin and marker <= timeline_end
     ]
+    return phases, prompt_markers, timeline_origin, timeline_end
+
+
+def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]], *, stream_time: bool = False) -> None:
+    if not phase_rows:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Patch
+    except Exception:
+        return
+
+    phases, prompt_markers, timeline_origin, timeline_end = _phase_timeline_data(output_dir, phase_rows, stream_time=stream_time)
     if not phases:
         return
 
@@ -1325,7 +1348,7 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
         duration_ms = (end - start) * 1000.0
         if name != "Decode" and duration_ms >= 20.0:
             label = f"{duration_ms:.0f}ms"
-            if name in {"V_Encode", "ImagePrefill", "T_Prefill"}:
+            if stream_time and name in {"V_Encode", "ImagePrefill", "T_Prefill"}:
                 label = f"P{idx} {label}"
             if name == "DynamicKVGrow":
                 label = f"KV +{duration_ms:.0f}ms"
@@ -1357,7 +1380,7 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
     ax.set_yticks(list(y_for.values()))
     ax.set_yticklabels(visible)
     ax.invert_yaxis()
-    ax.set_xlabel("Stream Time (s)" if stream_time else "Elapsed Time (s)")
+    ax.set_xlabel("Stream Time (s)" if stream_time else "Ready-relative Time (s)")
     ax.set_title(f"Phase Timeline: {output_dir.name}")
     ax.grid(True, axis="x", linestyle=":", alpha=0.35)
     xmax = max(timeline_end, timeline_origin + 0.1)

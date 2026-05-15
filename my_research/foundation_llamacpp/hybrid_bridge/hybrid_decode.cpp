@@ -536,6 +536,11 @@ int main(int argc, char** argv) {
   decode_context ctx(params);
   const long load_end_ms = ggml_time_ms();
   phases.row("L_DecoderLoad", load_start_ms, load_end_ms);
+  if (!custom.warmup_embedding_path.empty()) {
+    streamingvlm::hybrid_bridge::wait_for_file(custom.warmup_embedding_path, custom.wait_timeout_ms, ggml_time_ms);
+    auto warmup_embedding = streamingvlm::hybrid_bridge::read_embedding_file(custom.warmup_embedding_path);
+    warmup_mmproj_with_embedding(ctx, warmup_embedding);
+  }
   streamingvlm::hybrid_bridge::write_text_file(custom.ready_path, "ready\n");
   if (custom.wait_for_embedding) {
     streamingvlm::hybrid_bridge::wait_for_file(custom.embedding_path, custom.wait_timeout_ms, ggml_time_ms);
@@ -545,11 +550,6 @@ int main(int argc, char** argv) {
   auto embedding = streamingvlm::hybrid_bridge::read_embedding_file(custom.embedding_path);
   const long embedding_read_end_ms = ggml_time_ms();
   phases.row("ExternalEmbeddingRead", embedding_read_start_ms, embedding_read_end_ms);
-
-  if (!custom.warmup_embedding_path.empty()) {
-    auto warmup_embedding = streamingvlm::hybrid_bridge::read_embedding_file(custom.warmup_embedding_path);
-    warmup_mmproj_with_embedding(ctx, warmup_embedding);
-  }
 
   std::unique_ptr<streamingvlm::hybrid_bridge::inference_trace_collector> trace_writer;
   if (!custom.token_io_path.empty()) {

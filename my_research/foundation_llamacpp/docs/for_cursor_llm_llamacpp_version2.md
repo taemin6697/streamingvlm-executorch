@@ -285,7 +285,8 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     prefill, and decode phase rows.
   - `csv/foundation_proc.csv`: normalized copy of streaming phase rows.
   - `png/phase_timeline.png`: common phase timeline plot. Offline runs use
-    elapsed time; streaming runs use stream/video time from `stream_events.csv`.
+    ready-relative time after bridge load/warmup; streaming runs use
+    stream/video time from `stream_events.csv`.
   - `txt_json/stream_response_<idx>.txt`, `txt_json/stream_token_io_<idx>.txt`,
     `stream_inference_tokens_<idx>.txt`: per-prompt output and token traces.
 - Initial Q8 2B hybrid streaming validation:
@@ -401,7 +402,7 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 - Updated `runner/cli.py::_write_png_phase_timeline()` so the x-axis
   is stream/video time rather than first-prompt-relative time for streaming
   runs. The same function now also writes offline image, multi-image, and video
-  phase timelines as `png/phase_timeline.png`.
+  phase timelines as ready-relative `png/phase_timeline.png` plots.
 - The function reads `stream_events.csv`, derives the elapsed-time to video-time
   offset from the first frame/buffer event, and converts all phase rows before
   plotting.

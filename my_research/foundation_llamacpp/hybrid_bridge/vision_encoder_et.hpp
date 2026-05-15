@@ -38,6 +38,7 @@ class VisionEncoderSession {
 
   long load_start_ms() const;
   long load_end_ms() const;
+  VisionEncodeResult warmup(const std::string& warmup_image_path);
   VisionEncodeResult encode(const std::vector<std::string>& image_paths);
   VisionEncodeResult encode_with_optional_warmup(
       const std::vector<std::string>& image_paths,
@@ -62,4 +63,3 @@ void write_vision_stats(
     size_t n_values);
 
 } // namespace streamingvlm::hybrid_bridge
-
