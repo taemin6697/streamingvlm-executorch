@@ -9,8 +9,10 @@ from my_research.foundation_llamacpp.runner.media import (
 
 
 def test_normalize_stream_mode_keeps_single_buffer_alias():
-    assert normalize_stream_mode(None, single_buffer=True) == "single_buffer"
-    assert normalize_stream_mode("single-buffer", single_buffer=False) == "single_buffer"
+    assert normalize_stream_mode(None, single_buffer=True) == "on_demand"
+    assert normalize_stream_mode(None, single_buffer=False) == "on_demand"
+    assert normalize_stream_mode("on-demand", single_buffer=False) == "on_demand"
+    assert normalize_stream_mode("single-buffer", single_buffer=False) == "on_demand"
     assert normalize_stream_mode("sliding-window", single_buffer=False) == "sliding_window"
     assert normalize_stream_mode("vision-prefill", single_buffer=False) == "vision_prefill"
 

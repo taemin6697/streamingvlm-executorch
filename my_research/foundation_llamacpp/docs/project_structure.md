@@ -44,6 +44,24 @@ execution stage:
   finalization
 ```
 
+Current 2026-05-15 baseline:
+
+```text
+hybrid image / multi-image / offline video / streaming
+  -> one Android binary: hybrid_streaming_decode
+
+streaming mode names
+  on_demand       canonical latest-frame baseline
+  single_buffer   accepted legacy alias only
+  sliding_window  selected recent-frame clip with multi-turn text/KV state
+  vision_prefill  incremental KV-level visual prefix cache
+
+online buffer
+  optional --online-buffer decouples input frame cadence from processing
+  cadence; delayed work uses the latest frame/window at processing start and
+  vision-prefill coalesces stale pending cache jobs.
+```
+
 ## Top-Level Layout
 
 ```text
@@ -171,7 +189,7 @@ frame_indices:
   source video frame indices for video_file mode
 
 source_kind:
-  "image", "video", or "streaming_video"
+  "image", "multi_image", "video", or "streaming_video"
 ```
 `MediaMode.STREAMING` is the file-backed streaming simulator path. It is
 separate from `MediaMode.VIDEO_FILE`, which still means offline sampled frames
@@ -256,7 +274,7 @@ duration_s / effective_duration_s / max_video_time:
   original and clipped stream duration
 
 stream_mode:
-  "single_buffer", "sliding_window", or "vision_prefill"
+  "on_demand", "sliding_window", or "vision_prefill"
 
 frames:
   stream_frame index, timestamp_s, video_frame_index, num_patches, and tile files
@@ -265,11 +283,17 @@ prompt_events:
   prompt timestamp_s and prompt text
 ```
 
-In `--single-buffer`, `SingleBufferUpdate` means the current frame pointer is
-replaced with the latest sampled frame. It does not pop from an accumulated
-queue. Prompt events capture the buffered frame at arrival time; the actual
-prompt execution lane is serialized, so a prompt may wait behind an earlier
-decode.
+In `--stream-mode on-demand`, `OnDemandBufferUpdate` means the current frame
+pointer is replaced with the latest sampled frame. It does not pop from an
+accumulated queue. Prompt events normally capture the buffered frame at arrival
+time; the actual prompt execution lane is serialized, so a prompt may wait
+behind an earlier decode. `--single-buffer` and
+`--stream-mode single-buffer` remain accepted aliases for this mode.
+
+With `--online-buffer`, prompt/cache jobs do not freeze their selected frames at
+request timestamp. They read the latest buffered frame/window when the consumer
+actually starts the job, and stale pending vision-prefill cache updates are
+coalesced.
 
 In `--stream-mode sliding-window`, prompt events capture a selected list of
 sampled frames rather than one latest frame. The selection is bounded by
@@ -383,14 +407,14 @@ gpu:
   llama.cpp OpenCL path; video is handled as multiple sampled images by mtmd
 
 hybrid:
-  ExecuTorch/QNN vision process produces `.svlmemb`
-  llama.cpp/OpenCL decoder process consumes that embedding
+  default media path uses one `hybrid_streaming_decode` process that owns both
+  ExecuTorch/QNN vision encode and llama.cpp/OpenCL mmproj/decode
 ```
 
-The hybrid flow intentionally remains a two-process coordinated run because QNN
-vision loading/encode and OpenCL decoder loading have different runtime
-constraints. Do not merge `hybrid_vision_dump` and `hybrid_decode` unless that
-coordination requirement changes.
+The legacy two-process flow (`hybrid_vision_dump` producing `.svlmemb` and
+`hybrid_decode` consuming it) remains available in source for diagnostics and
+historical comparisons, but the runner no longer uses it as the default hybrid
+image/video path.
 
 ## C++ Hybrid Bridge
 
@@ -481,8 +505,8 @@ Responsibilities:
 
 ```text
 Purpose:
-  hybrid QNN streaming runner for single-buffer, sliding-window, and
-  vision-prefill modes.
+  unified hybrid QNN/OpenCL runner for image, multi-image, offline video,
+  on-demand streaming, sliding-window streaming, and vision-prefill streaming.
 
 Compile mode:
   STREAMINGVLM_STREAMING_DECODE_USE_QNN=1
@@ -492,21 +516,25 @@ Inputs:
   text GGUF
   mmproj GGUF
   QNN/ExecuTorch vision PTE
-  streaming media_manifest.json
-  stream_frame_<idx>.bin / stream_frame_<idx>.png files
+  media_manifest.json
+  frame/tile .bin inputs and PNG/JPG layout images
 
 Responsibilities:
   load QNN VisionEncoderSession once
   optionally warm QNN vision once with fixed warmup bin
   load llama.cpp/mmproj decode context once
-  replay sampled frame arrivals according to manifest timestamps
+  for offline image/multi-image/video, encode all manifest bins once and run
+  one prompt through the same decode context
+  for streaming, replay sampled frame arrivals according to manifest timestamps
   maintain sampled-frame history and the latest-frame buffer
   capture prompt events against the correct frame/window snapshot
-  for single-buffer, QNN-encode only the selected frame per prompt
+  for on-demand, QNN-encode only the selected frame per prompt
   for sliding-window, evaluate the selected window while preserving chat/KV state
   for vision-prefill, incrementally append frame KV into full-history snapshots
+  with --online-buffer, select frames at processing start and coalesce stale
+  pending cache updates
   run decoder-side mmproj, prefill, and decode
-  preserve chat history and KV state in single-buffer and sliding-window modes
+  preserve chat history and KV state in all streaming modes
   write stream events, phase rows, output, and per-turn token traces
 ```
 
@@ -514,7 +542,7 @@ Responsibilities:
 
 ```text
 Purpose:
-  standalone OpenCL single-buffer streaming runner.
+  standalone OpenCL on-demand streaming runner.
 
 Compile mode:
   STREAMINGVLM_OPENCL_PHASE_MTMD_NO_MAIN=1
@@ -528,7 +556,7 @@ Inputs:
 Responsibilities:
   include opencl_phase_mtmd.cpp in-process
   load llama.cpp/mtmd OpenCL context once
-  replay sampled frame arrivals with the same single-buffer event model
+  replay sampled frame arrivals with the same on-demand event model
   capture prompt events against the current buffered frame
   run llama.cpp/mtmd OpenCL vision encode + mmproj + prefill + decode
   preserve chat history and KV state across prompts
@@ -691,16 +719,12 @@ specific image wrappers such as InternVL `<img>...</img>`.
 run_android_hybrid_bridge.py
   -> runner.media.prepare_media
   -> push `.bin` frame/tile tensors and layout images
-  -> start hybrid_decode in background
-  -> start hybrid_vision_dump in background
-  -> both processes signal ready
-  -> coordinator touches start_encode.flag
-  -> hybrid_vision_dump warms one QNN encoder.encode() pass on the fixed Golden Gate input
-  -> hybrid_vision_dump writes vision_embedding.svlmemb
-  -> hybrid_decode reads embedding and consumes slices per IMAGE chunk
-  -> hybrid_decode warms mtmd_project_features() once with fixed Golden Gate QNN
-     pre-projector features before measuring Mmproj on the actual input
-  -> pull vision/decoder stats, traces, embedding file, memory timeline
+  -> run hybrid_streaming_decode --media-mode image|multi-image|video
+  -> hybrid_streaming_decode warms QNN encoder.encode() once on fixed Golden Gate input
+  -> hybrid_streaming_decode warms llama.cpp/mmproj decode context once
+  -> encode all manifest bins in order
+  -> consume slices per IMAGE chunk inside the same process
+  -> pull unified phase rows, traces, output, and memory timeline
   -> finalize summaries and plots
 ```
 
@@ -714,16 +738,20 @@ Frame2 marker -> embedding slice 1
 FrameN marker -> embedding slice N - 1
 ```
 
-### Streaming Single-Buffer OpenCL
+The older `hybrid_vision_dump + hybrid_decode` two-process handoff still exists
+for historical comparison, but it is no longer the default hybrid image/video
+runner path.
+
+### Streaming On-Demand OpenCL
 
 ```text
-run_android_hybrid_bridge.py --processor gpu --streaming-video ... --single-buffer
+run_android_hybrid_bridge.py --processor gpu --streaming-video ... --stream-mode on-demand
   -> runner.media.prepare_streaming_video_media
   -> push streaming media_manifest.json and stream_frame_<idx>.png layout images
   -> run opencl_streaming_decode
   -> opencl_streaming_decode loads llama.cpp/mtmd OpenCL context once
   -> producer thread replays sampled frame timestamps
-  -> SingleBufferUpdate replaces current frame pointer
+  -> OnDemandBufferUpdate replaces current frame pointer
   -> prompt job records current frame at arrival time
   -> consumer lane serially runs eval_message() and generate_response()
   -> output stream_events.csv, streaming_phase_stats.csv, per-turn token traces
@@ -733,17 +761,17 @@ run_android_hybrid_bridge.py --processor gpu --streaming-video ... --single-buff
 OpenCL streaming uses llama.cpp/mtmd for `V_Encode` and `Mmproj`. It is useful
 as a direct full-OpenCL baseline for the hybrid QNN streaming path.
 
-### Streaming Single-Buffer Hybrid
+### Streaming On-Demand Hybrid
 
 ```text
-run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --single-buffer
+run_android_hybrid_bridge.py --processor hybrid --streaming-video ... --stream-mode on-demand
   -> runner.media.prepare_streaming_video_media
   -> push media_manifest.json, stream_frame_<idx>.png, stream_frame_<idx>.bin
   -> run hybrid_streaming_decode
   -> hybrid_streaming_decode loads VisionEncoderSession once
   -> hybrid_streaming_decode loads llama.cpp/mmproj context once
   -> producer thread replays sampled frame timestamps
-  -> SingleBufferUpdate replaces current frame pointer
+  -> OnDemandBufferUpdate replaces current frame pointer
   -> prompt job records current frame at arrival time
   -> consumer lane serially QNN-encodes the selected .bin frame
   -> eval_with_external_embedding() runs decoder-side mmproj and prefill
@@ -881,7 +909,7 @@ Streaming artifacts:
 
 ```text
 csv/stream_events.csv:
-  frame enqueue, SingleBufferUpdate, prompt arrival, and prompt decode spans
+  frame enqueue, OnDemandBufferUpdate, prompt arrival, and prompt decode spans
 
 csv/streaming_phase_stats.csv:
   setup, buffer update, vision, mmproj, prefill, and decode phase rows. New
@@ -918,9 +946,15 @@ stream_inference_tokens_<idx>.txt:
 
 foundation_inference_tokens.txt:
   aggregate of all streaming turns with prompt headers
+
+txt_json/stream_buffer_summary.txt:
+  requested and observed input FPS, processed visual FPS, skipped/coalesced
+  cache updates, and prompt-frame lag. This is especially useful for
+  `--online-buffer` runs because input frame arrival and processing throughput
+  are intentionally decoupled.
 ```
 
-Hybrid-only artifacts:
+Legacy hybrid two-process artifacts:
 
 ```text
 hybrid_vision_stdout.txt
@@ -934,6 +968,10 @@ vision_exit_code.txt
 decoder_exit_code.txt
 media_manifest.json
 ```
+
+New default hybrid media/streaming runs use `hybrid_streaming_stdout.txt` and
+the common `foundation_*`, `stream_events.csv`, and `streaming_phase_stats.csv`
+artifacts instead.
 
 Standalone OpenCL artifacts:
 
@@ -1001,7 +1039,9 @@ When changing C++ bridge behavior:
 4. Keep binaries thin: parse CLI flags, call shared modules, write artifacts.
 5. Preserve existing target names because the Python runner and README commands
    call them directly.
-6. Rebuild hybrid_decode, opencl_phase_mtmd, and hybrid_vision_dump.
+6. Rebuild `hybrid_streaming_decode` and `opencl_streaming_decode`; rebuild
+   `hybrid_decode`/`hybrid_vision_dump` only when touching the legacy split
+   bridge.
 7. Run at least one image or video smoke test when prompt/media layout changes.
 ```
 
@@ -1010,20 +1050,20 @@ When changing streaming:
 ```text
 1. Keep video_file and streaming semantics separate. Video_file is offline
    sampled frames; streaming is timestamped replay with prompt events.
-2. Preserve the explicit state model. Single-buffer is latest-frame state,
+2. Preserve the explicit state model. On-demand is latest-frame state,
    sliding-window is bounded visual-window state with retained text/chat KV, and
    vision-prefill is incrementally saved/restored streaming-turn KV with
    retained closed chat history.
 3. Keep prompt arrival timestamp, selected buffered frame, and actual execution
    start distinguishable in stream_events.csv.
-4. Decoder context retention/eviction must remain explicit. Single-buffer,
+4. Decoder context retention/eviction must remain explicit. On-demand,
    sliding-window, and vision-prefill preserve chat history and KV across prompt
    events; vision-prefill restores a cached open user-turn prefix, evaluates
    only the text suffix, then saves the post-answer state for later frames.
 5. Keep OpenCL and Hybrid streaming artifacts aligned so their timelines can be
    compared.
 6. If adding persistent prefill or vision-encoder-only streaming, add new mode
-   flags instead of changing --single-buffer semantics silently.
+   flags instead of changing `--stream-mode on-demand` semantics silently.
 7. Keep dynamic KV and paged KV language separate. Current main means
    contiguous dynamic KV grow with OpenCL device-to-device migration; paged KV
    must be reintroduced only through a new design/branch.

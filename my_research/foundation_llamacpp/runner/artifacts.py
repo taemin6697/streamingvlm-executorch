@@ -26,6 +26,7 @@ HYBRID_STREAMING_PULL_ARTIFACTS = (
     "streaming_phase_stats.csv",
     "foundation_token_io.txt",
     "foundation_inference_tokens.txt",
+    "stream_buffer_summary.txt",
     "stream_inference_tokens_*.txt",
     "media_manifest.json",
     "foundation_exit_code.txt",
@@ -42,4 +43,3 @@ STANDALONE_PULL_ARTIFACTS = (
     "opencl_projected_embedding.svlmemb",
     "android_memory_timeline.csv",
 )
-

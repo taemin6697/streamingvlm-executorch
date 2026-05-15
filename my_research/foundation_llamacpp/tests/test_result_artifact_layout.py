@@ -61,7 +61,8 @@ def test_prepare_multi_image_media_uses_internvl_image_prefixes(tmp_path):
     Image.new("RGB", (32, 32), color=(255, 0, 0)).save(image_a)
     Image.new("RGB", (32, 32), color=(0, 255, 0)).save(image_b)
     args = argparse.Namespace(
-        images=[image_a, image_b],
+        multi_image=[image_a, image_b],
+        images=None,
         image=None,
         video=None,
         streaming_video=None,
@@ -78,8 +79,30 @@ def test_prepare_multi_image_media_uses_internvl_image_prefixes(tmp_path):
         "Compare the two images."
     )
     assert manifest["source_kind"] == "multi_image"
+    assert len(manifest["frames"]) == 2
+    assert manifest["prompt_events"] == [{"time": 0.0, "prompt": media.prompt}]
     assert manifest["num_patches_list"] == [1, 1]
     assert len(manifest["layout_images"]) == 2
+
+
+def test_prepare_image_and_video_media_write_unified_manifest_shape(tmp_path):
+    image = tmp_path / "a.jpg"
+    Image.new("RGB", (32, 32), color=(255, 0, 0)).save(image)
+
+    image_args = argparse.Namespace(
+        image=image,
+        multi_image=None,
+        images=None,
+        video=None,
+        streaming_video=None,
+        prompt="Describe it.",
+    )
+    image_media = prepare_media(image_args, tmp_path / "prepared_image")
+    image_manifest = json.loads(image_media.metadata_path.read_text(encoding="utf-8"))
+
+    assert image_manifest["source_kind"] == "image"
+    assert image_manifest["frames"][0]["stream_frame"] == 0
+    assert image_manifest["prompt_events"] == [{"time": 0.0, "prompt": image_manifest["prompt"]}]
 
 
 def test_result_model_name_separates_image_multi_image_and_video_runs(tmp_path):
@@ -95,6 +118,18 @@ def test_result_model_name_separates_image_multi_image_and_video_runs(tmp_path):
     assert len({image_name, multi_name, video_name}) == 3
 
 
+def test_hybrid_media_runner_uses_unified_streaming_binary():
+    source = (runner_cli.FOUNDATION_LLAMA / "runner" / "cli.py").read_text(encoding="utf-8")
+    hybrid_branch = source.split('if args.processor == "hybrid":', 1)[1].split("\n        else:", 1)[0]
+
+    assert '_find_executable(args.vision_build_dir, "hybrid_streaming_decode")' in hybrid_branch
+    assert "_push(adb, streaming_bin, args.remote_root)" in hybrid_branch
+    assert "_build_hybrid_streaming_remote_script(args)" in hybrid_branch
+    assert "_build_hybrid_remote_script(args, encoder_pte=encoder_pte, media=media)" not in hybrid_branch
+    assert "_push(adb, vision_bin, args.remote_root)" not in hybrid_branch
+    assert "_push(adb, decode_bin, args.remote_root)" not in hybrid_branch
+
+
 def test_artifact_layout_smoke_script_runs_vision_prefill_with_dynamic_kv():
     script = (
         runner_cli.FOUNDATION_LLAMA
@@ -102,7 +137,10 @@ def test_artifact_layout_smoke_script_runs_vision_prefill_with_dynamic_kv():
         / "run_artifact_layout_1b_q8.sh"
     ).read_text(encoding="utf-8")
 
-    assert script.count("--stream-mode vision-prefill") == 2
+    assert script.count("--stream-mode vision-prefill") == 3
+    assert "for mode in on-demand sliding-window" in script
+    assert "--multi-image \"$IMAGE_A\" \"$IMAGE_B\"" in script
+    assert "--online-buffer" in script
     assert "--processor hybrid" in script
     assert "--vision \"$VISION\"" in script
     assert "--dynamic-kv-cache" in script

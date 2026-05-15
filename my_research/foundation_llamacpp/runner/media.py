@@ -13,26 +13,46 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 MEDIA_MARKER = "<__media__>"
 MEDIA_MANIFEST_VERSION = 2
+STREAM_MODE_ON_DEMAND = "on_demand"
 STREAM_MODE_SINGLE_BUFFER = "single_buffer"
 STREAM_MODE_SLIDING_WINDOW = "sliding_window"
 STREAM_MODE_VISION_PREFILL = "vision_prefill"
 STREAM_MODES = {
-    STREAM_MODE_SINGLE_BUFFER,
+    STREAM_MODE_ON_DEMAND,
     STREAM_MODE_SLIDING_WINDOW,
     STREAM_MODE_VISION_PREFILL,
+}
+STREAM_MODE_ALIASES = {
+    STREAM_MODE_SINGLE_BUFFER: STREAM_MODE_ON_DEMAND,
 }
 
 
 def normalize_stream_mode(stream_mode: str | None, *, single_buffer: bool = False) -> str:
     if single_buffer:
-        return STREAM_MODE_SINGLE_BUFFER
+        return STREAM_MODE_ON_DEMAND
     if stream_mode is None:
-        return STREAM_MODE_SINGLE_BUFFER
+        return STREAM_MODE_ON_DEMAND
     normalized = stream_mode.strip().lower().replace("-", "_")
+    normalized = STREAM_MODE_ALIASES.get(normalized, normalized)
     if normalized not in STREAM_MODES:
         choices = ", ".join(sorted(mode.replace("_", "-") for mode in STREAM_MODES))
         raise ValueError(f"unsupported stream mode: {stream_mode!r}; expected one of: {choices}")
     return normalized
+
+
+def internvl3_image_prompt(raw_prompt: str, *, n_images: int = 1) -> str:
+    return (MEDIA_MARKER * max(n_images, 1)) + "\n" + raw_prompt
+
+
+def internvl3_multi_image_prompt(num_images: int, raw_prompt: str) -> str:
+    return "".join(f"Image-{image_i + 1}: {MEDIA_MARKER}\n" for image_i in range(num_images)) + raw_prompt
+
+
+def internvl3_video_prompt(num_patches_list: list[int], raw_prompt: str) -> str:
+    prefix_parts: list[str] = []
+    for frame_i, n_patches in enumerate(num_patches_list):
+        prefix_parts.append(f"Frame{frame_i + 1}: " + (MEDIA_MARKER * max(int(n_patches), 1)) + "\n")
+    return "".join(prefix_parts) + raw_prompt
 
 
 def _evenly_limit_items(items: list, limit: int) -> list:
@@ -72,11 +92,7 @@ def select_recent_window_frames(
 
 
 def build_streaming_video_prompt(frames: list[dict[str, object]], raw_prompt: str) -> str:
-    prefix_parts: list[str] = []
-    for frame_i, frame in enumerate(frames):
-        n_patches = int(frame.get("num_patches", 1) or 1)
-        prefix_parts.append(f"Frame{frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
-    return "".join(prefix_parts) + raw_prompt
+    return internvl3_video_prompt([int(frame.get("num_patches", 1) or 1) for frame in frames], raw_prompt)
 
 
 def normalize_image_to_bin(image, output_path: Path, image_size: int = 448) -> None:
@@ -172,6 +188,14 @@ def prepare_image_media(image: Path, work_dir: Path, prompt: str) -> PreparedMed
     normalize_image_to_bin(load_image(str(image)), frame_bin)
     if image.resolve() != layout_image.resolve():
         layout_image.write_bytes(image.read_bytes())
+    media_prompt = internvl3_image_prompt(prompt)
+    frame_record = {
+        "stream_frame": 0,
+        "timestamp_s": 0.0,
+        "video_frame_index": 0,
+        "num_patches": 1,
+        "tiles": [{"bin": frame_bin.name, "layout_image": layout_image.name}],
+    }
     metadata = {
         "schema_version": MEDIA_MANIFEST_VERSION,
         "source_kind": "image",
@@ -180,14 +204,18 @@ def prepare_image_media(image: Path, work_dir: Path, prompt: str) -> PreparedMed
         "frame_indices": [0],
         "frame_bins": [frame_bin.name],
         "layout_images": [layout_image.name],
-        "prompt": prompt,
+        "frames": [frame_record],
+        "prompt_events": [{"time": 0.0, "prompt": media_prompt}],
+        "prompt": media_prompt,
+        "raw_prompt": prompt,
+        "prompt_format": "internvl3",
     }
     metadata_path = work_dir / "media_manifest.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return PreparedMedia(
         frame_bins=[frame_bin],
         layout_images=[layout_image],
-        prompt=prompt,
+        prompt=media_prompt,
         metadata_path=metadata_path,
         num_patches_list=[1],
         frame_indices=[0],
@@ -197,7 +225,7 @@ def prepare_image_media(image: Path, work_dir: Path, prompt: str) -> PreparedMed
 
 def prepare_multi_image_media(images: list[Path], work_dir: Path, prompt: str) -> PreparedMedia:
     if not images:
-        raise SystemExit("--images requires at least one image path")
+        raise SystemExit("--multi-image requires at least one image path")
     load_image = importlib.import_module("transformers.image_utils").load_image
 
     frame_bins: list[Path] = []
@@ -222,10 +250,17 @@ def prepare_multi_image_media(images: list[Path], work_dir: Path, prompt: str) -
             }
         )
 
-    media_prompt = "".join(
-        f"Image-{image_i + 1}: {MEDIA_MARKER}\n"
+    media_prompt = internvl3_multi_image_prompt(len(images), prompt)
+    frame_records = [
+        {
+            "stream_frame": image_i,
+            "timestamp_s": float(image_i),
+            "video_frame_index": image_i,
+            "num_patches": 1,
+            "tiles": [{"bin": frame_bins[image_i].name, "layout_image": layout_images[image_i].name}],
+        }
         for image_i in range(len(images))
-    ) + prompt
+    ]
     metadata = {
         "schema_version": MEDIA_MANIFEST_VERSION,
         "source_kind": "multi_image",
@@ -234,9 +269,12 @@ def prepare_multi_image_media(images: list[Path], work_dir: Path, prompt: str) -
         "frame_indices": list(range(len(images))),
         "frame_bins": [path.name for path in frame_bins],
         "layout_images": [path.name for path in layout_images],
+        "frames": frame_records,
         "images": image_records,
+        "prompt_events": [{"time": 0.0, "prompt": media_prompt}],
         "prompt": media_prompt,
         "raw_prompt": prompt,
+        "prompt_format": "internvl3",
     }
     metadata_path = work_dir / "media_manifest.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -281,6 +319,8 @@ def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segment
             tile_records.append({"bin": frame_bin.name, "layout_image": layout_image.name})
         frame_records.append(
             {
+                "stream_frame": frame_i,
+                "timestamp_s": float(frame_i),
                 "frame": frame_i + 1,
                 "video_frame_index": int(frame_index),
                 "num_patches": len(tiles),
@@ -288,10 +328,7 @@ def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segment
             }
         )
 
-    prefix_parts: list[str] = []
-    for frame_i, n_patches in enumerate(num_patches_list):
-        prefix_parts.append(f"Frame{frame_i + 1}: " + (MEDIA_MARKER * n_patches) + "\n")
-    media_prompt = "".join(prefix_parts) + prompt
+    media_prompt = internvl3_video_prompt(num_patches_list, prompt)
 
     metadata = {
         "schema_version": MEDIA_MANIFEST_VERSION,
@@ -306,8 +343,10 @@ def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segment
         "frame_bins": [p.name for p in frame_bins],
         "layout_images": [p.name for p in layout_images],
         "frames": frame_records,
+        "prompt_events": [{"time": 0.0, "prompt": media_prompt}],
         "prompt": media_prompt,
         "raw_prompt": prompt,
+        "prompt_format": "internvl3",
     }
     metadata_path = work_dir / "media_manifest.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -348,7 +387,7 @@ def prepare_streaming_video_media(
         raise SystemExit(f"Streaming video has no frames: {video}")
     effective_duration_s = min(duration_s, max_video_time) if max_video_time is not None else duration_s
     normalized_stream_mode = normalize_stream_mode(stream_mode, single_buffer=single_buffer)
-    use_single_buffer_frames = normalized_stream_mode == STREAM_MODE_SINGLE_BUFFER
+    use_single_buffer_frames = normalized_stream_mode == STREAM_MODE_ON_DEMAND
 
     sample_count = int(np.floor(effective_duration_s * sampling_fps)) + 1
     timestamps = [idx / sampling_fps for idx in range(sample_count)]
@@ -427,6 +466,7 @@ def prepare_streaming_video_media(
         "prompt_events": prompt_events,
         "prompt": "",
         "raw_prompt": [event["prompt"] for event in prompt_events],
+        "prompt_format": "internvl3",
     }
     metadata_path = work_dir / "media_manifest.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -455,8 +495,11 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
             window_max_frames=getattr(args, "window_max_frames", 8),
             single_buffer=getattr(args, "single_buffer", False),
         )
-    if getattr(args, "images", None) is not None:
-        return prepare_multi_image_media(args.images, work_dir, args.prompt)
+    multi_image = getattr(args, "multi_image", None)
+    if multi_image is None:
+        multi_image = getattr(args, "images", None)
+    if multi_image is not None:
+        return prepare_multi_image_media(multi_image, work_dir, args.prompt)
     if args.video is not None:
         return prepare_video_media(
             args.video,
@@ -466,5 +509,5 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
             max_num=args.max_num,
         )
     if args.image is None:
-        raise SystemExit("media preparation requires --image, --images, or --video")
+        raise SystemExit("media preparation requires --image, --multi-image, --images, or --video")
     return prepare_image_media(args.image, work_dir, args.prompt)

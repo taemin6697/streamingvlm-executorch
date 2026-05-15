@@ -98,7 +98,7 @@ run_common \
   --prompt "Describe this image briefly."
 
 run_common \
-  --images "$IMAGE_A" "$IMAGE_B" \
+  --multi-image "$IMAGE_A" "$IMAGE_B" \
   --prompt "Compare these two images briefly."
 
 run_common \
@@ -107,7 +107,7 @@ run_common \
   --max-num 1 \
   --prompt "What is happening in this video?"
 
-for mode in single-buffer sliding-window; do
+for mode in on-demand sliding-window; do
   run_common \
     --streaming-video "$VIDEO" \
     --stream-mode "$mode" \
@@ -145,13 +145,29 @@ run_common \
   --kv-init-size 512 \
   --kv-grow-step 512
 
+run_common \
+  --streaming-video "$VIDEO" \
+  --stream-mode vision-prefill \
+  --sampling-fps 1.0 \
+  --max-video-time 2.0 \
+  --window-sec 2.0 \
+  --window-max-frames 4 \
+  --max-num 1 \
+  --time '[1.0, 2.0]' \
+  --prompt '["What is happening in this video?", "What changed?"]' \
+  --dynamic-kv-cache \
+  --kv-init-size 512 \
+  --kv-grow-step 512 \
+  --online-buffer
+
 STEM="InternVL3-1B-Instruct-Q8_0_hybrid_ctx_4096"
 verify_layout "$RESULTS_ROOT/${STEM}_image_kv16"
 verify_layout "$RESULTS_ROOT/${STEM}_multi_image_kv16"
 verify_layout "$RESULTS_ROOT/${STEM}_video_kv16"
-verify_layout "$RESULTS_ROOT/${STEM}_streaming_kv16"
+verify_layout "$RESULTS_ROOT/${STEM}_streaming_on_demand_kv16"
 verify_layout "$RESULTS_ROOT/${STEM}_streaming_sliding_window_kv16"
 verify_layout "$RESULTS_ROOT/${STEM}_streaming_vision_prefill_kv16"
 verify_layout "$RESULTS_ROOT/${STEM}_streaming_vision_prefill_kv16_dynamic"
+verify_layout "$RESULTS_ROOT/${STEM}_streaming_vision_prefill_kv16_dynamic_online"
 
 find "$RESULTS_ROOT" -maxdepth 2 -type d | sort

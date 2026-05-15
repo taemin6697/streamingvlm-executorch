@@ -1,7 +1,9 @@
 # Streaming Sliding-Window And Vision-Prefill Modes
 
 This note documents the two non-native streaming observation modes added after
-the original single-buffer streaming baseline:
+the original single-buffer streaming baseline. The current public name for that
+baseline is `--stream-mode on-demand`; `--stream-mode single-buffer` and
+`--single-buffer` remain compatibility aliases.
 
 - `--stream-mode sliding-window`
 - `--stream-mode vision-prefill`
@@ -23,7 +25,7 @@ difference is the state model used when a prompt arrives.
 ## Mode Summary
 
 ```text
-single-buffer:
+on-demand:
   latest image only
   multi-turn chat/KV state is preserved
   prompt latency includes prompt-time vision encode and image prefill
@@ -68,7 +70,7 @@ The manifest records:
 
 ```text
 source_kind: streaming_video
-stream_mode: single_buffer | sliding_window | vision_prefill
+stream_mode: on_demand | sliding_window | vision_prefill
 sampling_fps
 duration_s
 effective_duration_s
@@ -78,7 +80,7 @@ frames[]
 prompt_events[]
 ```
 
-`single-buffer` can use only layout images for OpenCL, but the hybrid streaming
+`on-demand` can use only layout images for OpenCL, but the hybrid streaming
 modes need both PNG layout images and normalized CHW float32 `.bin` inputs for
 ExecuTorch/QNN vision encoding.
 
@@ -88,10 +90,13 @@ ExecuTorch/QNN vision encoding.
 
 ```text
 --single-buffer
-  Backward-compatible alias for --stream-mode single-buffer.
+  Backward-compatible alias for --stream-mode on-demand.
 
---stream-mode single-buffer|sliding-window|vision-prefill
+--stream-mode on-demand|sliding-window|vision-prefill
   Selects streaming state semantics.
+
+--stream-mode single-buffer
+  Backward-compatible alias for --stream-mode on-demand.
 
 --window-sec SEC
   Lookback window used only by sliding-window.
@@ -103,9 +108,10 @@ ExecuTorch/QNN vision encoding.
 `vision-prefill` intentionally ignores `--window-sec` and
 `--window-max-frames`. It uses all sampled frames up to each cache-update frame.
 
-Result directories include the stream mode for non-single-buffer runs:
+Result directories include the stream mode:
 
 ```text
+<model>_hybrid_ctx_4096_streaming_on_demand_kv16
 <model>_hybrid_ctx_4096_streaming_sliding_window_kv16
 <model>_hybrid_ctx_4096_streaming_vision_prefill_kv16
 ```
@@ -119,7 +125,7 @@ The producer replays sampled frame timestamps. For each frame:
 
 ```text
 StreamFrameEnqueue
-SingleBufferUpdate
+OnDemandBufferUpdate
 ```
 
 In `vision-prefill`, the producer also enqueues a `CacheUpdate` job for every
@@ -340,7 +346,7 @@ VisionPrefillT_Prefill     -> T_Prefill
 ```
 
 Cache management rows remain in CSV but are hidden from the PNG timeline.
-`SingleBufferUpdate` stays visible as a vertical tick marker so frame arrivals
+`OnDemandBufferUpdate` stays visible as a vertical tick marker so frame arrivals
 can still be inspected.
 
 ## Validation

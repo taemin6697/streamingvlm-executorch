@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -16,8 +17,20 @@ def adb_cmd(serial: str | None) -> list[str]:
     return cmd
 
 
-def push(adb: list[str], local: Path, remote_dir: str) -> None:
-    run(adb + ["push", str(local), f"{remote_dir}/{local.name}"])
+def push(adb: list[str], local: Path, remote_dir: str, *, attempts: int = 3, retry_delay_s: float = 0.5) -> None:
+    cmd = adb + ["push", str(local), f"{remote_dir}/{local.name}"]
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(max(attempts, 1)):
+        try:
+            run(cmd)
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if attempt + 1 >= max(attempts, 1):
+                raise
+            time.sleep(retry_delay_s * (attempt + 1))
+    if last_error is not None:
+        raise last_error
 
 
 def remote_exists(adb: list[str], remote_path: str) -> bool:
@@ -39,4 +52,3 @@ def pull_if_exists(adb: list[str], remote: str, local: Path) -> None:
 
 def shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
-

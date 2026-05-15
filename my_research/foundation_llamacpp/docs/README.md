@@ -6,10 +6,43 @@ guide. Build internals and historical notes live in
 `archive/executorch_vision_llamacpp_decoder.md`. Dynamic KV implementation
 details live in `archive/dynamic_kv_cache_implementation.md`, and the OpenCL
 buffer/memory-architecture explanation lives in
-`archive/dynamic_kv_opencl_buffer_memory_architecture.md`. Streaming
+`archive/dynamic_kv_opencl_buffer_memory_architecture.md`. Legacy
 single-buffer details live in `archive/streaming_single_buffer_implementation.md`;
-sliding-window and KV vision-prefill details live in
+the current on-demand/sliding-window/KV vision-prefill details live in
 `archive/streaming_sliding_window_and_vision_prefill.md`.
+
+## Current Baseline
+
+As of 2026-05-15, the hybrid media baseline is unified around
+`hybrid_streaming_decode`:
+
+```text
+image          -> hybrid_streaming_decode --media-mode image
+multi-image    -> hybrid_streaming_decode --media-mode multi-image
+offline video  -> hybrid_streaming_decode --media-mode video
+streaming      -> hybrid_streaming_decode --media-mode streaming
+```
+
+The old `hybrid_vision_dump + hybrid_decode` split remains in source for
+comparison and older notes, but the default hybrid runner path now executes the
+single unified binary for image, multi-image, video, and streaming runs.
+
+User-facing CLI cleanup:
+
+```text
+--stream-mode on-demand
+  Canonical name for the old single-buffer latest-frame streaming baseline.
+  `--stream-mode single-buffer` and `--single-buffer` are accepted aliases.
+
+--multi-image img1 img2 ...
+  Canonical multi-image argument. `--images` remains a compatibility alias.
+
+--online-buffer
+  Streaming-only latest-buffer mode. Input frames continue to arrive at the
+  configured sampling FPS. If processing is delayed, prompt/cache work selects
+  frames from the latest buffer at processing start, and stale pending
+  vision-prefill cache updates are coalesced.
+```
 
 ## Common Setup
 
@@ -114,9 +147,10 @@ InternVL3-2B-Instruct-Q8_0_cpu_ctx_4096_text_kv16
 InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_image_kv16
 InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_multi_image_kv16
 InternVL3-2B-Instruct-Q8_0_opencl_ctx_4096_video_kv16
-InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_kv16
+InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_on_demand_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_sliding_window_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16
+InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16_dynamic_online
 ```
 
 Each run directory is normalized into three report folders after finalization:
@@ -165,6 +199,12 @@ csv/foundation_proc.csv
 csv/streaming_phase_stats.csv / csv/stream_events.csv
   Streaming-only timing and event logs.
 
+txt_json/stream_buffer_summary.txt
+  Streaming-only buffer report. It records requested/observed input FPS,
+  processed visual job FPS, skipped cache updates, and average prompt-frame
+  lag. `--online-buffer` uses this file to show the split between input frame
+  cadence and delayed processing cadence.
+
 png/phase_timeline.png
   Common phase timeline plot. Image, multi-image, and offline-video runs use
   ready-relative time after bridge load/warmup; streaming runs use stream/video
@@ -196,11 +236,13 @@ Artifact layout smoke:
 my_research/foundation_llamacpp/scripts/run_artifact_layout_1b_q8.sh
 ```
 
-This runs 1B Q8 hybrid single-image, multi-image, offline video, single-buffer
-streaming, sliding-window streaming, vision-prefill streaming, and
-vision-prefill streaming with dynamic KV growth (`--kv-init-size 512`,
-`--kv-grow-step 512`). It deliberately does not force-push models; the remote
-root must already contain the 1B Q8 GGUF, mmproj, and vision PTE files.
+This runs the 1B Q8 hybrid baseline matrix: single image, multi-image, offline
+video, streaming on-demand, streaming sliding-window, streaming vision-prefill,
+streaming vision-prefill with dynamic KV growth, and streaming vision-prefill
+with dynamic KV growth plus `--online-buffer`. Dynamic runs use
+`--kv-init-size 512` and `--kv-grow-step 512`. The script deliberately does not
+force-push models; the remote root must already contain the 1B Q8 GGUF, mmproj,
+and vision PTE files.
 
 ## Single Text Input
 
@@ -394,7 +436,7 @@ Useful:
 
 ## Multiple Image Input
 
-Use `--images` for InternVL-style multi-image prompts. The runner normalizes
+Use `--multi-image` for InternVL-style multi-image prompts. The runner normalizes
 each image as one 448 x 448 input, builds this prompt prefix, and writes the
 same `csv/`, `png/`, `txt_json/` artifact folders as single-image runs:
 
@@ -412,7 +454,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --llama-build-dir my_research/foundation_llamacpp/build-hybrid-android-opencl \
   --model llama.cpp/models/InternVL3-1B-Instruct-GGUF/InternVL3-1B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-1B-Instruct-GGUF/mmproj-InternVL3-1B-Instruct-Q8_0.gguf \
-  --images \
+  --multi-image \
     my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
     my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg \
   --prompt "Compare these two images briefly." \
@@ -551,9 +593,10 @@ Streaming video mode is supported by `--processor gpu` and `--processor hybrid`.
 
 The host samples the video first and pushes frame files plus `media_manifest.json`
 to Android. The device runner then replays those frames according to their
-timestamps. `--stream-mode single-buffer` keeps only the latest sampled frame.
-`--stream-mode sliding-window` turns the recent sampled frames into one
-video clip at prompt arrival while preserving multi-turn chat/KV state.
+timestamps. `--stream-mode on-demand` keeps only the latest sampled frame.
+`--stream-mode single-buffer` and `--single-buffer` are aliases for this legacy
+baseline. `--stream-mode sliding-window` turns the recent sampled frames into
+one video clip at prompt arrival while preserving multi-turn chat/KV state.
 `--stream-mode vision-prefill` is the
 hybrid KV-cache observation mode: every sampled frame saves a full-history
 video-prefix KV snapshot. Frame 0 is built from scratch; later frames restore
@@ -561,8 +604,11 @@ the previous snapshot and append only the new frame's label/image KV before
 saving the next snapshot. Prompt handling restores the matching snapshot before
 evaluating only the text question suffix.
 
-This is a deterministic file-backed streaming simulator, not a real camera
-queue.
+By default this is a deterministic file-backed streaming simulator where prompt
+jobs capture their selected frame/window at request timestamp. Add
+`--online-buffer` to model a real latest-buffer camera path: frame input cadence
+and processing cadence are decoupled, stale pending cache updates are dropped,
+and delayed prompt/cache work uses the latest frame/window at processing start.
 
 ### CPU
 
@@ -577,7 +623,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
   --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
-  --single-buffer \
+  --stream-mode on-demand \
   --sampling-fps 1.0 \
   --max_video_time 15 \
   --time '[5.0, 8.0]' \
@@ -608,7 +654,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --model llama.cpp/models/InternVL3-8B-Instruct-GGUF/InternVL3-8B-Instruct-Q4_K_M.gguf \
   --mmproj llama.cpp/models/InternVL3-8B-Instruct-GGUF/mmproj-InternVL3-8B-Instruct-Q8_0.gguf \
   --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
-  --single-buffer \
+  --stream-mode on-demand \
   --sampling-fps 1.0 \
   --max_video_time 60 \
   --time '[5.0, 8.0, 11.0, 14.0]' \
@@ -642,7 +688,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --model llama.cpp/models/InternVL3-8B-Instruct-GGUF/InternVL3-8B-Instruct-Q4_K_M.gguf \
   --mmproj llama.cpp/models/InternVL3-8B-Instruct-GGUF/mmproj-InternVL3-8B-Instruct-Q8_0.gguf \
   --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
-  --single-buffer \
+  --stream-mode on-demand \
   --sampling-fps 1.0 \
   --max_video_time 60 \
   --time '[5.0, 8.0, 11.0, 14.0]' \
@@ -677,7 +723,7 @@ python3 my_research/foundation_llamacpp/run_android_hybrid_bridge.py \
   --model llama.cpp/models/InternVL3-2B-Instruct-GGUF/InternVL3-2B-Instruct-Q8_0.gguf \
   --mmproj llama.cpp/models/InternVL3-2B-Instruct-GGUF/mmproj-InternVL3-2B-Instruct-Q8_0.gguf \
   --streaming-video my_research/foundation_llamacpp/sample_images/surveil_8.mp4 \
-  --single-buffer \
+  --stream-mode on-demand \
   --sampling-fps 1.0 \
   --max_video_time 15 \
   --time '[5.0, 8.0, 11.0, 14.0]' \
@@ -716,12 +762,15 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
   Input video to sample and replay.
 
 --single-buffer
-  Backward-compatible alias for `--stream-mode single-buffer`.
+  Backward-compatible alias for `--stream-mode on-demand`.
 
---stream-mode single-buffer
-  Existing native streaming baseline. Keep only the latest sampled frame as the
+--stream-mode on-demand
+  Existing latest-frame streaming baseline. Keep only the latest sampled frame as the
   current image buffer. Earlier frames are overwritten, not queued for later
   processing. This mode keeps llama.cpp chat/KV state across prompt events.
+
+--stream-mode single-buffer
+  Backward-compatible alias for `--stream-mode on-demand`.
 
 --stream-mode sliding-window
   Sliding video-window baseline. Each prompt selects recent sampled frames,
@@ -793,8 +842,15 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
   the main streaming timeline and are visualized in
   `dynamic_kv_grow_breakdown_stacked_bar.png`.
 
+--online-buffer
+  Latest-buffer execution semantics for streaming. Frame input still follows
+  `--sampling-fps`, but delayed work reads the newest buffered frame/window at
+  processing start. In vision-prefill mode, pending stale cache-update jobs are
+  coalesced so the worker spends time on the newest cache state instead of
+  replaying every queued intermediate snapshot.
+
 stream_events.csv
-  Frame arrival, `SingleBufferUpdate`, prompt arrival, and prompt decode events.
+  Frame arrival, `OnDemandBufferUpdate`, prompt arrival, and prompt decode events.
   For multi-frame modes, prompt/decode rows use the last selected frame index.
 
 streaming_phase_stats.csv / foundation_proc.csv
@@ -818,7 +874,7 @@ phase_timeline.png
 Notes:
 
 ```text
-SingleBufferUpdate
+OnDemandBufferUpdate
   The current frame pointer is replaced by the latest sampled frame. This is not
   popping from an accumulated queue.
 
@@ -828,7 +884,7 @@ Prompt wait
   The selected image/window remains frozen at prompt arrival.
 
 Multi-turn
-  Streaming single-buffer, sliding-window, and vision-prefill keep llama.cpp
+  Streaming on-demand, sliding-window, and vision-prefill keep llama.cpp
   chat/KV state across prompt events. In sliding-window, only the visual input
   is bounded to the selected recent frame window. In vision-prefill, frames
   arriving before a prompt are cached as an open user turn; the prompt text
@@ -838,7 +894,7 @@ Multi-turn
   `stream_inference_tokens_<idx>.txt` stores each turn's raw trace.
 
 Vision-prefill scheduling
-  Frame arrivals are still logged as `SingleBufferUpdate` ticks at their stream
+  Frame arrivals are still logged as `OnDemandBufferUpdate` ticks at their stream
   timestamps, even while the consumer lane is busy building older cache
   snapshots. Cache jobs are serialized: one cache build restores the previous
   snapshot, appends one new frame's text/image KV, saves the next snapshot, and

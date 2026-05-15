@@ -50,6 +50,7 @@ RESULT_ARTIFACT_DIRS = ("csv", "png", "txt_json")
 PHASE_PLOT_ALIASES = {
     "D": "Decode",
     "I_Prefill": "ImagePrefill",
+    "SingleBufferUpdate": "OnDemandBufferUpdate",
     "VisionPrefillV_Encode": "V_Encode",
     "VisionPrefillMmproj": "Mmproj",
     "VisionPrefillImagePrefill": "ImagePrefill",
@@ -75,7 +76,7 @@ PHASE_PLOT_EXCLUDED = {
     *DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values(),
 }
 PHASE_TIMELINE_VISIBLE = [
-    "SingleBufferUpdate",
+    "OnDemandBufferUpdate",
     "V_Encode",
     "Mmproj",
     "ImagePrefill",
@@ -761,7 +762,7 @@ def _phase_colors() -> dict[str, str]:
         "ExternalEmbeddingRead": "#00cec9",
         "L_DecoderRuntimeInit": "#a29bfe",
         "L_DecoderLoad": "#6c5ce7",
-        "SingleBufferUpdate": "#636e72",
+        "OnDemandBufferUpdate": "#636e72",
         "LayoutTokenize": "#fdcb6e",
         "Prefill": "#2d98da",
         "I_Prefill": "#0984e3",
@@ -1245,7 +1246,7 @@ def _phase_timeline_data(
     events_path = _result_artifact_path(output_dir, "stream_events.csv")
     if events_path.exists():
         for event_row in _read_csv_dicts(events_path):
-            if event_row.get("event") not in {"StreamFrameEnqueue", "SingleBufferUpdate"}:
+            if event_row.get("event") not in {"StreamFrameEnqueue", "SingleBufferUpdate", "OnDemandBufferUpdate"}:
                 continue
             try:
                 stream_origin_elapsed = float(event_row.get("elapsed_s_start", "0") or 0)
@@ -1275,7 +1276,7 @@ def _phase_timeline_data(
         if display_name is None:
             continue
         if end <= start:
-            if display_name != "SingleBufferUpdate":
+            if display_name != "OnDemandBufferUpdate":
                 continue
             end = start + 0.015
         phases.append((display_name, to_plot_time(start), to_plot_time(end), max(prompt_idx, 0)))
@@ -1326,7 +1327,7 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
         if y is None:
             continue
         color = colors.get(name, "#636e72")
-        if name == "SingleBufferUpdate":
+        if name == "OnDemandBufferUpdate":
             ax.vlines(
                 start,
                 y - 0.32,
@@ -1336,7 +1337,7 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
                 alpha=0.85,
             )
             continue
-        alpha = 0.38 if name == "SingleBufferUpdate" else 0.82
+        alpha = 0.38 if name == "OnDemandBufferUpdate" else 0.82
         ax.barh(
             y,
             end - start,
@@ -1642,11 +1643,12 @@ def _result_model_name(
     streaming: bool = False,
     stream_mode: str | None = None,
     dynamic_kv_cache: bool = False,
+    online_buffer: bool = False,
 ) -> str:
     suffix = "opencl" if processor == "gpu" else processor
     kv = _result_kv_suffix(cache_type_k, cache_type_v)
     if streaming:
-        mode_suffix = "" if stream_mode in (None, "single_buffer") else f"_{stream_mode}"
+        mode_suffix = f"_{stream_mode or 'on_demand'}"
         mid = f"_streaming{mode_suffix}"
     elif text_only:
         mid = "_text"
@@ -1659,7 +1661,8 @@ def _result_model_name(
     else:
         mid = ""
     dynamic = "_dynamic" if dynamic_kv_cache else ""
-    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}"
+    online = "_online" if online_buffer else ""
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}{online}"
 
 
 def _find_executable(build_dir: Path, name: str) -> Path:
@@ -2045,8 +2048,9 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
     flash_kv_suffix = _flash_attn_kv_shell_suffix(args)
     ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     force_arg = "--force-generation" if args.force_generation else ""
-    single_buffer_arg = "--single-buffer" if args.single_buffer else ""
+    online_buffer_arg = "--online-buffer" if getattr(args, "online_buffer", False) else ""
     stream_mode_arg = f"--stream-mode {shlex.quote(args.stream_mode)}"
+    media_mode_arg = f"--media-mode {shlex.quote('streaming' if args.streaming_video is not None else args.media_mode.value.replace('_', '-'))}"
     window_sec_arg = f"--window-sec {args.window_sec}" if args.window_sec is not None else ""
     window_max_frames_arg = f"--window-max-frames {args.window_max_frames}"
     is_hybrid = args.processor == "hybrid"
@@ -2063,13 +2067,14 @@ cd {shlex.quote(args.remote_root)} || exit 1
 {env_exports}
 rm -f android_memory_timeline.csv hybrid_streaming_stdout.txt opencl_streaming_stdout.txt stream_events.csv streaming_phase_stats.csv \\
   foundation_output.txt foundation_token_io.txt foundation_inference_tokens.txt foundation_exit_code.txt \\
-  stream_response_*.txt stream_token_io_*.txt stream_inference_tokens_*.txt stream_prompt_phase_*.csv
+  stream_buffer_summary.txt stream_response_*.txt stream_token_io_*.txt stream_inference_tokens_*.txt stream_prompt_phase_*.csv
 printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
 {baseline_loop}
 
-./{runner_bin} {single_buffer_arg} --runner ./opencl_phase_mtmd \\
+./{runner_bin} {online_buffer_arg} --runner ./opencl_phase_mtmd \\
   {encoder_arg} {warmup_image_arg} \\
+  {media_mode_arg} \\
   {stream_mode_arg} {window_sec_arg} {window_max_frames_arg} \\
   -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} \\
   --stream-manifest media_manifest.json \\
@@ -2203,10 +2208,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--images",
+        "--multi-image",
+        "--multi_image",
         type=Path,
         nargs="+",
+        dest="multi_image",
         default=None,
-        help="Multiple input images for InternVL multi-image prompts. Mutually exclusive with --image/--video/--streaming-video.",
+        help="Multiple input images for InternVL multi-image prompts. --images remains an alias.",
     )
     parser.add_argument(
         "--warmup-image",
@@ -2240,9 +2248,10 @@ def main() -> int:
         "--stream_mode",
         dest="stream_mode",
         default=None,
-        choices=("single-buffer", "sliding-window", "vision-prefill"),
-        help="Streaming strategy for --streaming-video. Defaults to single-buffer; --single-buffer remains an alias.",
+        choices=("on-demand", "single-buffer", "sliding-window", "vision-prefill"),
+        help="Streaming strategy for --streaming-video. Defaults to on-demand; --single-buffer remains an alias.",
     )
+    parser.add_argument("--online-buffer", "--online_buffer", dest="online_buffer", action="store_true", help="Use latest-only online stream buffer semantics.")
     parser.add_argument("--num-segments", type=int, default=8, help="Uniform temporal samples for --video.")
     parser.add_argument("--sampling-fps", "--sampling_fps", dest="sampling_fps", type=float, default=None, help="Frame sampling FPS for --streaming-video.")
     parser.add_argument("--max-video-time", "--max_video_time", dest="max_video_time", type=float, default=None, help="Optional maximum streaming-video duration to sample, in seconds.")
@@ -2445,9 +2454,10 @@ def main() -> int:
         raise SystemExit("--window-sec must be positive when provided.")
     if args.window_max_frames <= 0:
         raise SystemExit("--window-max-frames must be positive.")
-    selected_media_count = sum(x is not None for x in (args.image, args.images, args.video, args.streaming_video))
+    args.images = args.multi_image
+    selected_media_count = sum(x is not None for x in (args.image, args.multi_image, args.video, args.streaming_video))
     if selected_media_count > 1:
-        raise SystemExit("--image, --images, --video, and --streaming-video are mutually exclusive.")
+        raise SystemExit("--image, --multi-image/--images, --video, and --streaming-video are mutually exclusive.")
     if args.streaming_video is not None:
         if args.sampling_fps is None or args.sampling_fps <= 0:
             raise SystemExit("--streaming-video requires positive --sampling-fps.")
@@ -2455,7 +2465,7 @@ def main() -> int:
             args.stream_mode = normalize_stream_mode(args.stream_mode, single_buffer=args.single_buffer)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
-        args.single_buffer = args.stream_mode == "single_buffer"
+        args.single_buffer = args.stream_mode == "on_demand"
         args.prompt_events = _parse_streaming_prompt_events(args.time, args.prompt)
     else:
         args.prompt_events = []
@@ -2468,15 +2478,16 @@ def main() -> int:
         args.vision_build_dir = args.vision_build_dir.resolve()
 
     if args.processor == "hybrid":
-        if args.image is None and args.images is None and args.video is None and args.streaming_video is None:
-            raise SystemExit("--processor hybrid requires --image, --images, --video, or --streaming-video.")
+        if args.image is None and args.multi_image is None and args.video is None and args.streaming_video is None:
+            raise SystemExit("--processor hybrid requires --image, --multi-image/--images, --video, or --streaming-video.")
         if args.mmproj is None:
             raise SystemExit("--processor hybrid requires --mmproj.")
         args.mmproj = args.mmproj.resolve()
         if args.image is not None:
             args.image = args.image.resolve()
-        if args.images is not None:
-            args.images = [image.resolve() for image in args.images]
+        if args.multi_image is not None:
+            args.multi_image = [image.resolve() for image in args.multi_image]
+            args.images = args.multi_image
         if args.video is not None:
             args.video = args.video.resolve()
         if args.streaming_video is not None:
@@ -2493,8 +2504,9 @@ def main() -> int:
         args.mmproj = args.mmproj.resolve()
         if args.image is not None:
             args.image = args.image.resolve()
-        if args.images is not None:
-            args.images = [image.resolve() for image in args.images]
+        if args.multi_image is not None:
+            args.multi_image = [image.resolve() for image in args.multi_image]
+            args.images = args.multi_image
         if args.video is not None:
             args.video = args.video.resolve()
         if args.streaming_video is not None and args.processor != "gpu":
@@ -2505,8 +2517,8 @@ def main() -> int:
         exist_paths.append(args.mmproj)
     if args.image is not None:
         exist_paths.append(args.image)
-    if args.images is not None:
-        exist_paths.extend(args.images)
+    if args.multi_image is not None:
+        exist_paths.extend(args.multi_image)
     if args.video is not None:
         exist_paths.append(args.video)
     if args.streaming_video is not None:
@@ -2545,6 +2557,7 @@ def main() -> int:
         streaming=args.streaming_video is not None,
         stream_mode=getattr(args, "stream_mode", None),
         dynamic_kv_cache=getattr(args, "dynamic_kv_cache", False),
+        online_buffer=getattr(args, "online_buffer", False),
     )
     result_dir.mkdir(parents=True, exist_ok=True)
     _clear_result_artifact_dirs(result_dir)
@@ -2573,26 +2586,15 @@ def main() -> int:
                 manifest = _load_manifest(args.manifest.resolve())
                 encoder_pte = Path(manifest["paths"]["vision_encoder_pte"])
             args.remote_encoder_pte = encoder_pte.name
-            vision_bin = _find_executable(args.vision_build_dir, "hybrid_vision_dump")
-            decode_bin = _find_executable(args.llama_build_dir, "hybrid_decode")
             streaming_bin = _find_executable(args.vision_build_dir, "hybrid_streaming_decode")
-            if streaming_mode:
-                if not streaming_bin.exists():
-                    raise SystemExit("Missing hybrid_streaming_decode. Build hybrid_bridge first.")
-                if not vision_bin.exists():
-                    raise SystemExit("Missing hybrid_vision_dump. Build hybrid_bridge with ExecuTorch/QNN support first.")
-            elif not vision_bin.exists() or not decode_bin.exists():
-                raise SystemExit("Missing hybrid_vision_dump or hybrid_decode. Build hybrid_bridge first.")
+            if not streaming_bin.exists():
+                raise SystemExit("Missing hybrid_streaming_decode. Build hybrid_bridge first.")
             media = _prepare_media(args, Path(tmp))
             warmup_bin, warmup_layout = prepare_warmup_image(args.warmup_image, Path(tmp))
             args.remote_warmup_bin = warmup_bin.name
             args.remote_warmup_layout_image = warmup_layout.name
             args.remote_warmup_embedding = "warmup_vision_embedding.svlmemb"
-            if streaming_mode:
-                _push(adb, streaming_bin, args.remote_root)
-            else:
-                _push(adb, vision_bin, args.remote_root)
-                _push(adb, decode_bin, args.remote_root)
+            _push(adb, streaming_bin, args.remote_root)
             if encoder_pte is not None:
                 _push_model_cached(adb, encoder_pte, args.remote_root, force=args.model_push)
             _push(adb, media.metadata_path, args.remote_root)
@@ -2611,14 +2613,9 @@ def main() -> int:
                 _push(adb, layout_image, args.remote_root)
                 pushed_layouts.add(resolved_layout)
             _push_qnn_libs(adb, args.remote_root, Path(qnn_sdk), args.executorch_build_dir, args.soc_model)
-            if streaming_mode:
-                _run(adb + ["shell", f"chmod +x {shlex.quote(args.remote_root)}/hybrid_streaming_decode {shlex.quote(args.remote_root)}/opencl_phase_mtmd 2>/dev/null || true"])
-                script_text = _build_hybrid_streaming_remote_script(args)
-                pull_names = HYBRID_STREAMING_PULL_ARTIFACTS
-            else:
-                _run(adb + ["shell", f"chmod +x {shlex.quote(args.remote_root)}/hybrid_vision_dump {shlex.quote(args.remote_root)}/hybrid_decode"])
-                script_text = _build_hybrid_remote_script(args, encoder_pte=encoder_pte, media=media)
-                pull_names = HYBRID_PULL_ARTIFACTS
+            _run(adb + ["shell", f"chmod +x {shlex.quote(args.remote_root)}/hybrid_streaming_decode {shlex.quote(args.remote_root)}/opencl_phase_mtmd 2>/dev/null || true"])
+            script_text = _build_hybrid_streaming_remote_script(args)
+            pull_names = HYBRID_STREAMING_PULL_ARTIFACTS
         else:
             completion_mode = _standalone_completion_mode(args)
             streaming_mode = args.streaming_video is not None
@@ -2682,10 +2679,7 @@ def main() -> int:
     return_code = (result_dir / "foundation_exit_code.txt").read_text(encoding="utf-8").strip()
 
     if args.processor == "hybrid":
-        if args.streaming_video is not None:
-            _finalize_hybrid_streaming_outputs(result_dir)
-        else:
-            _finalize_hybrid_outputs(result_dir)
+        _finalize_hybrid_streaming_outputs(result_dir)
         (result_dir / "hybrid_decode_stdout.txt").unlink(missing_ok=True)
     else:
         _finalize_standalone_outputs(

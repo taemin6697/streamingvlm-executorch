@@ -35,7 +35,7 @@ def media_mode_from_args(args) -> MediaMode:
         return MediaMode.STREAMING
     if getattr(args, "video", None) is not None:
         return MediaMode.VIDEO_FILE
-    if getattr(args, "images", None) is not None:
+    if getattr(args, "multi_image", None) is not None or getattr(args, "images", None) is not None:
         return MediaMode.MULTI_IMAGE
     if getattr(args, "image", None) is not None:
         return MediaMode.IMAGE

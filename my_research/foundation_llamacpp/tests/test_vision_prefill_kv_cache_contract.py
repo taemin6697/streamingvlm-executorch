@@ -42,14 +42,15 @@ def test_streaming_timeline_aliases_vision_prefill_to_standard_lanes():
     assert runner_cli._phase_timeline_name("VisionPrefillMmproj") == "Mmproj"
     assert runner_cli._phase_timeline_name("VisionPrefillImagePrefill") == "ImagePrefill"
     assert runner_cli._phase_timeline_name("VisionPrefillT_Prefill") == "T_Prefill"
-    assert runner_cli._phase_timeline_name("SingleBufferUpdate") == "SingleBufferUpdate"
+    assert runner_cli._phase_timeline_name("SingleBufferUpdate") == "OnDemandBufferUpdate"
+    assert runner_cli._phase_timeline_name("OnDemandBufferUpdate") == "OnDemandBufferUpdate"
     assert runner_cli._phase_timeline_name("D") == "Decode"
 
     assert runner_cli._phase_timeline_name("VisionPrefillCacheBuild") is None
     assert runner_cli._phase_timeline_name("VisionPrefillCacheSave") is None
     assert runner_cli._phase_timeline_name("VisionPrefillCacheRestore") is None
 
-    assert "drop_pending_cache_updates" not in source
+    assert "drop_pending_cache_updates" in source
 
 
 def test_vision_prefill_keeps_full_history_and_caches_every_frame():
@@ -59,7 +60,19 @@ def test_vision_prefill_keeps_full_history_and_caches_every_frame():
     assert 'mode == "sliding_window"' in source
     assert "return selected;" in source
     assert "StreamJobKind::CacheUpdate" in source
-    assert "drop_pending_cache_updates" not in source
+    assert "drop_pending_cache_updates(stream_jobs)" in source
+
+
+def test_online_buffer_uses_latest_frame_at_processing_start():
+    source = STREAMING_CPP.read_text()
+    runner_source = (runner_cli.FOUNDATION_LLAMA / "runner" / "cli.py").read_text(encoding="utf-8")
+
+    assert "bool online_buffer = false" in source
+    assert "resolve_online_buffer_frames" in source
+    assert "prompt_frame_lag_s" in source
+    assert "stream_buffer_summary.txt" in source
+    assert "rm -f android_memory_timeline.csv" in runner_source
+    assert "stream_buffer_summary.txt stream_response_*.txt" in runner_source
 
 
 def test_vision_prefill_cache_build_encodes_frames_on_demand():

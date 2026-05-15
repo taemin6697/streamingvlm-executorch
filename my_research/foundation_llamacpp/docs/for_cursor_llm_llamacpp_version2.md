@@ -5,6 +5,44 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-15: Unified Hybrid Streaming Baseline
+
+- Created feature branch `codex/unified-online-buffer-baseline` for the current
+  baseline cleanup.
+- Hybrid image, multi-image, offline video, and streaming now use the same
+  Android execution surface: `hybrid_streaming_decode`.
+  - Offline media passes `--media-mode image|multi-image|video`.
+  - Streaming passes `--media-mode streaming`.
+  - The old `hybrid_vision_dump + hybrid_decode` split remains in source for
+    diagnostics, but the runner no longer uses it as the default hybrid
+    image/video path.
+- Renamed the user-facing latest-frame streaming mode:
+  - canonical: `--stream-mode on-demand`;
+  - compatibility aliases: `--stream-mode single-buffer` and `--single-buffer`;
+  - result folders now include `_streaming_on_demand_...`.
+- Renamed the canonical multi-image CLI to `--multi-image`; `--images` remains
+  accepted as a compatibility alias.
+- Added `--online-buffer` for streaming:
+  - frame input continues at `--sampling-fps`;
+  - delayed prompt/cache work resolves frames at processing start rather than
+    request timestamp;
+  - vision-prefill drops stale pending cache-update jobs before enqueueing the
+    newest cache update;
+  - streaming runs pull `txt_json/stream_buffer_summary.txt` with requested and
+    observed input FPS, processed visual FPS, skipped cache updates, and
+    prompt-frame lag.
+- Prompt construction now has a small formatter boundary in `runner/media.py`.
+  InternVL3 remains the active formatter:
+  - image: `<image>\nquestion`;
+  - multi-image: `Image-1: <image>\nImage-2: <image>\nquestion`;
+  - video/streaming: `Frame1: <image>\nFrame2: <image>\nquestion`.
+  Future Qwen/Gemma prompt formats should add a formatter instead of changing
+  scheduling code.
+- Artifact layout smoke script now covers the 1B Q8 eight-run baseline:
+  image, multi-image, offline video, streaming on-demand, streaming
+  sliding-window, streaming vision-prefill, streaming vision-prefill with
+  dynamic KV, and streaming vision-prefill with dynamic KV plus online-buffer.
+
 ## 2026-05-11: Hybrid Bridge Refactor Baseline
 
 - Refactor goal: separate media mode (`text`, `image`, `video_file`, future

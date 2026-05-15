@@ -41,10 +41,12 @@ struct PromptEvent {
 };
 
 struct Manifest {
+  std::string source_kind;
   double sampling_fps = 0.0;
   std::string stream_mode;
   double window_sec = -1.0;
   int window_max_frames = 0;
+  std::string prompt;
   std::vector<FrameRecord> frames;
   std::vector<PromptEvent> prompts;
 };
@@ -201,9 +203,11 @@ std::vector<std::string> object_blocks_in_array(const std::string& text, const s
 Manifest parse_manifest(const std::string& path) {
   const std::string text = read_file(path);
   Manifest manifest;
+  find_string_after(text, 0, "source_kind", manifest.source_kind);
   find_number_after(text, 0, "sampling_fps", manifest.sampling_fps);
   find_string_after(text, 0, "stream_mode", manifest.stream_mode);
   find_number_after(text, 0, "window_sec", manifest.window_sec);
+  find_string_after(text, 0, "prompt", manifest.prompt);
   double window_max_frames = 0.0;
   if (find_number_after(text, 0, "window_max_frames", window_max_frames)) {
     manifest.window_max_frames = static_cast<int>(window_max_frames);
@@ -212,7 +216,11 @@ Manifest parse_manifest(const std::string& path) {
   for (const std::string& block : object_blocks_in_array(text, "frames")) {
     FrameRecord frame;
     double frame_index = 0.0;
-    find_number_after(block, 0, "stream_frame", frame_index);
+    if (!find_number_after(block, 0, "stream_frame", frame_index)) {
+      if (find_number_after(block, 0, "frame", frame_index)) {
+        frame_index -= 1.0;
+      }
+    }
     frame.index = static_cast<int>(frame_index);
     find_number_after(block, 0, "timestamp_s", frame.timestamp_s);
     for (const std::string& tile_block : object_blocks_in_array(block, "tiles")) {
@@ -235,6 +243,9 @@ Manifest parse_manifest(const std::string& path) {
       find_string_after(block, 0, "text", event.prompt);
     }
     manifest.prompts.push_back(event);
+  }
+  if (manifest.prompts.empty() && !manifest.prompt.empty()) {
+    manifest.prompts.push_back(PromptEvent{0.0, manifest.prompt});
   }
   std::sort(manifest.prompts.begin(), manifest.prompts.end(), [](const auto& a, const auto& b) {
     return a.timestamp_s < b.timestamp_s;
@@ -274,7 +285,9 @@ struct Args {
   std::string encoder_path;
   std::string warmup_image_path;
   std::string runner = "./opencl_phase_mtmd";
+  std::string media_mode;
   std::string stream_mode;
+  std::string prompt_format = "internvl3";
   std::string model;
   std::string mmproj;
   std::string stream_events_path = "stream_events.csv";
@@ -302,6 +315,7 @@ struct Args {
   bool realtime = true;
   bool force_generation = false;
   bool single_buffer = false;
+  bool online_buffer = false;
   bool dynamic_kv_cache = false;
   bool no_kv_offload = false;
   bool no_warmup = false;
@@ -336,7 +350,9 @@ Args parse_args(int argc, char** argv) {
     }
     if (read_string("--encoder-path", args.encoder_path) || read_string("--encoder_path", args.encoder_path) ||
         read_string("--warmup-image-path", args.warmup_image_path) || read_string("--warmup_image_path", args.warmup_image_path) ||
+        read_string("--media-mode", args.media_mode) || read_string("--media_mode", args.media_mode) ||
         read_string("--stream-mode", args.stream_mode) || read_string("--stream_mode", args.stream_mode) ||
+        read_string("--prompt-format", args.prompt_format) || read_string("--prompt_format", args.prompt_format) ||
         read_string("--runner", args.runner) || read_string("-m", args.model) || read_string("--model", args.model) ||
         read_string("--mmproj", args.mmproj) || read_string("--stream-events-path", args.stream_events_path) ||
         read_string("--stream_events_path", args.stream_events_path) || read_string("--phase-stats-path", args.phase_stats_path) ||
@@ -373,6 +389,8 @@ Args parse_args(int argc, char** argv) {
       args.play_speed = std::atof(tmp.c_str());
     } else if (a == "--single-buffer" || a == "--single_buffer") {
       args.single_buffer = true;
+    } else if (a == "--online-buffer" || a == "--online_buffer") {
+      args.online_buffer = true;
     } else if (a == "--dynamic-kv-cache") {
       args.dynamic_kv_cache = true;
     } else if (a == "--force-generation") {
@@ -394,13 +412,16 @@ long now_ms() {
 
 std::string normalize_stream_mode(std::string mode, bool single_buffer) {
   if (single_buffer) {
-    return "single_buffer";
+    return "on_demand";
   }
   std::replace(mode.begin(), mode.end(), '-', '_');
   if (mode.empty()) {
-    return "single_buffer";
+    return "on_demand";
   }
-  if (mode == "single_buffer" || mode == "sliding_window" || mode == "vision_prefill") {
+  if (mode == "single_buffer") {
+    return "on_demand";
+  }
+  if (mode == "on_demand" || mode == "sliding_window" || mode == "vision_prefill") {
     return mode;
   }
   std::fprintf(stderr, "unsupported --stream-mode: %s\n", mode.c_str());
@@ -597,7 +618,7 @@ std::vector<FrameRecord> select_prompt_frames(
     const std::vector<FrameRecord>& available_frames,
     const FrameRecord& current_frame,
     const PromptEvent& prompt) {
-  if (args.stream_mode == "single_buffer") {
+  if (args.stream_mode == "on_demand") {
     return {current_frame};
   }
 
@@ -762,7 +783,7 @@ std::unique_ptr<streamingvlm::hybrid_bridge::VisionEncoderSession> load_single_b
     const Args& args,
     std::vector<PhaseTiming>& setup_phases) {
   if (args.encoder_path.empty()) {
-    std::fprintf(stderr, "--encoder-path is required for QNN single-buffer streaming\n");
+    std::fprintf(stderr, "--encoder-path is required for QNN on-demand streaming\n");
     std::exit(2);
   }
   const long load_start_ms = now_ms();
@@ -1341,7 +1362,7 @@ int run_single_buffer_prompt(
       origin_ms,
       streamingvlm::hybrid_bridge::hybrid_decode_phase_description());
   std::string prompt_text = prompt.prompt;
-  if (args.stream_mode == "single_buffer") {
+  if (args.stream_mode == "on_demand") {
     if (prompt_text.find(mtmd_default_marker()) == std::string::npos) {
       prompt_text = std::string(mtmd_default_marker()) + prompt_text;
     }
@@ -1479,6 +1500,66 @@ int run_single_buffer_prompt(
   }
   return rc;
 }
+
+int run_offline_media_prompt(
+    const Args& args,
+    decode_context& ctx,
+    streamingvlm::hybrid_bridge::VisionEncoderSession& encoder,
+    const Manifest& manifest,
+    long origin_ms) {
+  const std::vector<FrameRecord>& frames = manifest.frames;
+  const std::vector<std::string> bins = bins_for_frames(frames);
+  const std::vector<std::string> images = layout_images_for_frames(frames);
+  const std::string prompt_text =
+      !manifest.prompt.empty()
+          ? manifest.prompt
+          : (!manifest.prompts.empty() ? manifest.prompts.front().prompt : std::string());
+  if (bins.empty() || images.empty() || prompt_text.empty()) {
+    std::fprintf(stderr, "offline media manifest missing bins, images, or prompt\n");
+    return 2;
+  }
+
+  streamingvlm::hybrid_bridge::phase_recorder prompt_phases(
+      prompt_phase_path(0),
+      origin_ms,
+      streamingvlm::hybrid_bridge::hybrid_decode_phase_description());
+  auto trace_writer = std::make_unique<streamingvlm::hybrid_bridge::inference_trace_collector>(
+      "foundation_inference_tokens.txt");
+
+  const long vision_start_ms = now_ms();
+  auto vision = encoder.encode(bins);
+  long cursor_ms = vision_start_ms;
+  const long image_load_ms = vision.image_load_end_ms - vision.image_load_start_ms;
+  if (image_load_ms > 0) {
+    prompt_phases.row("ImageLoad", cursor_ms, cursor_ms + image_load_ms);
+    cursor_ms += image_load_ms;
+  }
+  for (const auto& range : vision.encode_ranges) {
+    const long encode_ms = range.second - range.first;
+    if (encode_ms > 0) {
+      prompt_phases.row("V_Encode", cursor_ms, cursor_ms + encode_ms);
+      cursor_ms += encode_ms;
+    }
+  }
+
+  streamingvlm::hybrid_bridge::EmbeddingFile embedding;
+  embedding.shape = vision.output_shape;
+  embedding.values = std::move(vision.values);
+  if (eval_with_external_embedding(ctx, prompt_text, images, embedding, prompt_phases, nullptr, trace_writer.get()) != 0) {
+    return 1;
+  }
+  const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
+  const std::string generated_text =
+      generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
+  write_stream_text_file(args.output_path, generated_text);
+  std::string token_io_doc = std::string("User: ") + prompt_text + "\nAssistant: " + generated_text + "\n";
+  if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+    token_io_doc += trace_writer->format_token_io_appendix();
+  }
+  write_stream_text_file("foundation_token_io.txt", token_io_doc);
+  write_stream_text_file("stream_response_0.txt", generated_text);
+  return 0;
+}
 #else
 int run_single_buffer_prompt(
     const Args& args,
@@ -1505,7 +1586,7 @@ int run_single_buffer_prompt(
       streamingvlm::hybrid_bridge::opencl_phase_description());
   common_chat_msg msg;
   std::string prompt_text = prompt.prompt;
-  if (args.stream_mode == "single_buffer") {
+  if (args.stream_mode == "on_demand") {
     if (prompt_text.find(mtmd_default_marker()) == std::string::npos) {
       prompt_text = std::string(mtmd_default_marker()) + prompt_text;
     }
@@ -1547,6 +1628,46 @@ int run_single_buffer_prompt(
   }
   return rc;
 }
+
+int run_offline_media_prompt(
+    const Args& args,
+    decode_context& ctx,
+    const Manifest& manifest,
+    long origin_ms) {
+  const std::vector<FrameRecord>& frames = manifest.frames;
+  const std::vector<std::string> images = layout_images_for_frames(frames);
+  const std::string prompt_text =
+      !manifest.prompt.empty()
+          ? manifest.prompt
+          : (!manifest.prompts.empty() ? manifest.prompts.front().prompt : std::string());
+  if (images.empty() || prompt_text.empty()) {
+    std::fprintf(stderr, "offline media manifest missing images or prompt\n");
+    return 2;
+  }
+  streamingvlm::hybrid_bridge::phase_recorder prompt_phases(
+      prompt_phase_path(0),
+      origin_ms,
+      streamingvlm::hybrid_bridge::opencl_phase_description());
+  auto trace_writer = std::make_unique<streamingvlm::hybrid_bridge::inference_trace_collector>(
+      "foundation_inference_tokens.txt");
+  common_chat_msg msg;
+  msg.role = "user";
+  msg.content = prompt_text;
+  if (eval_message(ctx, msg, images, prompt_phases, nullptr, nullptr, trace_writer.get()) != 0) {
+    return 1;
+  }
+  const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
+  const std::string generated_text =
+      generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
+  write_stream_text_file(args.output_path, generated_text);
+  std::string token_io_doc = std::string("User: ") + prompt_text + "\nAssistant: " + generated_text + "\n";
+  if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+    token_io_doc += trace_writer->format_token_io_appendix();
+  }
+  write_stream_text_file("foundation_token_io.txt", token_io_doc);
+  write_stream_text_file("stream_response_0.txt", generated_text);
+  return 0;
+}
 #endif
 
 void append_file_to_output(
@@ -1570,6 +1691,92 @@ void append_file_to_output(
   out << "\n";
 }
 
+enum class StreamJobKind {
+  CacheUpdate,
+  Prompt,
+};
+
+struct StreamJob {
+  StreamJobKind kind = StreamJobKind::Prompt;
+  std::vector<FrameRecord> frames;
+  PromptEvent prompt;
+  int prompt_idx = -1;
+  int frame_idx = -1;
+  long event_ms = 0;
+};
+
+struct StreamBufferStats {
+  int input_frames = 0;
+  int processed_visual_jobs = 0;
+  int skipped_cache_updates = 0;
+  long first_input_ms = 0;
+  long last_input_ms = 0;
+  long first_process_ms = 0;
+  long last_process_ms = 0;
+  std::vector<double> prompt_frame_lag_s;
+};
+
+int drop_pending_cache_updates(std::deque<StreamJob>& stream_jobs) {
+  const size_t before = stream_jobs.size();
+  stream_jobs.erase(
+      std::remove_if(
+          stream_jobs.begin(),
+          stream_jobs.end(),
+          [](const StreamJob& job) { return job.kind == StreamJobKind::CacheUpdate; }),
+      stream_jobs.end());
+  return static_cast<int>(before - stream_jobs.size());
+}
+
+std::vector<FrameRecord> resolve_online_buffer_frames(
+    const Args& args,
+    const std::vector<FrameRecord>& available_frames,
+    const FrameRecord& current_frame,
+    const PromptEvent& prompt) {
+  PromptEvent effective_prompt = prompt;
+  effective_prompt.timestamp_s = current_frame.timestamp_s;
+  return select_prompt_frames(args, available_frames, current_frame, effective_prompt);
+}
+
+void note_processed_visual_job(StreamBufferStats& stats, long start_ms, long end_ms) {
+  stats.processed_visual_jobs += 1;
+  if (stats.first_process_ms == 0 || start_ms < stats.first_process_ms) {
+    stats.first_process_ms = start_ms;
+  }
+  if (end_ms > stats.last_process_ms) {
+    stats.last_process_ms = end_ms;
+  }
+}
+
+void write_stream_buffer_summary(const Args& args, const Manifest& manifest, const StreamBufferStats& stats) {
+  std::ofstream out("stream_buffer_summary.txt");
+  const double input_span_s =
+      stats.first_input_ms > 0 && stats.last_input_ms > stats.first_input_ms
+          ? (stats.last_input_ms - stats.first_input_ms) / 1000.0
+          : 0.0;
+  const double observed_input_fps = input_span_s > 0.0 ? (stats.input_frames - 1) / input_span_s : 0.0;
+  const double process_span_s =
+      stats.first_process_ms > 0 && stats.last_process_ms > stats.first_process_ms
+          ? (stats.last_process_ms - stats.first_process_ms) / 1000.0
+          : 0.0;
+  const double processed_visual_fps =
+      process_span_s > 0.0 ? stats.processed_visual_jobs / process_span_s : 0.0;
+  double prompt_frame_lag_sum_s = 0.0;
+  for (double lag : stats.prompt_frame_lag_s) {
+    prompt_frame_lag_sum_s += lag;
+  }
+  const double avg_prompt_frame_lag_s =
+      stats.prompt_frame_lag_s.empty() ? 0.0 : prompt_frame_lag_sum_s / stats.prompt_frame_lag_s.size();
+  out << "online_buffer=" << (args.online_buffer ? "true" : "false") << "\n";
+  out << "requested_input_fps=" << manifest.sampling_fps << "\n";
+  out << "observed_input_fps=" << observed_input_fps << "\n";
+  out << "input_frame_count=" << stats.input_frames << "\n";
+  out << "processed_visual_jobs=" << stats.processed_visual_jobs << "\n";
+  out << "processed_visual_fps=" << processed_visual_fps << "\n";
+  out << "skipped_cache_updates=" << stats.skipped_cache_updates << "\n";
+  out << "prompt_frame_lag_s_avg=" << avg_prompt_frame_lag_s << "\n";
+  out << "prompt_frame_lag_s_count=" << stats.prompt_frame_lag_s.size() << "\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1589,7 +1796,7 @@ int main(int argc, char** argv) {
     args.window_max_frames = manifest.window_max_frames;
   }
   args.stream_mode = normalize_stream_mode(args.stream_mode, args.single_buffer);
-  args.single_buffer = args.stream_mode == "single_buffer";
+  args.single_buffer = args.stream_mode == "on_demand";
   if (manifest.frames.empty()) {
     std::fprintf(stderr, "stream manifest has no frames: %s\n", args.manifest.c_str());
     return 2;
@@ -1615,28 +1822,57 @@ int main(int argc, char** argv) {
   phases << "row_type,elapsed_s_start,elapsed_s_end,rss_kb_start,rss_kb_end,"
             "col_a_ms,col_b_ms,total_ms,kv_pos,kv_total,kv_used_pct,"
             "kv_estimated_used_kb,kv_total_kb,kv_physical_committed_kb,token_idx\n";
-  phases << "# StreamFrameEnqueue: sampled frame enters buffer  SingleBufferUpdate: current image buffer update  "
+  phases << "# StreamFrameEnqueue: sampled frame enters buffer  OnDemandBufferUpdate: current image buffer update  "
             "StreamPromptPrefill/StreamDecode: prompt handled against current buffered image\n";
   phases << "# clock_origin_ms: " << origin_ms << "\n";
   for (const auto& setup : setup_phases) {
     append_phase_row(phases, setup.name, setup.start_ms, setup.end_ms, origin_ms);
   }
-  enum class StreamJobKind {
-    CacheUpdate,
-    Prompt,
-  };
-  struct StreamJob {
-    StreamJobKind kind = StreamJobKind::Prompt;
-    std::vector<FrameRecord> frames;
-    PromptEvent prompt;
-    int prompt_idx = -1;
-    int frame_idx = -1;
-    long event_ms = 0;
-  };
+
+  const bool offline_media_mode =
+      args.media_mode != "streaming" &&
+      manifest.source_kind != "streaming_video";
+  if (offline_media_mode) {
+    for (const auto& frame : manifest.frames) {
+      events.row(
+          "StreamFrameEnqueue",
+          frame.index,
+          -1,
+          frame.timestamp_s,
+          origin_ms,
+          origin_ms,
+          origin_ms,
+          "offline");
+    }
+    const long prompt_start_ms = now_ms();
+    append_phase_row(phases, "StreamPromptPrefill", prompt_start_ms, prompt_start_ms, origin_ms);
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+    const int rc = run_offline_media_prompt(args, *decode_ctx, *encoder_ctx, manifest, origin_ms);
+#else
+    const int rc = run_offline_media_prompt(args, *decode_ctx, manifest, origin_ms);
+#endif
+    append_phase_file(phases, prompt_phase_path(0));
+    const long prompt_end_ms = now_ms();
+    events.row(
+        "StreamDecode",
+        last_frame_index(manifest.frames),
+        0,
+        manifest.prompts.empty() ? 0.0 : manifest.prompts.front().timestamp_s,
+        origin_ms,
+        prompt_start_ms,
+        prompt_end_ms,
+        "rc=" + std::to_string(rc));
+    return rc;
+  }
+
   std::deque<StreamJob> stream_jobs;
   std::mutex mu;
   std::condition_variable cv;
   bool done = false;
+  FrameRecord latest_frame;
+  bool have_latest_frame = false;
+  std::vector<FrameRecord> latest_available_frames;
+  StreamBufferStats buffer_stats;
 
   std::thread producer([&]() {
     double last_ts = 0.0;
@@ -1657,13 +1893,24 @@ int main(int argc, char** argv) {
       available_frames.push_back(frame);
       {
         std::lock_guard<std::mutex> lock(mu);
+        latest_frame = current_frame;
+        have_latest_frame = true;
+        latest_available_frames = available_frames;
+        buffer_stats.input_frames += 1;
+        if (buffer_stats.first_input_ms == 0) {
+          buffer_stats.first_input_ms = t;
+        }
+        buffer_stats.last_input_ms = t;
 #if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
         if (args.stream_mode == "vision_prefill") {
           PromptEvent cache_event;
           cache_event.timestamp_s = frame.timestamp_s;
+          if (args.online_buffer) {
+            buffer_stats.skipped_cache_updates += drop_pending_cache_updates(stream_jobs);
+          }
           stream_jobs.push_back(StreamJob{
               StreamJobKind::CacheUpdate,
-              select_prompt_frames(args, available_frames, current_frame, cache_event),
+              args.online_buffer ? std::vector<FrameRecord>{} : select_prompt_frames(args, available_frames, current_frame, cache_event),
               cache_event,
               -1,
               frame.index,
@@ -1674,7 +1921,7 @@ int main(int argc, char** argv) {
         while (prompt_cursor < manifest.prompts.size() && manifest.prompts[prompt_cursor].timestamp_s <= frame.timestamp_s) {
           stream_jobs.push_back(StreamJob{
               StreamJobKind::Prompt,
-              select_prompt_frames(args, available_frames, current_frame, manifest.prompts[prompt_cursor]),
+              args.online_buffer ? std::vector<FrameRecord>{} : select_prompt_frames(args, available_frames, current_frame, manifest.prompts[prompt_cursor]),
               manifest.prompts[prompt_cursor],
               static_cast<int>(prompt_cursor),
               frame.index,
@@ -1684,9 +1931,9 @@ int main(int argc, char** argv) {
         }
       }
       events.row("StreamFrameEnqueue", frame.index, -1, frame.timestamp_s, origin_ms, t, t, "queued");
-      append_phase_row(phases, "SingleBufferUpdate", t, t, origin_ms);
+      append_phase_row(phases, "OnDemandBufferUpdate", t, t, origin_ms);
       events.row(
-          "SingleBufferUpdate",
+          "OnDemandBufferUpdate",
           frame.index,
           -1,
           frame.timestamp_s,
@@ -1702,7 +1949,7 @@ int main(int argc, char** argv) {
       while (have_current_frame && prompt_cursor < manifest.prompts.size()) {
         stream_jobs.push_back(StreamJob{
             StreamJobKind::Prompt,
-            select_prompt_frames(args, available_frames, current_frame, manifest.prompts[prompt_cursor]),
+            args.online_buffer ? std::vector<FrameRecord>{} : select_prompt_frames(args, available_frames, current_frame, manifest.prompts[prompt_cursor]),
             manifest.prompts[prompt_cursor],
             static_cast<int>(prompt_cursor),
             current_frame.index,
@@ -1736,6 +1983,15 @@ int main(int argc, char** argv) {
       }
       job = stream_jobs.front();
       stream_jobs.pop_front();
+      if (args.online_buffer && have_latest_frame) {
+        job.frames = resolve_online_buffer_frames(args, latest_available_frames, latest_frame, job.prompt);
+        job.frame_idx = latest_frame.index;
+        if (job.kind == StreamJobKind::CacheUpdate) {
+          job.prompt.timestamp_s = latest_frame.timestamp_s;
+        } else if (job.kind == StreamJobKind::Prompt) {
+          buffer_stats.prompt_frame_lag_s.push_back(latest_frame.timestamp_s - job.prompt.timestamp_s);
+        }
+      }
     }
 
 #if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
@@ -1760,6 +2016,10 @@ int main(int argc, char** argv) {
           cache_start_ms,
           cache_end_ms,
           ok ? "ok" : "miss");
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        note_processed_visual_job(buffer_stats, cache_start_ms, cache_end_ms);
+      }
       continue;
     }
 #endif
@@ -1808,10 +2068,15 @@ int main(int argc, char** argv) {
         decode_start_ms,
         decode_end_ms,
         "rc=" + std::to_string(rc));
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      note_processed_visual_job(buffer_stats, decode_start_ms, decode_end_ms);
+    }
     ++handled_prompts;
   }
 
   producer.join();
+  write_stream_buffer_summary(args, manifest, buffer_stats);
   std::fprintf(stderr, "Processed %zu streaming frames and %zu prompt events\n", manifest.frames.size(), handled_prompts);
   return 0;
 }
