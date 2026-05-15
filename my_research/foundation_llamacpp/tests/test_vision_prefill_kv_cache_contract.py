@@ -94,7 +94,7 @@ def test_vision_prefill_cache_build_encodes_frames_on_demand():
     assert "bins[image_chunk_idx]" in source
 
 
-def test_vision_prefill_cache_build_restores_previous_snapshot_and_appends_latest_frame_only():
+def test_vision_prefill_cache_build_restores_previous_snapshot_and_appends_next_missing_frame():
     source = STREAMING_CPP.read_text()
     build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
         "\n}\n\nint run_vision_prefill_prompt_from_committed_cache", 1
@@ -102,8 +102,10 @@ def test_vision_prefill_cache_build_restores_previous_snapshot_and_appends_lates
 
     assert "build_formatted_incremental_vision_cache_append" in source
     assert "restore_vision_prefill_cache_state(ctx, cache, cache_phases, \"VisionPrefillCacheAppendRestore\")" in build_fn
-    assert "std::vector<FrameRecord> append_frames{target_frames.back()}" in build_fn
-    assert "frames.begin() + static_cast<std::ptrdiff_t>(cached_prefix_size)" not in build_fn
+    assert "target_frames.resize(cached_prefix_size + 1)" in build_fn
+    assert "target_frames.begin() + static_cast<std::ptrdiff_t>(cached_prefix_size)" in build_fn
+    assert "target_frames.end()" not in build_fn.split("std::vector<FrameRecord> append_frames", 1)[1].split(");", 1)[0]
+    assert "std::vector<FrameRecord> append_frames{target_frames.back()}" not in build_fn
     assert "bins_for_frames(append_frames)" in build_fn
     assert "layout_images_for_frames(append_frames)" in build_fn
 
@@ -141,10 +143,80 @@ def test_vision_prefill_cache_update_preempts_for_pending_prompt():
     assert "mtmd_helper_decode_image_chunk_with_abort" in mtmd_helper_header
     assert "mtmd_helper_decode_image_chunk_with_abort_and_progress" in mtmd_helper_header
     assert "mtmd_decode_batch_callback" in mtmd_helper_header
-    assert "k_preemptible_image_prefill_batch" in source
     assert "preemptible_image_batch" in source
     assert "mtmd_helper_decode_image_chunk_with_abort_and_progress" in source
     assert "VisionPrefillImagePrefillBatch" in source
+
+
+def test_partial_vision_prefill_commits_current_image_batch_instead_of_rollback():
+    source = STREAMING_CPP.read_text()
+    helper_header = (ROOT / "llama.cpp/tools/mtmd/mtmd-helper.h").read_text()
+    helper_impl = (ROOT / "llama.cpp/tools/mtmd/mtmd-helper.cpp").read_text()
+    build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
+        "\n}\n\nint run_vision_prefill_prompt_from_committed_cache", 1
+    )[0]
+
+    assert "bool partial_vision_kv = false" in source
+    assert '"--partial-vision-kv"' in source
+    assert "VisionPrefillCacheBuildStatus::Partial" in source
+    assert "partial_image_committed" in source
+    assert "args.partial_vision_kv" in build_fn
+    assert "save_vision_prefill_cache_state(ctx, next_cache, cache_phases, args.partial_vision_kv)" in build_fn
+    assert "VisionPrefillCachePartialCommit" in source
+    assert "rollback_vision_prefill_cache_build(ctx, cache, cache_phases, false)" in build_fn
+    assert "new_n_past" in helper_header
+    assert "*new_n_past = n_past + decoded_n_pos" in helper_impl
+    assert "return 2" in helper_impl
+
+
+def test_partial_vision_prefill_waits_for_one_image_batch_before_abort():
+    source = STREAMING_CPP.read_text()
+
+    assert "completed_image_batches" in source
+    assert "require_completed_batch_before_abort" in source
+    assert "*callback->completed_image_batches <= 0" in source
+
+
+def test_partial_vision_prefill_commits_mutated_text_state_on_preempt():
+    source = STREAMING_CPP.read_text()
+    eval_fn = source.split("bool eval_streaming_chunks_with_on_demand_vision(", 1)[1].split(
+        "\n}\n\nbool tokenize_formatted_text", 1
+    )[0]
+
+    assert "llm_state_mutated" in eval_fn
+    assert "commit_partial_cache_preempt" in eval_fn
+    assert "next_chunk_is_image" in eval_fn
+
+
+def test_partial_vision_prefill_closes_current_frame_text_after_partial_image():
+    source = STREAMING_CPP.read_text()
+    eval_fn = source.split("bool eval_streaming_chunks_with_on_demand_vision(", 1)[1].split(
+        "\n}\n\nbool tokenize_formatted_text", 1
+    )[0]
+
+    assert "drain_text_chunks_after_partial_image" in eval_fn
+    assert "mtmd_input_chunk_get_type(drain_chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE" in eval_fn
+
+
+def test_partial_vision_prefill_uses_live_cache_save_without_replacing_snapshot_mode():
+    source = STREAMING_CPP.read_text()
+    save_fn = source.split("bool save_vision_prefill_cache_state(", 1)[1].split(
+        "\n}\n\nbool restore_vision_prefill_cache_state", 1
+    )[0]
+
+    assert "bool live_only" in save_fn
+    assert "if (live_only)" in save_fn
+    assert "LLAMA_STATE_SEQ_FLAGS_ON_DEVICE" in save_fn
+    assert "args.partial_vision_kv)" in source
+
+
+def test_partial_vision_prefill_uses_ubatch_size_for_visible_chunks():
+    source = STREAMING_CPP.read_text()
+
+    assert "image_prefill_batch_size" in source
+    assert "std::min<int32_t>(ctx.n_batch, image_prefill_batch_size)" in source
+    assert "std::max(1, args.ubatch_size)" in source
+    assert "k_preemptible_image_prefill_batch" not in source
 
 
 def test_vision_prefill_preserves_chat_history_across_prompt_events():
@@ -163,7 +235,7 @@ def test_vision_prefill_preserves_chat_history_across_prompt_events():
     assert "cache.chat_history = ctx.chat_history" in source
     assert 'args.stream_mode == "vision_prefill"' not in singleton_fn
     assert "vision_cache->open_user_prefix = false" in prompt_fn
-    assert "save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)" in prompt_fn
+    assert "save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, args.partial_vision_kv)" in prompt_fn
 
 
 def test_vision_prefill_uses_global_stream_frame_labels_for_interleaved_turns():

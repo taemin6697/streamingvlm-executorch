@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -317,6 +318,7 @@ struct Args {
   bool force_generation = false;
   bool single_buffer = false;
   bool online_buffer = false;
+  bool partial_vision_kv = false;
   bool dynamic_kv_cache = false;
   bool no_kv_offload = false;
   bool no_warmup = false;
@@ -392,6 +394,8 @@ Args parse_args(int argc, char** argv) {
       args.single_buffer = true;
     } else if (a == "--online-buffer" || a == "--online_buffer") {
       args.online_buffer = true;
+    } else if (a == "--partial-vision-kv" || a == "--partial_vision_kv") {
+      args.partial_vision_kv = true;
     } else if (a == "--dynamic-kv-cache") {
       args.dynamic_kv_cache = true;
     } else if (a == "--force-generation") {
@@ -837,13 +841,12 @@ enum class VisionPrefillCacheBuildStatus {
   Ok,
   Failed,
   Preempted,
+  Partial,
 };
 
 bool cache_preempt_requested(const std::atomic<int>* pending_prompt_jobs) {
   return pending_prompt_jobs != nullptr && pending_prompt_jobs->load(std::memory_order_acquire) > 0;
 }
-
-constexpr int32_t k_preemptible_image_prefill_batch = 16;
 
 void record_cache_preempt(streamingvlm::hybrid_bridge::phase_recorder& phases) {
   const long t = now_ms();
@@ -854,11 +857,18 @@ struct CachePreemptDecodeCallback {
   const std::atomic<int>* pending_prompt_jobs = nullptr;
   streamingvlm::hybrid_bridge::phase_recorder* phases = nullptr;
   bool* preempted = nullptr;
+  const int32_t* completed_image_batches = nullptr;
+  bool require_completed_batch_before_abort = false;
 };
 
 bool cache_preempt_decode_callback(void* user_data) {
   auto* callback = static_cast<CachePreemptDecodeCallback*>(user_data);
   if (callback == nullptr || !cache_preempt_requested(callback->pending_prompt_jobs)) {
+    return false;
+  }
+  if (callback->require_completed_batch_before_abort &&
+      callback->completed_image_batches != nullptr &&
+      *callback->completed_image_batches <= 0) {
     return false;
   }
   if (callback->preempted != nullptr) {
@@ -872,6 +882,7 @@ bool cache_preempt_decode_callback(void* user_data) {
 
 struct ImagePrefillBatchProgress {
   streamingvlm::hybrid_bridge::phase_recorder* phases = nullptr;
+  int32_t* completed_image_batches = nullptr;
 };
 
 void image_prefill_batch_progress_callback(
@@ -882,10 +893,15 @@ void image_prefill_batch_progress_callback(
     int64_t end_ms,
     void* user_data) {
   auto* progress = static_cast<ImagePrefillBatchProgress*>(user_data);
-  if (progress == nullptr || progress->phases == nullptr || end_ms <= start_ms) {
+  if (progress == nullptr) {
     return;
   }
-  progress->phases->row("VisionPrefillImagePrefillBatch", start_ms, end_ms);
+  if (progress->completed_image_batches != nullptr) {
+    ++*progress->completed_image_batches;
+  }
+  if (progress->phases != nullptr && end_ms > start_ms) {
+    progress->phases->row("VisionPrefillImagePrefillBatch", start_ms, end_ms);
+  }
 }
 
 const char* cache_build_status_detail(VisionPrefillCacheBuildStatus status) {
@@ -894,6 +910,8 @@ const char* cache_build_status_detail(VisionPrefillCacheBuildStatus status) {
       return "ok";
     case VisionPrefillCacheBuildStatus::Preempted:
       return "preempted";
+    case VisionPrefillCacheBuildStatus::Partial:
+      return "partial";
     case VisionPrefillCacheBuildStatus::Failed:
     default:
       return "miss";
@@ -1074,12 +1092,19 @@ bool eval_streaming_chunks_with_on_demand_vision(
     const char* image_phase_name,
     const char* mmproj_phase_name,
     bool require_image,
+    int32_t image_prefill_batch_size,
+    bool allow_partial_image_commit = false,
+    bool* partial_image_committed = nullptr,
     const std::atomic<int>* pending_prompt_jobs = nullptr,
     bool* preempted = nullptr) {
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
   bool used_image = false;
   size_t image_chunk_idx = 0;
+  bool llm_state_mutated = false;
   const int32_t decoder_embedding_size = llama_model_n_embd_inp(ctx.model);
+  if (partial_image_committed != nullptr) {
+    *partial_image_committed = false;
+  }
   auto preempt = [&]() {
     if (!cache_preempt_requested(pending_prompt_jobs)) {
       return false;
@@ -1090,15 +1115,74 @@ bool eval_streaming_chunks_with_on_demand_vision(
     record_cache_preempt(phases);
     return true;
   };
-
-  for (size_t i = 0; i < n_chunks; ++i) {
-    if (preempt()) {
+  auto commit_partial_cache_preempt = [&]() {
+    if (!allow_partial_image_commit || !llm_state_mutated || !cache_preempt_requested(pending_prompt_jobs)) {
       return false;
     }
+    if (preempted != nullptr) {
+      *preempted = true;
+    }
+    if (partial_image_committed != nullptr) {
+      *partial_image_committed = true;
+    }
+    record_cache_preempt(phases);
+    return true;
+  };
+  auto next_chunk_is_image = [&](size_t chunk_idx) {
+    if (chunk_idx + 1 >= n_chunks) {
+      return false;
+    }
+    const mtmd_input_chunk* next_chunk = mtmd_input_chunks_get(chunks.ptr.get(), chunk_idx + 1);
+    return mtmd_input_chunk_get_type(next_chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE;
+  };
+  auto eval_text_chunk = [&](const mtmd_input_chunk* text_chunk, bool chunk_logits_last) {
+    llama_pos text_new_n_past = ctx.n_past;
+    const long text_prefill_start_ms = now_ms();
+    if (mtmd_helper_eval_chunk_single(
+            ctx.ctx_vision.get(),
+            ctx.lctx,
+            text_chunk,
+            ctx.n_past,
+            seq_id,
+            ctx.n_batch,
+            chunk_logits_last,
+            &text_new_n_past) != 0) {
+      LOG_ERR("failed to eval cached text chunk\n");
+      return false;
+    }
+    llama_synchronize(ctx.lctx);
+    phases.row(text_phase_name, text_prefill_start_ms, now_ms());
+    ctx.n_past = text_new_n_past;
+    llm_state_mutated = true;
+    return true;
+  };
+  auto drain_text_chunks_after_partial_image = [&](size_t start_idx) {
+    for (size_t drain_idx = start_idx; drain_idx < n_chunks; ++drain_idx) {
+      const mtmd_input_chunk* drain_chunk = mtmd_input_chunks_get(chunks.ptr.get(), drain_idx);
+      if (mtmd_input_chunk_get_type(drain_chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        break;
+      }
+      if (!eval_text_chunk(drain_chunk, logits_last && drain_idx == n_chunks - 1)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  for (size_t i = 0; i < n_chunks; ++i) {
     const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
+    const bool is_image_chunk = mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE;
+    if (!(allow_partial_image_commit && is_image_chunk)) {
+      if (commit_partial_cache_preempt()) {
+        return false;
+      }
+      if (preempt()) {
+        return false;
+      }
+    }
     const bool chunk_logits_last = logits_last && i == n_chunks - 1;
     llama_pos new_n_past = ctx.n_past;
-    if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+    if (is_image_chunk) {
       if (image_chunk_idx >= bins.size()) {
         LOG_ERR("tokenized prefix has more image chunks than cached vision bins\n");
         return false;
@@ -1119,7 +1203,7 @@ bool eval_streaming_chunks_with_on_demand_vision(
           cursor_ms += encode_ms;
         }
       }
-      if (preempt()) {
+      if (!allow_partial_image_commit && preempt()) {
         return false;
       }
 
@@ -1134,7 +1218,7 @@ bool eval_streaming_chunks_with_on_demand_vision(
       float* image_slice = embeddings.next_slice(n_tokens, n_feature_embd);
       float* image_embedding = image_slice;
       if (n_feature_embd != n_embd) {
-        if (preempt()) {
+        if (!allow_partial_image_commit && preempt()) {
           return false;
         }
         const long mmproj_start_ms = now_ms();
@@ -1156,19 +1240,24 @@ bool eval_streaming_chunks_with_on_demand_vision(
       std::vector<float> image_embedding_copy(
           image_embedding,
           image_embedding + static_cast<size_t>(n_tokens) * decoder_embedding_size);
-      if (preempt()) {
+      if (!allow_partial_image_commit && preempt()) {
         return false;
       }
       const long image_prefill_start_ms = now_ms();
+      const llama_pos image_n_past_before = ctx.n_past;
       const int32_t preemptible_image_batch =
-          std::min<int32_t>(ctx.n_batch, k_preemptible_image_prefill_batch);
+          std::min<int32_t>(ctx.n_batch, image_prefill_batch_size);
+      int32_t completed_image_batches = 0;
       CachePreemptDecodeCallback decode_preempt{
           pending_prompt_jobs,
           &phases,
           preempted,
+          &completed_image_batches,
+          allow_partial_image_commit,
       };
       ImagePrefillBatchProgress image_prefill_progress{
           &phases,
+          &completed_image_batches,
       };
       const int32_t image_decode_ret = mtmd_helper_decode_image_chunk_with_abort_and_progress(
               ctx.ctx_vision.get(),
@@ -1190,39 +1279,50 @@ bool eval_streaming_chunks_with_on_demand_vision(
         if (preempted != nullptr) {
           *preempted = true;
         }
+        if (allow_partial_image_commit && new_n_past > image_n_past_before) {
+          ctx.n_past = new_n_past;
+          llm_state_mutated = true;
+          if (!drain_text_chunks_after_partial_image(i + 1)) {
+            return false;
+          }
+          if (partial_image_committed != nullptr) {
+            *partial_image_committed = true;
+          }
+        }
         return false;
       }
       if (image_decode_ret != 0) {
         LOG_ERR("failed to decode on-demand vision image embedding\n");
         return false;
       }
-      if (preempt()) {
-        return false;
-      }
+      ctx.n_past = new_n_past;
+      llm_state_mutated = true;
       embeddings.finish();
       used_image = true;
       ++image_chunk_idx;
+      if (commit_partial_cache_preempt()) {
+        return false;
+      }
+      if (!allow_partial_image_commit && preempt()) {
+        return false;
+      }
     } else {
+      if (commit_partial_cache_preempt()) {
+        return false;
+      }
       if (preempt()) {
         return false;
       }
-      const long text_prefill_start_ms = now_ms();
-      if (mtmd_helper_eval_chunk_single(
-              ctx.ctx_vision.get(),
-              ctx.lctx,
-              chunk,
-              ctx.n_past,
-              seq_id,
-              ctx.n_batch,
-              chunk_logits_last,
-              &new_n_past) != 0) {
-        LOG_ERR("failed to eval cached text chunk\n");
+      if (!eval_text_chunk(chunk, chunk_logits_last)) {
         return false;
       }
-      llama_synchronize(ctx.lctx);
-      phases.row(text_phase_name, text_prefill_start_ms, now_ms());
-      if (preempt()) {
-        return false;
+      new_n_past = ctx.n_past;
+      if (allow_partial_image_commit) {
+        if (!next_chunk_is_image(i) && commit_partial_cache_preempt()) {
+          return false;
+        }
+      } else if (preempt()) {
+          return false;
       }
     }
     ctx.n_past = new_n_past;
@@ -1313,7 +1413,20 @@ bool save_vision_prefill_cache_state_blob(
 bool save_vision_prefill_cache_state(
     decode_context& ctx,
     VisionPrefillCache& cache,
-    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
+    bool live_only = false) {
+  if (live_only) {
+    const long t = now_ms();
+    phases.row("VisionPrefillCacheSave", t, t);
+    cache.state.clear();
+    cache.host_state.clear();
+    cache.state_flags = static_cast<llama_state_seq_flags>(0);
+    cache.host_state_flags = static_cast<llama_state_seq_flags>(0);
+    cache.n_past = ctx.n_past;
+    cache.chat_history = ctx.chat_history;
+    return true;
+  }
+
   cache.state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
   if (!save_vision_prefill_cache_state_blob(
           ctx,
@@ -1354,7 +1467,14 @@ bool restore_vision_prefill_cache_state(
     const char* phase_name = "VisionPrefillCacheRestore",
     bool prefer_host_state = false) {
   if (!cache.valid || (cache.state.empty() && cache.host_state.empty())) {
-    return false;
+    if (!cache.valid) {
+      return false;
+    }
+    const long t = now_ms();
+    phases.row(phase_name, t, t);
+    ctx.n_past = cache.n_past;
+    ctx.chat_history = cache.chat_history;
+    return true;
   }
   reset_decode_context_for_singleton(ctx);
   const long restore_start_ms = now_ms();
@@ -1413,6 +1533,11 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     target_frames.push_back(frames.back());
   }
 
+  const size_t cached_prefix_size = vision_prefill_cache_prefix_size(cache, target_frames);
+  if (cached_prefix_size > 0 && target_frames.size() > cached_prefix_size + 1) {
+    target_frames.resize(cached_prefix_size + 1);
+  }
+
   VisionPrefillCache next_cache;
   next_cache.frames = target_frames;
   next_cache.frame_indices = frame_indices_for(target_frames);
@@ -1442,8 +1567,7 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     return VisionPrefillCacheBuildStatus::Preempted;
   }
 
-  const size_t cached_prefix_size = vision_prefill_cache_prefix_size(cache, target_frames);
-  const bool can_append_incrementally = cached_prefix_size > 0 && target_frames.size() == cached_prefix_size + 1;
+  const bool can_append_incrementally = cached_prefix_size > 0 && target_frames.size() > cached_prefix_size;
   bool use_incremental_append = false;
   std::string formatted_prefix;
   bool formatted_prefix_add_special = false;
@@ -1452,7 +1576,8 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
 
   if (can_append_incrementally &&
       restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore")) {
-    std::vector<FrameRecord> append_frames{target_frames.back()};
+    auto append_begin = target_frames.begin() + static_cast<std::ptrdiff_t>(cached_prefix_size);
+    std::vector<FrameRecord> append_frames(append_begin, append_begin + 1);
     bins = bins_for_frames(append_frames);
     images_to_load = layout_images_for_frames(append_frames);
     if (!build_formatted_incremental_vision_cache_append(append_frames, formatted_prefix)) {
@@ -1527,6 +1652,8 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
   }
 
   bool preempted = false;
+  bool partial_image_committed = false;
+  const int32_t image_prefill_batch_size = std::max(1, args.ubatch_size);
   if (!eval_streaming_chunks_with_on_demand_vision(
           ctx,
           chunks,
@@ -1541,9 +1668,22 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
           "VisionPrefillImagePrefill",
           "VisionPrefillMmproj",
           true,
+          image_prefill_batch_size,
+          args.partial_vision_kv,
+          &partial_image_committed,
           pending_prompt_jobs,
           &preempted)) {
     if (preempted) {
+      if (partial_image_committed) {
+        if (!save_vision_prefill_cache_state(ctx, next_cache, cache_phases, args.partial_vision_kv)) {
+          cache = std::move(next_cache);
+          return VisionPrefillCacheBuildStatus::Failed;
+        }
+        next_cache.valid = true;
+        cache_phases.row("VisionPrefillCachePartialCommit", build_start_ms, now_ms());
+        cache = std::move(next_cache);
+        return VisionPrefillCacheBuildStatus::Partial;
+      }
       if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, false)) {
         return VisionPrefillCacheBuildStatus::Failed;
       }
@@ -1552,14 +1692,16 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     cache = std::move(next_cache);
     return VisionPrefillCacheBuildStatus::Failed;
   }
-  if (cache_preempt_requested(pending_prompt_jobs)) {
+  if (cache_preempt_requested(pending_prompt_jobs) && !args.partial_vision_kv) {
     if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, true)) {
       return VisionPrefillCacheBuildStatus::Failed;
     }
     return VisionPrefillCacheBuildStatus::Preempted;
+  } else if (cache_preempt_requested(pending_prompt_jobs)) {
+    record_cache_preempt(cache_phases);
   }
 
-  if (!save_vision_prefill_cache_state(ctx, next_cache, cache_phases)) {
+  if (!save_vision_prefill_cache_state(ctx, next_cache, cache_phases, args.partial_vision_kv)) {
     cache = std::move(next_cache);
     return VisionPrefillCacheBuildStatus::Failed;
   }
@@ -1646,7 +1788,7 @@ int run_vision_prefill_prompt_from_committed_cache(
         vision_cache->images = images;
         vision_cache->open_user_prefix = false;
         vision_cache->open_user_content.clear();
-        if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)) {
+        if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, args.partial_vision_kv)) {
           rc = 1;
         } else {
           vision_cache->valid = true;
@@ -2378,7 +2520,8 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(mu);
         if (status == VisionPrefillCacheBuildStatus::Preempted) {
           buffer_stats.skipped_cache_updates += 1;
-        } else if (status == VisionPrefillCacheBuildStatus::Ok) {
+        } else if (status == VisionPrefillCacheBuildStatus::Ok ||
+                   status == VisionPrefillCacheBuildStatus::Partial) {
           note_committed_cache_update(buffer_stats, cache_start_ms, cache_end_ms);
         } else {
           note_processed_visual_job(buffer_stats, cache_start_ms, cache_end_ms);

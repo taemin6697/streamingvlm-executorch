@@ -309,6 +309,8 @@ int32_t mtmd_helper_decode_image_chunk_with_abort_and_progress(
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
+    llama_pos decoded_n_pos = 0;
+    *new_n_past = n_past;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     if (mtmd_decode_use_mrope(ctx)) {
@@ -366,6 +368,8 @@ int32_t mtmd_helper_decode_image_chunk_with_abort_and_progress(
         if (on_batch_done != nullptr) {
             on_batch_done(i_batch, n_img_batches, n_tokens_batch, t1, t2, batch_user_data);
         }
+        decoded_n_pos += n_tokens_batch;
+        *new_n_past = n_past + decoded_n_pos;
 
         LOG_INF("%s decoded (batch %d/%d) in %" PRId64 " ms\n", name, i_batch+1, n_img_batches, t2 - t1);
 
@@ -378,8 +382,8 @@ int32_t mtmd_helper_decode_image_chunk_with_abort_and_progress(
         }
     }
 
-    n_past += mtmd_input_chunk_get_n_pos(chunk);
-    *new_n_past = n_past;
+    decoded_n_pos = mtmd_input_chunk_get_n_pos(chunk);
+    *new_n_past = n_past + decoded_n_pos;
 
     if (use_non_causal) {
         llama_set_causal_attn(lctx, true);
