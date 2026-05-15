@@ -2057,6 +2057,7 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
     ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     force_arg = "--force-generation" if args.force_generation else ""
     online_buffer_arg = "--online-buffer" if getattr(args, "online_buffer", False) else ""
+    partial_vision_kv_arg = "--partial-vision-kv" if getattr(args, "partial_vision_kv", False) else ""
     stream_mode_arg = f"--stream-mode {shlex.quote(args.stream_mode)}"
     media_mode_arg = f"--media-mode {shlex.quote('streaming' if args.streaming_video is not None else args.media_mode.value.replace('_', '-'))}"
     window_sec_arg = f"--window-sec {args.window_sec}" if args.window_sec is not None else ""
@@ -2080,7 +2081,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
 {baseline_loop}
 
-./{runner_bin} {online_buffer_arg} --runner ./opencl_phase_mtmd \\
+./{runner_bin} {online_buffer_arg} {partial_vision_kv_arg} --runner ./opencl_phase_mtmd \\
   {encoder_arg} {warmup_image_arg} \\
   {media_mode_arg} \\
   {stream_mode_arg} {window_sec_arg} {window_max_frames_arg} \\
@@ -2260,6 +2261,7 @@ def main() -> int:
         help="Streaming strategy for --streaming-video. Defaults to on-demand; --single-buffer remains an alias.",
     )
     parser.add_argument("--online-buffer", "--online_buffer", dest="online_buffer", action="store_true", help="Use latest-only online stream buffer semantics.")
+    parser.add_argument("--partial-vision-kv", "--partial_vision_kv", dest="partial_vision_kv", action="store_true", help="In vision-prefill streaming, commit the current image prefill chunk when a prompt preempts cache construction.")
     parser.add_argument("--num-segments", type=int, default=8, help="Uniform temporal samples for --video.")
     parser.add_argument("--sampling-fps", "--sampling_fps", dest="sampling_fps", type=float, default=None, help="Frame sampling FPS for --streaming-video.")
     parser.add_argument("--max-video-time", "--max_video_time", dest="max_video_time", type=float, default=None, help="Optional maximum streaming-video duration to sample, in seconds.")
