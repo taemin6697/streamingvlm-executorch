@@ -9,6 +9,9 @@ from my_research.test_python.internvl3_partial_prefill import (
     downsample_grid_average,
     island_background_merge_pool_selection,
     island_context_pool_selection,
+    object_all_background_kmeans_selection,
+    object_background_budget_counts,
+    object_budget_background_kmeans_selection,
     object_topk_residual_cluster_pool_selection,
     parse_ratios,
     patch_attention_rollout,
@@ -16,6 +19,7 @@ from my_research.test_python.internvl3_partial_prefill import (
     percent_reduction,
     select_topk_indices,
     selection_source_coverage,
+    split_disconnected_label_grid,
     square_grid_size,
     visual_token_scores_from_vit_patch_scores,
     vit_attention_rollout,
@@ -396,3 +400,210 @@ def test_selection_source_coverage_reports_missing_and_overlap_tokens():
         "visual_source_overlap_count": 1,
         "visual_source_missing_count": 1,
     }
+
+
+def test_split_disconnected_label_grid_splits_same_label_islands():
+    label_grid = torch.tensor(
+        [
+            [0, 0, -1, 0],
+            [0, -1, -1, 0],
+            [-1, -1, -1, -1],
+            [1, 1, -1, 1],
+        ]
+    )
+    valid_mask = label_grid >= 0
+
+    new_labels = split_disconnected_label_grid(label_grid, valid_mask)
+
+    components = sorted(set(int(x) for x in new_labels[valid_mask].tolist()))
+    assert components == [0, 1, 2, 3]
+    assert new_labels[0, 0].item() == new_labels[1, 0].item()
+    assert new_labels[0, 3].item() != new_labels[0, 0].item()
+    assert new_labels[3, 3].item() != new_labels[3, 0].item()
+
+
+def test_object_all_background_kmeans_selection_keeps_all_island_tokens_and_covers_background():
+    features = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    scores = torch.tensor(
+        [
+            0.90,
+            0.80,
+            0.70,
+            0.60,
+            0.50,
+            0.40,
+            0.30,
+            0.20,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+        ]
+    )
+    island_mask = torch.zeros(4, 4, dtype=torch.bool)
+    island_mask[:2, :] = True
+
+    selection = object_all_background_kmeans_selection(
+        features,
+        scores,
+        grid_side=4,
+        background_k_min=2,
+        background_k_max=3,
+        background_k_elbow_threshold=0.01,
+        background_min_region_size=1,
+        island_mask=island_mask,
+    )
+
+    assert selection.object_indices.tolist() == list(range(8))
+    assert 2 <= len(selection.background_summaries) <= 8
+    source_sets = [set(summary["source_indices"]) for summary in selection.background_summaries]
+    assert set().union(*source_sets) == set(range(8, 16))
+    assert sum(len(source) for source in source_sets) == 8
+
+
+def test_object_budget_background_kmeans_selection_uses_total_ratio_with_90_10_split():
+    features = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    scores = torch.tensor(
+        [
+            0.90,
+            0.80,
+            0.70,
+            0.60,
+            0.50,
+            0.40,
+            0.30,
+            0.20,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+        ]
+    )
+    island_mask = torch.zeros(4, 4, dtype=torch.bool)
+    island_mask[:2, :] = True
+
+    selection = object_budget_background_kmeans_selection(
+        features,
+        scores,
+        ratio_percent=50,
+        grid_side=4,
+        object_budget_percent=90,
+        background_min_region_size=1,
+        island_mask=island_mask,
+    )
+
+    assert selection.object_indices.tolist() == [0, 1, 2, 3, 4, 5, 6]
+    assert len(selection.background_summaries) == 1
+    assert selection.features.shape[0] == 8
+    assert selection.background_summaries[0]["source_indices"] == list(range(7, 16))
+
+
+def test_object_background_budget_counts_transfers_excess_object_budget_to_background():
+    cases = [
+        (10, 26, 23, 3),
+        (30, 77, 69, 8),
+        (50, 128, 115, 13),
+        (70, 180, 118, 62),
+        (100, 256, 118, 138),
+    ]
+
+    for ratio, total_budget, object_count, background_count in cases:
+        budget = object_background_budget_counts(
+            total_tokens=256,
+            ratio_percent=ratio,
+            object_budget_percent=90,
+            object_candidate_count=118,
+        )
+
+        assert budget.total_budget == total_budget
+        assert budget.object_count == object_count
+        assert budget.background_count == background_count
+
+
+def test_object_budget_background_kmeans_selection_transfers_unused_object_budget_to_background():
+    features = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    scores = torch.tensor(
+        [
+            0.90,
+            0.80,
+            0.70,
+            0.60,
+            0.50,
+            0.40,
+            0.30,
+            0.20,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+        ]
+    )
+    island_mask = torch.zeros(4, 4, dtype=torch.bool)
+    island_mask[:2, :] = True
+
+    selection = object_budget_background_kmeans_selection(
+        features,
+        scores,
+        ratio_percent=100,
+        grid_side=4,
+        object_budget_percent=90,
+        background_min_region_size=1,
+        island_mask=island_mask,
+    )
+
+    assert selection.object_indices.tolist() == list(range(8))
+    assert len(selection.background_summaries) == 8
+    assert selection.features.shape[0] == 16
+    source_sets = [set(summary["source_indices"]) for summary in selection.background_summaries]
+    assert set().union(*source_sets) == set(range(8, 16))
+
+
+def test_object_budget_background_kmeans_selection_keeps_all_tokens_at_100_percent_with_default_region_size():
+    features = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    scores = torch.tensor(
+        [
+            0.90,
+            0.80,
+            0.70,
+            0.60,
+            0.50,
+            0.40,
+            0.30,
+            0.20,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+            0.10,
+            0.20,
+            0.30,
+            0.40,
+        ]
+    )
+    island_mask = torch.zeros(4, 4, dtype=torch.bool)
+    island_mask[:2, :] = True
+
+    selection = object_budget_background_kmeans_selection(
+        features,
+        scores,
+        ratio_percent=100,
+        grid_side=4,
+        object_budget_percent=90,
+        island_mask=island_mask,
+    )
+
+    assert selection.object_indices.tolist() == list(range(8))
+    assert len(selection.background_summaries) == 8
+    assert selection.features.shape[0] == 16

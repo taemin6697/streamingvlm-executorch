@@ -46,10 +46,14 @@ SELECTION_POLICY_TOPK = "topk"
 SELECTION_POLICY_ISLAND_CONTEXT_POOL = "island-context-pool"
 SELECTION_POLICY_ISLAND_BACKGROUND_MERGE_POOL = "island-background-merge-pool"
 SELECTION_POLICY_OBJECT_TOPK_RESIDUAL_CLUSTER_POOL = "object-topk-residual-cluster-pool"
+SELECTION_POLICY_OBJECT_ALL_BACKGROUND_KMEANS = "object-all-background-kmeans"
+SELECTION_POLICY_OBJECT_BUDGET_BACKGROUND_KMEANS = "object-budget-background-kmeans"
 POOLED_SELECTION_POLICIES = (
     SELECTION_POLICY_ISLAND_CONTEXT_POOL,
     SELECTION_POLICY_ISLAND_BACKGROUND_MERGE_POOL,
     SELECTION_POLICY_OBJECT_TOPK_RESIDUAL_CLUSTER_POOL,
+    SELECTION_POLICY_OBJECT_ALL_BACKGROUND_KMEANS,
+    SELECTION_POLICY_OBJECT_BUDGET_BACKGROUND_KMEANS,
 )
 SELECTION_POLICIES = (SELECTION_POLICY_TOPK, *POOLED_SELECTION_POLICIES)
 
@@ -68,6 +72,15 @@ class RatioSelection:
     object_indices: torch.Tensor
     background_summaries: list[dict[str, Any]]
     details: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ObjectBackgroundBudget:
+    total_budget: int
+    object_budget: int
+    initial_background_budget: int
+    object_count: int
+    background_count: int
 
 
 @dataclass
@@ -260,6 +273,38 @@ def _selection_counts(
     return k_total, k_total - k_bg, k_bg
 
 
+def object_background_budget_counts(
+    *,
+    total_tokens: int,
+    ratio_percent: int,
+    object_budget_percent: int,
+    object_candidate_count: int,
+) -> ObjectBackgroundBudget:
+    if total_tokens <= 0:
+        raise ValueError("total_tokens must be positive")
+    if ratio_percent <= 0 or ratio_percent > 100:
+        raise ValueError(f"ratio_percent must be in 1..100, got {ratio_percent}")
+    if object_budget_percent <= 0 or object_budget_percent >= 100:
+        raise ValueError("object_budget_percent must be in 1..99")
+
+    total_budget = max(1, min(total_tokens, math.ceil(total_tokens * ratio_percent / 100.0)))
+    background_budget_percent = 100 - int(object_budget_percent)
+    initial_background_budget = max(0, math.ceil(total_budget * background_budget_percent / 100.0))
+    initial_background_budget = min(initial_background_budget, max(0, total_budget - 1))
+    object_budget = max(1, total_budget - initial_background_budget)
+
+    candidates = max(0, min(int(object_candidate_count), int(total_tokens)))
+    object_count = min(object_budget, candidates if candidates > 0 else total_tokens)
+    background_count = min(max(0, total_tokens - object_count), max(0, total_budget - object_count))
+    return ObjectBackgroundBudget(
+        total_budget=int(total_budget),
+        object_budget=int(object_budget),
+        initial_background_budget=int(initial_background_budget),
+        object_count=int(object_count),
+        background_count=int(background_count),
+    )
+
+
 def _coarse_cell_center_index(
     *,
     grid_side: int,
@@ -366,6 +411,336 @@ def merge_background_regions(
     return sorted(regions, key=lambda region: (region["min_row"], region["min_col"], min(region["indices"])))
 
 
+def _kmeans_labels(
+    points: torch.Tensor,
+    k: int,
+    *,
+    max_iterations: int = 30,
+) -> tuple[torch.Tensor, float]:
+    points = points.detach().float().cpu()
+    n_points = int(points.shape[0])
+    if n_points == 0:
+        return torch.empty(0, dtype=torch.long), 0.0
+    k = max(1, min(int(k), n_points))
+    if k == n_points:
+        return torch.arange(n_points, dtype=torch.long), 0.0
+
+    initial = torch.linspace(0, n_points - 1, steps=k).round().long()
+    centers = points.index_select(0, initial).clone()
+    labels = torch.full((n_points,), -1, dtype=torch.long)
+    for _ in range(max(1, max_iterations)):
+        distances = torch.cdist(points, centers).pow(2)
+        next_labels = distances.argmin(dim=1)
+        if torch.equal(next_labels, labels):
+            break
+        labels = next_labels
+        next_centers = centers.clone()
+        for cluster_id in range(k):
+            cluster_points = points[labels == cluster_id]
+            if cluster_points.numel() > 0:
+                next_centers[cluster_id] = cluster_points.mean(dim=0)
+        centers = next_centers
+
+    inertia = float(torch.cdist(points, centers).pow(2).min(dim=1).values.sum().item())
+    return labels, inertia
+
+
+def _choose_k_by_elbow(
+    points: torch.Tensor,
+    *,
+    k_min: int,
+    k_max: int,
+    elbow_threshold: float,
+    max_iterations: int = 30,
+) -> int:
+    n_points = int(points.shape[0])
+    if n_points <= 0:
+        return 0
+    lower = max(1, min(int(k_min), n_points))
+    upper = max(lower, min(int(k_max), n_points))
+    previous_inertia: float | None = None
+    previous_k = lower
+    for k in range(lower, upper + 1):
+        _, inertia = _kmeans_labels(points, k, max_iterations=max_iterations)
+        if previous_inertia is not None:
+            if previous_inertia <= 1e-12:
+                return previous_k
+            improvement = (previous_inertia - inertia) / previous_inertia
+            if improvement < elbow_threshold:
+                return previous_k
+        previous_inertia = inertia
+        previous_k = k
+    return upper
+
+
+def _background_cluster_features(
+    background_indices: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    grid_side: int,
+    spatial_weight: float,
+    score_weight: float,
+) -> torch.Tensor:
+    idx = background_indices.detach().cpu().long()
+    rows = (idx // grid_side).float() / max(1, grid_side - 1)
+    cols = (idx % grid_side).float() / max(1, grid_side - 1)
+    score_values = _normalize_tensor(scores).flatten().index_select(0, idx)
+    return torch.stack(
+        [
+            rows * float(spatial_weight),
+            cols * float(spatial_weight),
+            score_values * float(score_weight),
+        ],
+        dim=1,
+    )
+
+
+def split_disconnected_label_grid(label_grid: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    labels = label_grid.detach().cpu().long()
+    valid = valid_mask.detach().cpu().bool()
+    if labels.shape != valid.shape:
+        raise ValueError("label_grid and valid_mask must have the same shape")
+
+    h, w = labels.shape
+    visited = torch.zeros((h, w), dtype=torch.bool)
+    out = torch.full((h, w), -1, dtype=torch.long)
+    next_label = 0
+    for row in range(h):
+        for col in range(w):
+            if visited[row, col] or not bool(valid[row, col]):
+                continue
+            old_label = int(labels[row, col].item())
+            stack = [(row, col)]
+            visited[row, col] = True
+            while stack:
+                cur_row, cur_col = stack.pop()
+                out[cur_row, cur_col] = next_label
+                for next_row, next_col in (
+                    (cur_row - 1, cur_col),
+                    (cur_row + 1, cur_col),
+                    (cur_row, cur_col - 1),
+                    (cur_row, cur_col + 1),
+                ):
+                    if not (0 <= next_row < h and 0 <= next_col < w):
+                        continue
+                    if visited[next_row, next_col] or not bool(valid[next_row, next_col]):
+                        continue
+                    if int(labels[next_row, next_col].item()) != old_label:
+                        continue
+                    visited[next_row, next_col] = True
+                    stack.append((next_row, next_col))
+            next_label += 1
+    return out
+
+
+def _regions_from_label_grid(label_grid: torch.Tensor, scores: torch.Tensor, grid_side: int) -> list[dict[str, Any]]:
+    labels = label_grid.detach().cpu().long().reshape(grid_side, grid_side)
+    regions: list[dict[str, Any]] = []
+    for label in sorted(int(x) for x in labels.unique().tolist() if int(x) >= 0):
+        indices = labels.flatten().eq(label).nonzero(as_tuple=False).flatten().tolist()
+        if indices:
+            region = _region_from_indices([int(idx) for idx in indices], scores, grid_side)
+            region["region_id"] = len(regions)
+            regions.append(region)
+    return regions
+
+
+def _merge_small_regions(
+    regions: list[dict[str, Any]],
+    scores: torch.Tensor,
+    *,
+    grid_side: int,
+    min_region_size: int,
+) -> list[dict[str, Any]]:
+    if min_region_size <= 1:
+        return regions
+    regions = [dict(region) for region in regions]
+    while len(regions) > 1:
+        small_indices = [idx for idx, region in enumerate(regions) if len(region["indices"]) < min_region_size]
+        if not small_indices:
+            break
+        i = min(small_indices, key=lambda idx: (len(regions[idx]["indices"]), min(regions[idx]["indices"])))
+        best: tuple[float, int, int] | None = None
+        best_j: int | None = None
+        for j, region in enumerate(regions):
+            if i == j:
+                continue
+            adjacent = _regions_are_adjacent(regions[i], region, grid_side)
+            cost = _merge_cost(regions[i], region, adjacent=adjacent, grid_side=grid_side)
+            if best is None or cost < best:
+                best = cost
+                best_j = j
+        assert best_j is not None
+        merged = _merge_region_dicts(regions[i], regions[best_j], scores, grid_side)
+        regions = [region for idx, region in enumerate(regions) if idx not in (i, best_j)]
+        regions.append(merged)
+
+    return sorted(regions, key=lambda region: (region["min_row"], region["min_col"], min(region["indices"])))
+
+
+def _merge_regions_to_target(
+    regions: list[dict[str, Any]],
+    scores: torch.Tensor,
+    *,
+    grid_side: int,
+    target_region_count: int,
+) -> list[dict[str, Any]]:
+    if target_region_count <= 0:
+        return []
+    regions = [dict(region) for region in regions]
+    target_region_count = min(target_region_count, len(regions))
+    while len(regions) > target_region_count:
+        best: tuple[float, int, int] | None = None
+        best_pair: tuple[int, int] | None = None
+        for i in range(len(regions)):
+            for j in range(i + 1, len(regions)):
+                adjacent = _regions_are_adjacent(regions[i], regions[j], grid_side)
+                cost = _merge_cost(regions[i], regions[j], adjacent=adjacent, grid_side=grid_side)
+                if best is None or cost < best:
+                    best = cost
+                    best_pair = (i, j)
+        assert best_pair is not None
+        i, j = best_pair
+        merged = _merge_region_dicts(regions[i], regions[j], scores, grid_side)
+        regions = [region for idx, region in enumerate(regions) if idx not in (i, j)]
+        regions.append(merged)
+    return sorted(regions, key=lambda region: (region["min_row"], region["min_col"], min(region["indices"])))
+
+
+def _split_region_dict(region: dict[str, Any], scores: torch.Tensor, grid_side: int) -> list[dict[str, Any]]:
+    indices = [int(idx) for idx in region["indices"]]
+    if len(indices) <= 1:
+        return [region]
+    row_span = int(region["max_row"]) - int(region["min_row"])
+    col_span = int(region["max_col"]) - int(region["min_col"])
+    if row_span >= col_span:
+        indices = sorted(indices, key=lambda idx: (idx // grid_side, idx % grid_side))
+    else:
+        indices = sorted(indices, key=lambda idx: (idx % grid_side, idx // grid_side))
+    mid = max(1, len(indices) // 2)
+    return [
+        _region_from_indices(indices[:mid], scores, grid_side),
+        _region_from_indices(indices[mid:], scores, grid_side),
+    ]
+
+
+def _split_regions_to_target(
+    regions: list[dict[str, Any]],
+    scores: torch.Tensor,
+    *,
+    grid_side: int,
+    target_region_count: int,
+) -> list[dict[str, Any]]:
+    regions = [dict(region) for region in regions]
+    while len(regions) < target_region_count:
+        candidates = [idx for idx, region in enumerate(regions) if len(region["indices"]) > 1]
+        if not candidates:
+            break
+        split_idx = max(candidates, key=lambda idx: (len(regions[idx]["indices"]), -min(regions[idx]["indices"])))
+        split_regions = _split_region_dict(regions[split_idx], scores, grid_side)
+        regions = [region for idx, region in enumerate(regions) if idx != split_idx]
+        regions.extend(split_regions)
+    return sorted(regions, key=lambda region: (region["min_row"], region["min_col"], min(region["indices"])))
+
+
+def connected_kmeans_background_regions(
+    context_mask: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    grid_side: int,
+    k_min: int,
+    k_max: int,
+    elbow_threshold: float,
+    min_region_size: int,
+    spatial_weight: float,
+    score_weight: float,
+    max_iterations: int = 30,
+) -> tuple[list[dict[str, Any]], int]:
+    context_mask = context_mask.detach().cpu().bool().reshape(grid_side, grid_side)
+    scores = scores.detach().float().cpu().flatten()
+    background_indices = context_mask.flatten().nonzero(as_tuple=False).flatten()
+    if background_indices.numel() == 0:
+        return [], 0
+
+    points = _background_cluster_features(
+        background_indices,
+        scores,
+        grid_side=grid_side,
+        spatial_weight=spatial_weight,
+        score_weight=score_weight,
+    )
+    selected_k = _choose_k_by_elbow(
+        points,
+        k_min=k_min,
+        k_max=k_max,
+        elbow_threshold=elbow_threshold,
+        max_iterations=max_iterations,
+    )
+    labels, _ = _kmeans_labels(points, selected_k, max_iterations=max_iterations)
+    label_grid = torch.full((grid_side * grid_side,), -1, dtype=torch.long)
+    label_grid[background_indices] = labels
+    label_grid = label_grid.reshape(grid_side, grid_side)
+    connected_labels = split_disconnected_label_grid(label_grid, context_mask)
+    regions = _regions_from_label_grid(connected_labels, scores, grid_side)
+    regions = _merge_small_regions(regions, scores, grid_side=grid_side, min_region_size=min_region_size)
+    return regions, selected_k
+
+
+def connected_kmeans_background_regions_for_target(
+    context_mask: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    grid_side: int,
+    target_region_count: int,
+    min_region_size: int,
+    spatial_weight: float,
+    score_weight: float,
+    max_iterations: int = 30,
+) -> tuple[list[dict[str, Any]], int]:
+    context_mask = context_mask.detach().cpu().bool().reshape(grid_side, grid_side)
+    scores = scores.detach().float().cpu().flatten()
+    background_indices = context_mask.flatten().nonzero(as_tuple=False).flatten()
+    if target_region_count <= 0 or background_indices.numel() == 0:
+        return [], 0
+
+    selected_k = min(int(target_region_count), int(background_indices.numel()))
+    if selected_k == int(background_indices.numel()):
+        regions = [
+            _region_from_indices([int(idx)], scores, grid_side)
+            for idx in background_indices.tolist()
+        ]
+        return regions, selected_k
+
+    points = _background_cluster_features(
+        background_indices,
+        scores,
+        grid_side=grid_side,
+        spatial_weight=spatial_weight,
+        score_weight=score_weight,
+    )
+    labels, _ = _kmeans_labels(points, selected_k, max_iterations=max_iterations)
+    label_grid = torch.full((grid_side * grid_side,), -1, dtype=torch.long)
+    label_grid[background_indices] = labels
+    label_grid = label_grid.reshape(grid_side, grid_side)
+    connected_labels = split_disconnected_label_grid(label_grid, context_mask)
+    regions = _regions_from_label_grid(connected_labels, scores, grid_side)
+    if len(regions) > selected_k:
+        regions = _merge_regions_to_target(
+            regions,
+            scores,
+            grid_side=grid_side,
+            target_region_count=selected_k,
+        )
+    elif len(regions) < selected_k:
+        regions = _split_regions_to_target(
+            regions,
+            scores,
+            grid_side=grid_side,
+            target_region_count=selected_k,
+        )
+    return regions, selected_k
+
+
 def cc_background_cluster_count(
     residual_mask: torch.Tensor,
     *,
@@ -409,6 +784,68 @@ def _assemble_selection_features(
         entries.append((int(item["pseudo_index"]), item["feature"], "background"))
     entries.sort(key=lambda item: (item[0], 0 if item[2] == "object" else 1))
     return torch.stack([entry[1] for entry in entries], dim=0) if entries else flat_features[:0]
+
+
+def _background_summary_candidates_from_regions(
+    flat_features: torch.Tensor,
+    scores: torch.Tensor,
+    regions: list[dict[str, Any]],
+    *,
+    grid_side: int,
+    extra_fields: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    summary_candidates: list[dict[str, Any]] = []
+    extra_fields = extra_fields or {}
+    for region_id, region in enumerate(regions):
+        source_indices = [int(idx) for idx in region["indices"]]
+        source_tensor = torch.tensor(source_indices, dtype=torch.long, device=flat_features.device)
+        cpu_source_tensor = torch.tensor(source_indices, dtype=torch.long)
+        summary = {
+            "feature": flat_features.index_select(0, source_tensor).mean(dim=0),
+            "score": float(scores.index_select(0, cpu_source_tensor).mean().item()),
+            "pseudo_index": _region_pseudo_index(region, grid_side),
+            "region_id": region_id,
+            "source_indices": source_indices,
+            "min_row": int(region["min_row"]),
+            "max_row": int(region["max_row"]),
+            "min_col": int(region["min_col"]),
+            "max_col": int(region["max_col"]),
+        }
+        summary.update(extra_fields)
+        summary_candidates.append(summary)
+    return summary_candidates
+
+
+def _background_summary_metadata(
+    summary_candidates: list[dict[str, Any]],
+    *,
+    extra_keys: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    base_keys = (
+        "score",
+        "pseudo_index",
+        "region_id",
+        "source_indices",
+        "min_row",
+        "max_row",
+        "min_col",
+        "max_col",
+    )
+    summaries: list[dict[str, Any]] = []
+    for item in summary_candidates:
+        summary: dict[str, Any] = {}
+        for key in (*base_keys, *extra_keys):
+            if key not in item:
+                continue
+            value = item[key]
+            if key == "source_indices":
+                summary[key] = [int(x) for x in value]
+            elif key == "score":
+                summary[key] = float(value)
+            else:
+                summary[key] = int(value)
+        summaries.append(summary)
+    return summaries
 
 
 def selection_source_coverage(
@@ -609,42 +1046,14 @@ def island_background_merge_pool_selection(
         target_region_count=target_background_regions,
     )
 
-    summary_candidates: list[dict[str, Any]] = []
-    for region_id, region in enumerate(merged_regions):
-        source_indices = [int(idx) for idx in region["indices"]]
-        source_tensor = torch.tensor(source_indices, dtype=torch.long, device=flat_features.device)
-        cpu_source_tensor = torch.tensor(source_indices, dtype=torch.long)
-        summary_feature = flat_features.index_select(0, source_tensor).mean(dim=0)
-        summary_score = float(scores.index_select(0, cpu_source_tensor).mean().item())
-        pseudo_index = _region_pseudo_index(region, grid_side)
-        summary_candidates.append(
-            {
-                "feature": summary_feature,
-                "score": summary_score,
-                "pseudo_index": pseudo_index,
-                "region_id": region_id,
-                "source_indices": source_indices,
-                "min_row": int(region["min_row"]),
-                "max_row": int(region["max_row"]),
-                "min_col": int(region["min_col"]),
-                "max_col": int(region["max_col"]),
-            }
-        )
-
+    summary_candidates = _background_summary_candidates_from_regions(
+        flat_features,
+        scores,
+        merged_regions,
+        grid_side=grid_side,
+    )
     features = _assemble_selection_features(flat_features, object_indices, summary_candidates)
-    background_summaries = [
-        {
-            "score": float(item["score"]),
-            "pseudo_index": int(item["pseudo_index"]),
-            "region_id": int(item["region_id"]),
-            "source_indices": [int(x) for x in item["source_indices"]],
-            "min_row": int(item["min_row"]),
-            "max_row": int(item["max_row"]),
-            "min_col": int(item["min_col"]),
-            "max_col": int(item["max_col"]),
-        }
-        for item in summary_candidates
-    ]
+    background_summaries = _background_summary_metadata(summary_candidates)
 
     return IslandContextSelection(
         features=features,
@@ -744,42 +1153,182 @@ def object_topk_residual_cluster_pool_selection(
         target_region_count=target_background_regions,
     )
 
-    summary_candidates: list[dict[str, Any]] = []
-    for region_id, region in enumerate(merged_regions):
-        source_indices = [int(idx) for idx in region["indices"]]
-        source_tensor = torch.tensor(source_indices, dtype=torch.long, device=flat_features.device)
-        cpu_source_tensor = torch.tensor(source_indices, dtype=torch.long)
-        summary_feature = flat_features.index_select(0, source_tensor).mean(dim=0)
-        summary_score = float(scores.index_select(0, cpu_source_tensor).mean().item())
-        pseudo_index = _region_pseudo_index(region, grid_side)
-        summary_candidates.append(
-            {
-                "feature": summary_feature,
-                "score": summary_score,
-                "pseudo_index": pseudo_index,
-                "region_id": region_id,
-                "source_indices": source_indices,
-                "min_row": int(region["min_row"]),
-                "max_row": int(region["max_row"]),
-                "min_col": int(region["min_col"]),
-                "max_col": int(region["max_col"]),
-            }
+    summary_candidates = _background_summary_candidates_from_regions(
+        flat_features,
+        scores,
+        merged_regions,
+        grid_side=grid_side,
+    )
+    features = _assemble_selection_features(flat_features, object_indices, summary_candidates)
+    background_summaries = _background_summary_metadata(summary_candidates)
+
+    return IslandContextSelection(
+        features=features,
+        object_indices=object_indices,
+        background_summaries=background_summaries,
+        island_mask=island_mask,
+    )
+
+
+def object_all_background_kmeans_selection(
+    flat_features: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    grid_side: int,
+    background_k_min: int = 4,
+    background_k_max: int = 24,
+    background_k_elbow_threshold: float = 0.08,
+    background_min_region_size: int = 2,
+    background_spatial_weight: float = 1.0,
+    background_score_weight: float = 0.35,
+    island_mask: torch.Tensor | None = None,
+) -> IslandContextSelection:
+    if flat_features.ndim != 2:
+        raise ValueError(f"flat_features must be [tokens, hidden], got {tuple(flat_features.shape)}")
+    scores = scores.detach().float().cpu().flatten()
+    total_tokens = int(scores.numel())
+    if flat_features.shape[0] != total_tokens:
+        raise ValueError("flat_features and scores must have the same token count")
+    if grid_side * grid_side != total_tokens:
+        raise ValueError(f"grid_side {grid_side} does not match token count {total_tokens}")
+
+    if island_mask is None:
+        island_mask = build_attention_island_mask(scores, grid_side=grid_side)
+    else:
+        island_mask = island_mask.detach().cpu().bool()
+    if tuple(island_mask.shape) != (grid_side, grid_side):
+        raise ValueError(f"island_mask must be {(grid_side, grid_side)}, got {tuple(island_mask.shape)}")
+
+    flat_island = island_mask.flatten()
+    object_indices = torch.sort(flat_island.nonzero(as_tuple=False).flatten()).values
+    if object_indices.numel() == total_tokens:
+        return IslandContextSelection(
+            features=flat_features,
+            object_indices=object_indices,
+            background_summaries=[],
+            island_mask=island_mask,
         )
 
+    context_mask = (~flat_island).reshape(grid_side, grid_side)
+    merged_regions, selected_k = connected_kmeans_background_regions(
+        context_mask,
+        scores,
+        grid_side=grid_side,
+        k_min=background_k_min,
+        k_max=background_k_max,
+        elbow_threshold=background_k_elbow_threshold,
+        min_region_size=background_min_region_size,
+        spatial_weight=background_spatial_weight,
+        score_weight=background_score_weight,
+    )
+
+    summary_candidates = _background_summary_candidates_from_regions(
+        flat_features,
+        scores,
+        merged_regions,
+        grid_side=grid_side,
+        extra_fields={"kmeans_raw_k": int(selected_k)},
+    )
     features = _assemble_selection_features(flat_features, object_indices, summary_candidates)
-    background_summaries = [
-        {
-            "score": float(item["score"]),
-            "pseudo_index": int(item["pseudo_index"]),
-            "region_id": int(item["region_id"]),
-            "source_indices": [int(x) for x in item["source_indices"]],
-            "min_row": int(item["min_row"]),
-            "max_row": int(item["max_row"]),
-            "min_col": int(item["min_col"]),
-            "max_col": int(item["max_col"]),
-        }
-        for item in summary_candidates
-    ]
+    background_summaries = _background_summary_metadata(
+        summary_candidates,
+        extra_keys=("kmeans_raw_k",),
+    )
+
+    return IslandContextSelection(
+        features=features,
+        object_indices=object_indices,
+        background_summaries=background_summaries,
+        island_mask=island_mask,
+    )
+
+
+def object_budget_background_kmeans_selection(
+    flat_features: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    ratio_percent: int,
+    grid_side: int,
+    object_budget_percent: int = 90,
+    background_min_region_size: int = 2,
+    background_spatial_weight: float = 1.0,
+    background_score_weight: float = 0.35,
+    island_mask: torch.Tensor | None = None,
+) -> IslandContextSelection:
+    if flat_features.ndim != 2:
+        raise ValueError(f"flat_features must be [tokens, hidden], got {tuple(flat_features.shape)}")
+    scores = scores.detach().float().cpu().flatten()
+    total_tokens = int(scores.numel())
+    if flat_features.shape[0] != total_tokens:
+        raise ValueError("flat_features and scores must have the same token count")
+    if grid_side * grid_side != total_tokens:
+        raise ValueError(f"grid_side {grid_side} does not match token count {total_tokens}")
+
+    if island_mask is None:
+        island_mask = build_attention_island_mask(scores, grid_side=grid_side)
+    else:
+        island_mask = island_mask.detach().cpu().bool()
+    if tuple(island_mask.shape) != (grid_side, grid_side):
+        raise ValueError(f"island_mask must be {(grid_side, grid_side)}, got {tuple(island_mask.shape)}")
+
+    flat_island = island_mask.flatten()
+    object_candidates = flat_island.nonzero(as_tuple=False).flatten()
+    if object_candidates.numel() == 0:
+        object_candidates = torch.arange(total_tokens, dtype=torch.long)
+
+    budget = object_background_budget_counts(
+        total_tokens=total_tokens,
+        ratio_percent=ratio_percent,
+        object_budget_percent=object_budget_percent,
+        object_candidate_count=int(object_candidates.numel()),
+    )
+    background_budget_percent = 100 - int(object_budget_percent)
+
+    object_take = budget.object_count
+    object_scores = scores.index_select(0, object_candidates)
+    selected_local = torch.topk(object_scores, k=object_take, largest=True, sorted=False).indices
+    object_indices = torch.sort(object_candidates.index_select(0, selected_local)).values
+
+    residual_mask = torch.ones(total_tokens, dtype=torch.bool)
+    residual_mask[object_indices.cpu()] = False
+    merged_regions, selected_k = connected_kmeans_background_regions_for_target(
+        residual_mask.reshape(grid_side, grid_side),
+        scores,
+        grid_side=grid_side,
+        target_region_count=budget.background_count,
+        min_region_size=background_min_region_size,
+        spatial_weight=background_spatial_weight,
+        score_weight=background_score_weight,
+    )
+
+    summary_candidates = _background_summary_candidates_from_regions(
+        flat_features,
+        scores,
+        merged_regions,
+        grid_side=grid_side,
+        extra_fields={
+            "kmeans_target_k": int(selected_k),
+            "total_budget": int(budget.total_budget),
+            "object_budget": int(budget.object_budget),
+            "initial_background_budget": int(budget.initial_background_budget),
+            "effective_background_budget": int(budget.background_count),
+            "object_budget_percent": int(object_budget_percent),
+            "background_budget_percent": int(background_budget_percent),
+        },
+    )
+    features = _assemble_selection_features(flat_features, object_indices, summary_candidates)
+    background_summaries = _background_summary_metadata(
+        summary_candidates,
+        extra_keys=(
+            "kmeans_target_k",
+            "total_budget",
+            "object_budget",
+            "initial_background_budget",
+            "effective_background_budget",
+            "object_budget_percent",
+            "background_budget_percent",
+        ),
+    )
 
     return IslandContextSelection(
         features=features,
@@ -842,6 +1391,14 @@ def _selection_details(
                 "background_min_clusters": int(args.background_min_clusters),
                 "background_max_clusters": int(args.background_max_clusters),
                 "background_max_fraction": float(args.background_max_fraction),
+                "background_k_min": int(args.background_k_min),
+                "background_k_max": int(args.background_k_max),
+                "background_k_elbow_threshold": float(args.background_k_elbow_threshold),
+                "background_min_region_size": int(args.background_min_region_size),
+                "background_spatial_weight": float(args.background_spatial_weight),
+                "background_score_weight": float(args.background_score_weight),
+                "object_budget_percent": int(args.object_budget_percent),
+                "background_budget_percent": int(100 - args.object_budget_percent),
                 "background_summaries": background_summaries,
             }
         )
@@ -880,6 +1437,29 @@ def select_visual_features_for_ratio(
                 background_min_clusters=args.background_min_clusters,
                 background_max_clusters=args.background_max_clusters,
                 background_max_fraction=args.background_max_fraction,
+            )
+        elif args.selection_policy == SELECTION_POLICY_OBJECT_ALL_BACKGROUND_KMEANS:
+            selection = object_all_background_kmeans_selection(
+                flat_features,
+                scores,
+                grid_side=grid_side,
+                background_k_min=args.background_k_min,
+                background_k_max=args.background_k_max,
+                background_k_elbow_threshold=args.background_k_elbow_threshold,
+                background_min_region_size=args.background_min_region_size,
+                background_spatial_weight=args.background_spatial_weight,
+                background_score_weight=args.background_score_weight,
+            )
+        elif args.selection_policy == SELECTION_POLICY_OBJECT_BUDGET_BACKGROUND_KMEANS:
+            selection = object_budget_background_kmeans_selection(
+                flat_features,
+                scores,
+                ratio_percent=ratio_percent,
+                grid_side=grid_side,
+                object_budget_percent=args.object_budget_percent,
+                background_min_region_size=args.background_min_region_size,
+                background_spatial_weight=args.background_spatial_weight,
+                background_score_weight=args.background_score_weight,
             )
         elif args.selection_policy == SELECTION_POLICY_ISLAND_BACKGROUND_MERGE_POOL:
             selection = island_background_merge_pool_selection(
@@ -1990,6 +2570,14 @@ def run_experiment(args: argparse.Namespace) -> Path:
         "background_max_clusters": args.background_max_clusters,
         "background_max_fraction": args.background_max_fraction,
         "background_pool_grid": args.background_pool_grid,
+        "background_k_min": args.background_k_min,
+        "background_k_max": args.background_k_max,
+        "background_k_elbow_threshold": args.background_k_elbow_threshold,
+        "background_min_region_size": args.background_min_region_size,
+        "background_spatial_weight": args.background_spatial_weight,
+        "background_score_weight": args.background_score_weight,
+        "object_budget_percent": args.object_budget_percent,
+        "background_budget_percent": 100 - args.object_budget_percent,
         "attention_prefill_ms": attention_prefill_ms,
         "baseline_prefill_ms": baseline_prefill_ms,
         "comparison_prefill_baseline_ms": comparison_prefill_baseline_ms,
@@ -2034,7 +2622,9 @@ def parse_args() -> argparse.Namespace:
             "topk keeps original tokens only; island-context-pool keeps high-attention island tokens "
             "and replaces context-field tokens with coarse pooled background summaries; "
             "island-background-merge-pool clusters only non-island background tokens into merged summary regions; "
-            "object-topk-residual-cluster-pool clusters every non-object token so the visualization has no gaps."
+            "object-topk-residual-cluster-pool clusters every non-object token so the visualization has no gaps; "
+            "object-budget-background-kmeans treats each ratio as the total visual-token budget and splits it "
+            "between object top-k and k-means background summaries."
         ),
     )
     parser.add_argument(
@@ -2091,6 +2681,60 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Coarse grid side used to pool context/background tokens for island-context-pool.",
     )
+    parser.add_argument(
+        "--background-k-min",
+        type=int,
+        default=4,
+        help="For object-all-background-kmeans, minimum k considered by elbow auto-k.",
+    )
+    parser.add_argument(
+        "--background-k-max",
+        type=int,
+        default=24,
+        help="For object-all-background-kmeans, maximum k considered by elbow auto-k.",
+    )
+    parser.add_argument(
+        "--background-k-elbow-threshold",
+        type=float,
+        default=0.08,
+        help="For object-all-background-kmeans, stop when inertia improvement falls below this value.",
+    )
+    parser.add_argument(
+        "--background-min-region-size",
+        type=int,
+        default=2,
+        help=(
+            "For object-all-background-kmeans and object-budget-background-kmeans, merge connected "
+            "background regions smaller than this size."
+        ),
+    )
+    parser.add_argument(
+        "--background-spatial-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "For object-all-background-kmeans and object-budget-background-kmeans, spatial coordinate "
+            "weight used in k-means features."
+        ),
+    )
+    parser.add_argument(
+        "--background-score-weight",
+        type=float,
+        default=0.35,
+        help=(
+            "For object-all-background-kmeans and object-budget-background-kmeans, attention score "
+            "weight used in k-means features."
+        ),
+    )
+    parser.add_argument(
+        "--object-budget-percent",
+        type=int,
+        default=90,
+        help=(
+            "For object-budget-background-kmeans, percent of each total ratio budget reserved for "
+            "original object tokens. The rest is reserved for pooled background summaries."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print planned ratios without loading the model")
     return parser.parse_args()
 
@@ -2103,7 +2747,10 @@ def main() -> None:
         print(f"model: {args.model}")
         print(f"image: {args.image if args.image is not None else '(not required for dry-run)'}")
         print(f"question: {args.question}")
+        print(f"importance source: {args.importance_source}")
+        print(f"selection policy: {args.selection_policy}")
         print(f"ratios: {', '.join(str(r) + '%' for r in ratios)}")
+        print(f"object budget percent: {args.object_budget_percent}")
         if args.background_fixed_clusters is not None:
             print(f"background fixed clusters: {args.background_fixed_clusters}")
         print("No model was loaded.")

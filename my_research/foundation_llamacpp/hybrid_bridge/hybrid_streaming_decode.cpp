@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -799,13 +800,16 @@ std::unique_ptr<streamingvlm::hybrid_bridge::VisionEncoderSession> load_single_b
 #if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
 struct VisionPrefillCache {
   bool valid = false;
+  std::vector<FrameRecord> frames;
   std::vector<int> frame_indices;
   std::vector<std::string> images;
   std::vector<common_chat_msg> chat_history;
   std::string open_user_content;
   bool open_user_prefix = false;
   std::vector<uint8_t> state;
+  std::vector<uint8_t> host_state;
   llama_state_seq_flags state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+  llama_state_seq_flags host_state_flags = static_cast<llama_state_seq_flags>(0);
   llama_pos n_past = 0;
 };
 
@@ -813,17 +817,87 @@ bool vision_prefill_cache_matches(const VisionPrefillCache& cache, const std::ve
   return cache.valid && cache.frame_indices == frame_indices_for(frames);
 }
 
-bool vision_prefill_cache_is_immediate_prefix(
+size_t vision_prefill_cache_prefix_size(
     const VisionPrefillCache& cache,
     const std::vector<FrameRecord>& frames) {
   if (!cache.valid) {
-    return false;
+    return 0;
   }
   const std::vector<int> target = frame_indices_for(frames);
-  if (target.size() != cache.frame_indices.size() + 1) {
+  if (target.size() <= cache.frame_indices.size()) {
+    return 0;
+  }
+  if (!std::equal(cache.frame_indices.begin(), cache.frame_indices.end(), target.begin())) {
+    return 0;
+  }
+  return cache.frame_indices.size();
+}
+
+enum class VisionPrefillCacheBuildStatus {
+  Ok,
+  Failed,
+  Preempted,
+};
+
+bool cache_preempt_requested(const std::atomic<int>* pending_prompt_jobs) {
+  return pending_prompt_jobs != nullptr && pending_prompt_jobs->load(std::memory_order_acquire) > 0;
+}
+
+constexpr int32_t k_preemptible_image_prefill_batch = 16;
+
+void record_cache_preempt(streamingvlm::hybrid_bridge::phase_recorder& phases) {
+  const long t = now_ms();
+  phases.row("VisionPrefillCachePreempt", t, t);
+}
+
+struct CachePreemptDecodeCallback {
+  const std::atomic<int>* pending_prompt_jobs = nullptr;
+  streamingvlm::hybrid_bridge::phase_recorder* phases = nullptr;
+  bool* preempted = nullptr;
+};
+
+bool cache_preempt_decode_callback(void* user_data) {
+  auto* callback = static_cast<CachePreemptDecodeCallback*>(user_data);
+  if (callback == nullptr || !cache_preempt_requested(callback->pending_prompt_jobs)) {
     return false;
   }
-  return std::equal(cache.frame_indices.begin(), cache.frame_indices.end(), target.begin());
+  if (callback->preempted != nullptr) {
+    *callback->preempted = true;
+  }
+  if (callback->phases != nullptr) {
+    record_cache_preempt(*callback->phases);
+  }
+  return true;
+}
+
+struct ImagePrefillBatchProgress {
+  streamingvlm::hybrid_bridge::phase_recorder* phases = nullptr;
+};
+
+void image_prefill_batch_progress_callback(
+    int32_t /*batch_idx*/,
+    int32_t /*n_batches*/,
+    int32_t /*n_tokens_batch*/,
+    int64_t start_ms,
+    int64_t end_ms,
+    void* user_data) {
+  auto* progress = static_cast<ImagePrefillBatchProgress*>(user_data);
+  if (progress == nullptr || progress->phases == nullptr || end_ms <= start_ms) {
+    return;
+  }
+  progress->phases->row("VisionPrefillImagePrefillBatch", start_ms, end_ms);
+}
+
+const char* cache_build_status_detail(VisionPrefillCacheBuildStatus status) {
+  switch (status) {
+    case VisionPrefillCacheBuildStatus::Ok:
+      return "ok";
+    case VisionPrefillCacheBuildStatus::Preempted:
+      return "preempted";
+    case VisionPrefillCacheBuildStatus::Failed:
+    default:
+      return "miss";
+  }
 }
 
 std::string format_user_message_for_current_history(decode_context& ctx, const std::string& content) {
@@ -871,7 +945,10 @@ bool build_formatted_incremental_vision_cache_append(
   if (frames.empty()) {
     return false;
   }
-  out = build_stream_frame_prompt_line(frames.back());
+  out.clear();
+  for (const FrameRecord& frame : frames) {
+    out += build_stream_frame_prompt_line(frame);
+  }
   return true;
 }
 
@@ -996,13 +1073,28 @@ bool eval_streaming_chunks_with_on_demand_vision(
     const char* vision_phase_name,
     const char* image_phase_name,
     const char* mmproj_phase_name,
-    bool require_image) {
+    bool require_image,
+    const std::atomic<int>* pending_prompt_jobs = nullptr,
+    bool* preempted = nullptr) {
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
   bool used_image = false;
   size_t image_chunk_idx = 0;
   const int32_t decoder_embedding_size = llama_model_n_embd_inp(ctx.model);
+  auto preempt = [&]() {
+    if (!cache_preempt_requested(pending_prompt_jobs)) {
+      return false;
+    }
+    if (preempted != nullptr) {
+      *preempted = true;
+    }
+    record_cache_preempt(phases);
+    return true;
+  };
 
   for (size_t i = 0; i < n_chunks; ++i) {
+    if (preempt()) {
+      return false;
+    }
     const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
     const bool chunk_logits_last = logits_last && i == n_chunks - 1;
     llama_pos new_n_past = ctx.n_past;
@@ -1027,6 +1119,9 @@ bool eval_streaming_chunks_with_on_demand_vision(
           cursor_ms += encode_ms;
         }
       }
+      if (preempt()) {
+        return false;
+      }
 
       streamingvlm::hybrid_bridge::EmbeddingFile embedding;
       embedding.shape = vision.output_shape;
@@ -1039,6 +1134,9 @@ bool eval_streaming_chunks_with_on_demand_vision(
       float* image_slice = embeddings.next_slice(n_tokens, n_feature_embd);
       float* image_embedding = image_slice;
       if (n_feature_embd != n_embd) {
+        if (preempt()) {
+          return false;
+        }
         const long mmproj_start_ms = now_ms();
         if (mtmd_project_features(
                 ctx.ctx_vision.get(),
@@ -1058,25 +1156,56 @@ bool eval_streaming_chunks_with_on_demand_vision(
       std::vector<float> image_embedding_copy(
           image_embedding,
           image_embedding + static_cast<size_t>(n_tokens) * decoder_embedding_size);
+      if (preempt()) {
+        return false;
+      }
       const long image_prefill_start_ms = now_ms();
-      if (mtmd_helper_decode_image_chunk(
+      const int32_t preemptible_image_batch =
+          std::min<int32_t>(ctx.n_batch, k_preemptible_image_prefill_batch);
+      CachePreemptDecodeCallback decode_preempt{
+          pending_prompt_jobs,
+          &phases,
+          preempted,
+      };
+      ImagePrefillBatchProgress image_prefill_progress{
+          &phases,
+      };
+      const int32_t image_decode_ret = mtmd_helper_decode_image_chunk_with_abort_and_progress(
               ctx.ctx_vision.get(),
               ctx.lctx,
               chunk,
               image_embedding_copy.data(),
               ctx.n_past,
               seq_id,
-              ctx.n_batch,
-              &new_n_past) != 0) {
+              preemptible_image_batch,
+              &new_n_past,
+              cache_preempt_decode_callback,
+              &decode_preempt,
+              image_prefill_batch_progress_callback,
+              &image_prefill_progress);
+      llama_synchronize(ctx.lctx);
+      (void) image_prefill_start_ms;
+      (void) image_phase_name;
+      if (image_decode_ret == 2) {
+        if (preempted != nullptr) {
+          *preempted = true;
+        }
+        return false;
+      }
+      if (image_decode_ret != 0) {
         LOG_ERR("failed to decode on-demand vision image embedding\n");
         return false;
       }
-      llama_synchronize(ctx.lctx);
-      phases.row(image_phase_name, image_prefill_start_ms, now_ms());
+      if (preempt()) {
+        return false;
+      }
       embeddings.finish();
       used_image = true;
       ++image_chunk_idx;
     } else {
+      if (preempt()) {
+        return false;
+      }
       const long text_prefill_start_ms = now_ms();
       if (mtmd_helper_eval_chunk_single(
               ctx.ctx_vision.get(),
@@ -1092,6 +1221,9 @@ bool eval_streaming_chunks_with_on_demand_vision(
       }
       llama_synchronize(ctx.lctx);
       phases.row(text_phase_name, text_prefill_start_ms, now_ms());
+      if (preempt()) {
+        return false;
+      }
     }
     ctx.n_past = new_n_past;
   }
@@ -1150,32 +1282,64 @@ bool load_layout_bitmaps(
   return true;
 }
 
-bool save_vision_prefill_cache_state(
+bool save_vision_prefill_cache_state_blob(
     decode_context& ctx,
-    VisionPrefillCache& cache,
-    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+    std::vector<uint8_t>& state,
+    llama_state_seq_flags flags,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
+    const char* phase_name) {
   const long save_start_ms = now_ms();
-  cache.state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
-  size_t state_size = llama_state_seq_get_size_ext(ctx.lctx, 0, cache.state_flags);
-  if (state_size == 0) {
-    cache.state_flags = static_cast<llama_state_seq_flags>(0);
-    state_size = llama_state_seq_get_size_ext(ctx.lctx, 0, cache.state_flags);
-  }
+  const size_t state_size = llama_state_seq_get_size_ext(ctx.lctx, 0, flags);
   if (state_size == 0) {
     LOG_ERR("failed to determine vision prefill cache state size\n");
     return false;
   }
-  cache.state.assign(state_size, 0);
+  state.assign(state_size, 0);
   const size_t copied = llama_state_seq_get_data_ext(
       ctx.lctx,
-      cache.state.data(),
-      cache.state.size(),
+      state.data(),
+      state.size(),
       0,
-      cache.state_flags);
-  phases.row("VisionPrefillCacheSave", save_start_ms, now_ms());
-  if (copied != cache.state.size()) {
-    LOG_ERR("failed to save vision prefill cache state: copied %zu of %zu bytes\n", copied, cache.state.size());
-    cache.state.clear();
+      flags);
+  phases.row(phase_name, save_start_ms, now_ms());
+  if (copied != state.size()) {
+    LOG_ERR("failed to save vision prefill cache state: copied %zu of %zu bytes\n", copied, state.size());
+    state.clear();
+    return false;
+  }
+  return true;
+}
+
+bool save_vision_prefill_cache_state(
+    decode_context& ctx,
+    VisionPrefillCache& cache,
+    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+  cache.state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+  if (!save_vision_prefill_cache_state_blob(
+          ctx,
+          cache.state,
+          cache.state_flags,
+          phases,
+          "VisionPrefillCacheSave")) {
+    cache.state_flags = static_cast<llama_state_seq_flags>(0);
+    if (!save_vision_prefill_cache_state_blob(
+            ctx,
+            cache.state,
+            cache.state_flags,
+            phases,
+            "VisionPrefillCacheSave")) {
+      return false;
+    }
+  }
+  cache.host_state_flags = static_cast<llama_state_seq_flags>(0);
+  if (cache.state_flags == cache.host_state_flags) {
+    cache.host_state = cache.state;
+  } else if (!save_vision_prefill_cache_state_blob(
+                 ctx,
+                 cache.host_state,
+                 cache.host_state_flags,
+                 phases,
+                 "VisionPrefillCacheHostSave")) {
     return false;
   }
   cache.n_past = ctx.n_past;
@@ -1187,22 +1351,27 @@ bool restore_vision_prefill_cache_state(
     decode_context& ctx,
     const VisionPrefillCache& cache,
     streamingvlm::hybrid_bridge::phase_recorder& phases,
-    const char* phase_name = "VisionPrefillCacheRestore") {
-  if (!cache.valid || cache.state.empty()) {
+    const char* phase_name = "VisionPrefillCacheRestore",
+    bool prefer_host_state = false) {
+  if (!cache.valid || (cache.state.empty() && cache.host_state.empty())) {
     return false;
   }
   reset_decode_context_for_singleton(ctx);
   const long restore_start_ms = now_ms();
+  const std::vector<uint8_t>& state =
+      prefer_host_state && !cache.host_state.empty() ? cache.host_state : cache.state;
+  const llama_state_seq_flags state_flags =
+      prefer_host_state && !cache.host_state.empty() ? cache.host_state_flags : cache.state_flags;
   const size_t restored = llama_state_seq_set_data_ext(
       ctx.lctx,
-      cache.state.data(),
-      cache.state.size(),
+      state.data(),
+      state.size(),
       0,
-      cache.state_flags);
+      state_flags);
   llama_synchronize(ctx.lctx);
   phases.row(phase_name, restore_start_ms, now_ms());
-  if (restored != cache.state.size()) {
-    LOG_ERR("failed to restore vision prefill cache state: restored %zu of %zu bytes\n", restored, cache.state.size());
+  if (restored != state.size()) {
+    LOG_ERR("failed to restore vision prefill cache state: restored %zu of %zu bytes\n", restored, state.size());
     return false;
   }
   ctx.n_past = cache.n_past;
@@ -1210,21 +1379,48 @@ bool restore_vision_prefill_cache_state(
   return true;
 }
 
-bool build_vision_prefill_cache(
+bool rollback_vision_prefill_cache_build(
+    decode_context& ctx,
+    const VisionPrefillCache& cache,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
+    bool record_preempt_phase) {
+  if (record_preempt_phase) {
+    record_cache_preempt(phases);
+  }
+  if (!cache.valid) {
+    reset_decode_context_for_singleton(ctx);
+    return true;
+  }
+  return restore_vision_prefill_cache_state(ctx, cache, phases, "VisionPrefillCacheRollback", true);
+}
+
+VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     const Args& args,
     decode_context& ctx,
     streamingvlm::hybrid_bridge::VisionEncoderSession& encoder,
     const std::vector<FrameRecord>& frames,
     int frame_idx,
     long origin_ms,
-    VisionPrefillCache& cache) {
+    VisionPrefillCache& cache,
+    const std::atomic<int>* pending_prompt_jobs) {
+  std::vector<FrameRecord> target_frames = frames;
+  if (args.online_buffer && cache.valid && frames.size() == 1) {
+    const int latest_frame_index = frames.back().index;
+    if (std::find(cache.frame_indices.begin(), cache.frame_indices.end(), latest_frame_index) != cache.frame_indices.end()) {
+      return VisionPrefillCacheBuildStatus::Ok;
+    }
+    target_frames = cache.frames;
+    target_frames.push_back(frames.back());
+  }
+
   VisionPrefillCache next_cache;
-  next_cache.frame_indices = frame_indices_for(frames);
+  next_cache.frames = target_frames;
+  next_cache.frame_indices = frame_indices_for(target_frames);
   next_cache.images = layout_images_for_frames(frames);
-  if (frames.empty() || next_cache.images.empty()) {
+  if (target_frames.empty() || next_cache.images.empty()) {
     LOG_ERR("cannot build vision prefill cache for frame %d: missing bins or layout images\n", frame_idx);
     cache = std::move(next_cache);
-    return false;
+    return VisionPrefillCacheBuildStatus::Failed;
   }
 
   const std::string phase_path = "stream_vision_prefill_cache_" + std::to_string(frame_idx) + ".csv";
@@ -1234,7 +1430,20 @@ bool build_vision_prefill_cache(
       streamingvlm::hybrid_bridge::hybrid_decode_phase_description());
   const long build_start_ms = now_ms();
 
-  const bool can_append_incrementally = vision_prefill_cache_is_immediate_prefix(cache, frames);
+  next_cache.images = layout_images_for_frames(target_frames);
+
+  if (vision_prefill_cache_matches(cache, target_frames)) {
+    return VisionPrefillCacheBuildStatus::Ok;
+  }
+  if (cache_preempt_requested(pending_prompt_jobs)) {
+    if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, true)) {
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    return VisionPrefillCacheBuildStatus::Preempted;
+  }
+
+  const size_t cached_prefix_size = vision_prefill_cache_prefix_size(cache, target_frames);
+  const bool can_append_incrementally = cached_prefix_size > 0 && target_frames.size() == cached_prefix_size + 1;
   bool use_incremental_append = false;
   std::string formatted_prefix;
   bool formatted_prefix_add_special = false;
@@ -1243,13 +1452,13 @@ bool build_vision_prefill_cache(
 
   if (can_append_incrementally &&
       restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore")) {
-    std::vector<FrameRecord> append_frames{frames.back()};
+    std::vector<FrameRecord> append_frames{target_frames.back()};
     bins = bins_for_frames(append_frames);
     images_to_load = layout_images_for_frames(append_frames);
-    if (!build_formatted_incremental_vision_cache_append(frames, formatted_prefix)) {
+    if (!build_formatted_incremental_vision_cache_append(append_frames, formatted_prefix)) {
       LOG_ERR("failed to build incremental vision prefill cache append\n");
       cache = std::move(next_cache);
-      return false;
+      return VisionPrefillCacheBuildStatus::Failed;
     }
     next_cache.open_user_content = cache.open_user_content + formatted_prefix;
     next_cache.open_user_prefix = true;
@@ -1258,21 +1467,21 @@ bool build_vision_prefill_cache(
       if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
         LOG_ERR("failed to split formatted post-answer vision prefill cache prefix\n");
         cache = std::move(next_cache);
-        return false;
+        return VisionPrefillCacheBuildStatus::Failed;
       }
       formatted_prefix_add_special = ctx.chat_history.empty();
     }
     use_incremental_append = true;
   } else {
     reset_decode_context_for_singleton(ctx);
-    bins = bins_for_frames(frames);
+    bins = bins_for_frames(target_frames);
     images_to_load = next_cache.images;
-    next_cache.open_user_content = build_stream_video_prompt_prefix(frames);
+    next_cache.open_user_content = build_stream_video_prompt_prefix(target_frames);
     next_cache.open_user_prefix = true;
     if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
       LOG_ERR("failed to split formatted vision prefill cache prefix\n");
       cache = std::move(next_cache);
-      return false;
+      return VisionPrefillCacheBuildStatus::Failed;
     }
     formatted_prefix_add_special = ctx.chat_history.empty();
   }
@@ -1283,13 +1492,19 @@ bool build_vision_prefill_cache(
         frame_idx,
         use_incremental_append ? "incremental" : "full-history");
     cache = std::move(next_cache);
-    return false;
+    return VisionPrefillCacheBuildStatus::Failed;
   }
 
   mtmd::bitmaps bitmaps;
   if (!load_layout_bitmaps(ctx, images_to_load, bitmaps)) {
     cache = std::move(next_cache);
-    return false;
+    return VisionPrefillCacheBuildStatus::Failed;
+  }
+  if (cache_preempt_requested(pending_prompt_jobs)) {
+    if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, true)) {
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    return VisionPrefillCacheBuildStatus::Preempted;
   }
 
   mtmd::input_chunks chunks(mtmd_input_chunks_init());
@@ -1302,9 +1517,16 @@ bool build_vision_prefill_cache(
           "VisionPrefillLayoutTokenize",
           chunks)) {
     cache = std::move(next_cache);
-    return false;
+    return VisionPrefillCacheBuildStatus::Failed;
+  }
+  if (cache_preempt_requested(pending_prompt_jobs)) {
+    if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, true)) {
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    return VisionPrefillCacheBuildStatus::Preempted;
   }
 
+  bool preempted = false;
   if (!eval_streaming_chunks_with_on_demand_vision(
           ctx,
           chunks,
@@ -1318,20 +1540,148 @@ bool build_vision_prefill_cache(
           "VisionPrefillV_Encode",
           "VisionPrefillImagePrefill",
           "VisionPrefillMmproj",
-          true)) {
+          true,
+          pending_prompt_jobs,
+          &preempted)) {
+    if (preempted) {
+      if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, false)) {
+        return VisionPrefillCacheBuildStatus::Failed;
+      }
+      return VisionPrefillCacheBuildStatus::Preempted;
+    }
     cache = std::move(next_cache);
-    return false;
+    return VisionPrefillCacheBuildStatus::Failed;
+  }
+  if (cache_preempt_requested(pending_prompt_jobs)) {
+    if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, true)) {
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    return VisionPrefillCacheBuildStatus::Preempted;
   }
 
   if (!save_vision_prefill_cache_state(ctx, next_cache, cache_phases)) {
     cache = std::move(next_cache);
-    return false;
+    return VisionPrefillCacheBuildStatus::Failed;
   }
   next_cache.valid = true;
   cache_phases.row("VisionPrefillCacheBuild", build_start_ms, now_ms());
   cache = std::move(next_cache);
   (void)args;
-  return true;
+  return VisionPrefillCacheBuildStatus::Ok;
+}
+
+int run_vision_prefill_prompt_from_committed_cache(
+    const Args& args,
+    decode_context& ctx,
+    const PromptEvent& prompt,
+    int prompt_idx,
+    long origin_ms,
+    VisionPrefillCache* vision_cache) {
+  const bool has_committed_cache =
+      vision_cache != nullptr && vision_cache->valid && !vision_cache->frames.empty() && !vision_cache->images.empty();
+  const std::vector<FrameRecord> cached_frames = has_committed_cache ? vision_cache->frames : std::vector<FrameRecord>{};
+  const std::vector<std::string> images = has_committed_cache ? vision_cache->images : std::vector<std::string>{};
+  const std::string token_io = "stream_token_io_" + std::to_string(prompt_idx) + ".txt";
+  const std::string inference_tokens = "stream_inference_tokens_" + std::to_string(prompt_idx) + ".txt";
+  const std::string phase_path = prompt_phase_path(prompt_idx);
+
+  streamingvlm::hybrid_bridge::phase_recorder prompt_phases(
+      phase_path,
+      origin_ms,
+      streamingvlm::hybrid_bridge::hybrid_decode_phase_description());
+  if (!has_committed_cache) {
+    const long miss_ms = now_ms();
+    prompt_phases.row("VisionPrefillCacheMiss", miss_ms, miss_ms);
+    std::fprintf(stderr, "prompt %d has no committed vision-prefill cache snapshot\n", prompt_idx);
+    return 2;
+  }
+
+  std::unique_ptr<streamingvlm::hybrid_bridge::inference_trace_collector> trace_writer;
+  if (!token_io.empty()) {
+    trace_writer = std::make_unique<streamingvlm::hybrid_bridge::inference_trace_collector>(
+        inference_tokens);
+  }
+
+  int rc = 0;
+  std::string generated_text;
+  const long cache_check_ms = now_ms();
+  prompt_phases.row("VisionPrefillCacheHit", cache_check_ms, cache_check_ms);
+  const bool prefer_host_restore = args.dynamic_kv_cache && !vision_cache->host_state.empty();
+  if (restore_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, "VisionPrefillCacheRestore", prefer_host_restore)) {
+    std::string suffix;
+    const std::string user_content =
+        vision_cache->open_user_prefix ? (vision_cache->open_user_content + prompt.prompt) : prompt.prompt;
+    const bool add_special = ctx.chat_history.empty() && !vision_cache->open_user_prefix;
+    const bool suffix_ready = vision_cache->open_user_prefix
+        ? build_formatted_question_suffix(ctx, vision_cache->open_user_content, prompt.prompt, suffix)
+        : (suffix = format_user_message_for_current_history(ctx, prompt.prompt), true);
+    if (suffix_ready) {
+      mtmd::bitmaps empty_bitmaps;
+      mtmd::input_chunks suffix_chunks(mtmd_input_chunks_init());
+      if (tokenize_formatted_text(
+              ctx,
+              suffix,
+              empty_bitmaps,
+              add_special,
+              prompt_phases,
+              "VisionPrefillSuffixTokenize",
+              suffix_chunks) &&
+          eval_streaming_chunks_with_external_embedding(
+              ctx,
+              suffix_chunks,
+              nullptr,
+              prompt_phases,
+              0,
+              true,
+              "T_Prefill",
+              "ImagePrefill",
+              "Mmproj",
+              false)) {
+        append_user_message_to_history(ctx, user_content);
+        const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
+        generated_text =
+            generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
+        vision_cache->frames = cached_frames;
+        vision_cache->frame_indices = frame_indices_for(cached_frames);
+        vision_cache->images = images;
+        vision_cache->open_user_prefix = false;
+        vision_cache->open_user_content.clear();
+        if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)) {
+          rc = 1;
+        } else {
+          vision_cache->valid = true;
+        }
+      } else {
+        rc = 1;
+      }
+    } else {
+      LOG_ERR("failed to split formatted vision prefill question suffix\n");
+      rc = 1;
+    }
+  } else {
+    rc = 1;
+  }
+
+  if (rc == 0) {
+    write_stream_text_file("stream_response_" + std::to_string(prompt_idx) + ".txt", generated_text);
+    std::string token_io_doc = std::string("User: ") + prompt.prompt + "\nAssistant: " + generated_text + "\n";
+    if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+      token_io_doc += trace_writer->format_token_io_appendix();
+    }
+    write_stream_text_file(token_io, token_io_doc);
+    trace_writer.reset();
+    std::ofstream aggregate("foundation_inference_tokens.txt", std::ios::app);
+    std::ifstream raw_trace(inference_tokens);
+    if (aggregate && raw_trace) {
+      aggregate << "\n===== stream prompt " << prompt_idx << " @ " << prompt.timestamp_s << "s =====\n";
+      aggregate << "images: " << join_strings(images, ";") << "\n";
+      aggregate << "user: " << prompt.prompt << "\n\n";
+      aggregate << raw_trace.rdbuf();
+      aggregate << "\n";
+    }
+  }
+  (void)args;
+  return rc;
 }
 
 int run_single_buffer_prompt(
@@ -1343,6 +1693,16 @@ int run_single_buffer_prompt(
     int prompt_idx,
     long origin_ms,
     VisionPrefillCache* vision_cache) {
+  if (args.stream_mode == "vision_prefill") {
+    return run_vision_prefill_prompt_from_committed_cache(
+        args,
+        ctx,
+        prompt,
+        prompt_idx,
+        origin_ms,
+        vision_cache);
+  }
+
   const std::vector<std::string> bins = bins_for_frames(frames);
   const std::vector<std::string> images = layout_images_for_frames(frames);
   if (bins.empty()) {
@@ -1377,107 +1737,35 @@ int run_single_buffer_prompt(
   }
 
   int rc = 0;
-  bool handled_with_cache = false;
-  bool cache_miss_recorded = false;
   std::string generated_text;
-
-  if (args.stream_mode == "vision_prefill") {
-    const long cache_check_ms = now_ms();
-    if (vision_cache != nullptr && vision_prefill_cache_matches(*vision_cache, frames)) {
-      prompt_phases.row("VisionPrefillCacheHit", cache_check_ms, cache_check_ms);
-      if (restore_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)) {
-        std::string suffix;
-        const std::string user_content =
-            vision_cache->open_user_prefix ? (vision_cache->open_user_content + prompt.prompt) : prompt.prompt;
-        const bool add_special = ctx.chat_history.empty() && !vision_cache->open_user_prefix;
-        const bool suffix_ready = vision_cache->open_user_prefix
-            ? build_formatted_question_suffix(ctx, vision_cache->open_user_content, prompt.prompt, suffix)
-            : (suffix = format_user_message_for_current_history(ctx, prompt.prompt), true);
-        if (suffix_ready) {
-          mtmd::bitmaps empty_bitmaps;
-          mtmd::input_chunks suffix_chunks(mtmd_input_chunks_init());
-          if (tokenize_formatted_text(
-                  ctx,
-                  suffix,
-                  empty_bitmaps,
-                  add_special,
-                  prompt_phases,
-                  "VisionPrefillSuffixTokenize",
-                  suffix_chunks) &&
-              eval_streaming_chunks_with_external_embedding(
-                  ctx,
-                  suffix_chunks,
-                  nullptr,
-                  prompt_phases,
-                  0,
-                  true,
-                  "T_Prefill",
-                  "ImagePrefill",
-                  "Mmproj",
-                  false)) {
-            append_user_message_to_history(ctx, user_content);
-            const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
-            generated_text =
-                generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
-            handled_with_cache = true;
-            vision_cache->frame_indices = frame_indices_for(frames);
-            vision_cache->images = images;
-            vision_cache->open_user_prefix = false;
-            vision_cache->open_user_content.clear();
-            if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases)) {
-              rc = 1;
-            } else {
-              vision_cache->valid = true;
-            }
-          } else {
-            rc = 1;
-          }
-        } else {
-          LOG_ERR("failed to split formatted vision prefill question suffix\n");
-          rc = 1;
-        }
-      }
-    } else {
-      prompt_phases.row("VisionPrefillCacheMiss", cache_check_ms, cache_check_ms);
-      cache_miss_recorded = true;
+  if (is_singleton_video_mode(args)) {
+    reset_decode_context_for_singleton(ctx);
+  }
+  const long vision_start_ms = now_ms();
+  auto vision = encoder.encode(bins);
+  long cursor_ms = vision_start_ms;
+  const long image_load_ms = vision.image_load_end_ms - vision.image_load_start_ms;
+  if (image_load_ms > 0) {
+    prompt_phases.row("ImageLoad", cursor_ms, cursor_ms + image_load_ms);
+    cursor_ms += image_load_ms;
+  }
+  for (const auto& range : vision.encode_ranges) {
+    const long encode_ms = range.second - range.first;
+    if (encode_ms > 0) {
+      prompt_phases.row("V_Encode", cursor_ms, cursor_ms + encode_ms);
+      cursor_ms += encode_ms;
     }
   }
+  streamingvlm::hybrid_bridge::EmbeddingFile embedding;
+  embedding.shape = vision.output_shape;
+  embedding.values = std::move(vision.values);
 
-  if (!handled_with_cache) {
-    if (args.stream_mode == "vision_prefill" && !cache_miss_recorded) {
-      const long miss_ms = now_ms();
-      prompt_phases.row("VisionPrefillCacheMiss", miss_ms, miss_ms);
-    }
-    rc = 0;
-    if (is_singleton_video_mode(args)) {
-      reset_decode_context_for_singleton(ctx);
-    }
-    const long vision_start_ms = now_ms();
-    auto vision = encoder.encode(bins);
-    long cursor_ms = vision_start_ms;
-    const long image_load_ms = vision.image_load_end_ms - vision.image_load_start_ms;
-    if (image_load_ms > 0) {
-      prompt_phases.row("ImageLoad", cursor_ms, cursor_ms + image_load_ms);
-      cursor_ms += image_load_ms;
-    }
-    for (const auto& range : vision.encode_ranges) {
-      const long encode_ms = range.second - range.first;
-      if (encode_ms > 0) {
-        prompt_phases.row("V_Encode", cursor_ms, cursor_ms + encode_ms);
-        cursor_ms += encode_ms;
-      }
-    }
-    streamingvlm::hybrid_bridge::EmbeddingFile embedding;
-    embedding.shape = vision.output_shape;
-    embedding.values = std::move(vision.values);
-
-    if (eval_with_external_embedding(ctx, prompt_text, images, embedding, prompt_phases, nullptr, trace_writer.get()) != 0) {
-      rc = 1;
-    } else {
-      const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
-      generated_text =
-          generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
-    }
+  if (eval_with_external_embedding(ctx, prompt_text, images, embedding, prompt_phases, nullptr, trace_writer.get()) != 0) {
+    rc = 1;
+  } else {
+    const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
+    generated_text =
+        generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
   }
 
   if (rc == 0) {
@@ -1708,7 +1996,11 @@ struct StreamJob {
 struct StreamBufferStats {
   int input_frames = 0;
   int processed_visual_jobs = 0;
+  int committed_cache_updates = 0;
+  int prompt_decode_jobs = 0;
   int skipped_cache_updates = 0;
+  long committed_cache_update_ms = 0;
+  long prompt_decode_ms = 0;
   long first_input_ms = 0;
   long last_input_ms = 0;
   long first_process_ms = 0;
@@ -1747,6 +2039,18 @@ void note_processed_visual_job(StreamBufferStats& stats, long start_ms, long end
   }
 }
 
+void note_committed_cache_update(StreamBufferStats& stats, long start_ms, long end_ms) {
+  stats.committed_cache_updates += 1;
+  stats.committed_cache_update_ms += std::max<long>(0, end_ms - start_ms);
+  note_processed_visual_job(stats, start_ms, end_ms);
+}
+
+void note_prompt_decode_job(StreamBufferStats& stats, long start_ms, long end_ms) {
+  stats.prompt_decode_jobs += 1;
+  stats.prompt_decode_ms += std::max<long>(0, end_ms - start_ms);
+  note_processed_visual_job(stats, start_ms, end_ms);
+}
+
 void write_stream_buffer_summary(const Args& args, const Manifest& manifest, const StreamBufferStats& stats) {
   std::ofstream out("stream_buffer_summary.txt");
   const double input_span_s =
@@ -1760,6 +2064,12 @@ void write_stream_buffer_summary(const Args& args, const Manifest& manifest, con
           : 0.0;
   const double processed_visual_fps =
       process_span_s > 0.0 ? stats.processed_visual_jobs / process_span_s : 0.0;
+  const double committed_cache_fps =
+      input_span_s > 0.0 ? stats.committed_cache_updates / input_span_s : 0.0;
+  const double cache_worker_s = stats.committed_cache_update_ms / 1000.0;
+  const double cache_worker_fps =
+      cache_worker_s > 0.0 ? stats.committed_cache_updates / cache_worker_s : 0.0;
+  const double prompt_decode_total_s = stats.prompt_decode_ms / 1000.0;
   double prompt_frame_lag_sum_s = 0.0;
   for (double lag : stats.prompt_frame_lag_s) {
     prompt_frame_lag_sum_s += lag;
@@ -1772,6 +2082,12 @@ void write_stream_buffer_summary(const Args& args, const Manifest& manifest, con
   out << "input_frame_count=" << stats.input_frames << "\n";
   out << "processed_visual_jobs=" << stats.processed_visual_jobs << "\n";
   out << "processed_visual_fps=" << processed_visual_fps << "\n";
+  out << "committed_cache_updates=" << stats.committed_cache_updates << "\n";
+  out << "committed_cache_fps=" << committed_cache_fps << "\n";
+  out << "cache_worker_fps=" << cache_worker_fps << "\n";
+  out << "cache_worker_total_s=" << cache_worker_s << "\n";
+  out << "prompt_decode_jobs=" << stats.prompt_decode_jobs << "\n";
+  out << "prompt_decode_total_s=" << prompt_decode_total_s << "\n";
   out << "skipped_cache_updates=" << stats.skipped_cache_updates << "\n";
   out << "prompt_frame_lag_s_avg=" << avg_prompt_frame_lag_s << "\n";
   out << "prompt_frame_lag_s_count=" << stats.prompt_frame_lag_s.size() << "\n";
@@ -1873,6 +2189,7 @@ int main(int argc, char** argv) {
   bool have_latest_frame = false;
   std::vector<FrameRecord> latest_available_frames;
   StreamBufferStats buffer_stats;
+  std::atomic<int> pending_prompt_jobs{0};
 
   std::thread producer([&]() {
     double last_ts = 0.0;
@@ -1919,6 +2236,12 @@ int main(int argc, char** argv) {
         }
 #endif
         while (prompt_cursor < manifest.prompts.size() && manifest.prompts[prompt_cursor].timestamp_s <= frame.timestamp_s) {
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+          if (args.stream_mode == "vision_prefill") {
+            pending_prompt_jobs.fetch_add(1, std::memory_order_release);
+            buffer_stats.skipped_cache_updates += drop_pending_cache_updates(stream_jobs);
+          }
+#endif
           stream_jobs.push_back(StreamJob{
               StreamJobKind::Prompt,
               args.online_buffer ? std::vector<FrameRecord>{} : select_prompt_frames(args, available_frames, current_frame, manifest.prompts[prompt_cursor]),
@@ -1947,6 +2270,12 @@ int main(int argc, char** argv) {
     {
       std::lock_guard<std::mutex> lock(mu);
       while (have_current_frame && prompt_cursor < manifest.prompts.size()) {
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+        if (args.stream_mode == "vision_prefill") {
+          pending_prompt_jobs.fetch_add(1, std::memory_order_release);
+          buffer_stats.skipped_cache_updates += drop_pending_cache_updates(stream_jobs);
+        }
+#endif
         stream_jobs.push_back(StreamJob{
             StreamJobKind::Prompt,
             args.online_buffer ? std::vector<FrameRecord>{} : select_prompt_frames(args, available_frames, current_frame, manifest.prompts[prompt_cursor]),
@@ -1984,12 +2313,22 @@ int main(int argc, char** argv) {
       job = stream_jobs.front();
       stream_jobs.pop_front();
       if (args.online_buffer && have_latest_frame) {
-        job.frames = resolve_online_buffer_frames(args, latest_available_frames, latest_frame, job.prompt);
-        job.frame_idx = latest_frame.index;
-        if (job.kind == StreamJobKind::CacheUpdate) {
-          job.prompt.timestamp_s = latest_frame.timestamp_s;
-        } else if (job.kind == StreamJobKind::Prompt) {
+        const bool prompt_uses_committed_vision_cache =
+            args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::Prompt;
+        if (prompt_uses_committed_vision_cache) {
           buffer_stats.prompt_frame_lag_s.push_back(latest_frame.timestamp_s - job.prompt.timestamp_s);
+        } else if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::CacheUpdate) {
+          job.frames = {latest_frame};
+          job.frame_idx = latest_frame.index;
+          job.prompt.timestamp_s = latest_frame.timestamp_s;
+        } else {
+          job.frames = resolve_online_buffer_frames(args, latest_available_frames, latest_frame, job.prompt);
+          job.frame_idx = latest_frame.index;
+          if (job.kind == StreamJobKind::CacheUpdate) {
+            job.prompt.timestamp_s = latest_frame.timestamp_s;
+          } else if (job.kind == StreamJobKind::Prompt) {
+            buffer_stats.prompt_frame_lag_s.push_back(latest_frame.timestamp_s - job.prompt.timestamp_s);
+          }
         }
       }
     }
@@ -1997,14 +2336,33 @@ int main(int argc, char** argv) {
 #if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
     if (job.kind == StreamJobKind::CacheUpdate) {
       const long cache_start_ms = now_ms();
-      const bool ok = build_vision_prefill_cache(
+      if (cache_preempt_requested(&pending_prompt_jobs)) {
+        const long preempt_ms = now_ms();
+        append_phase_row(phases, "VisionPrefillCachePreempt", preempt_ms, preempt_ms, origin_ms);
+        events.row(
+            "VisionPrefillCacheBuild",
+            last_frame_index(job.frames),
+            -1,
+            job.prompt.timestamp_s,
+            origin_ms,
+            cache_start_ms,
+            preempt_ms,
+            "preempted");
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          buffer_stats.skipped_cache_updates += 1;
+        }
+        continue;
+      }
+      const VisionPrefillCacheBuildStatus status = build_vision_prefill_cache(
           args,
           *decode_ctx,
           *encoder_ctx,
           job.frames,
           job.frame_idx,
           origin_ms,
-          vision_prefill_cache);
+          vision_prefill_cache,
+          &pending_prompt_jobs);
       const long cache_end_ms = now_ms();
       append_phase_file(phases, "stream_vision_prefill_cache_" + std::to_string(job.frame_idx) + ".csv");
       events.row(
@@ -2015,12 +2373,30 @@ int main(int argc, char** argv) {
           origin_ms,
           cache_start_ms,
           cache_end_ms,
-          ok ? "ok" : "miss");
+          cache_build_status_detail(status));
       {
         std::lock_guard<std::mutex> lock(mu);
-        note_processed_visual_job(buffer_stats, cache_start_ms, cache_end_ms);
+        if (status == VisionPrefillCacheBuildStatus::Preempted) {
+          buffer_stats.skipped_cache_updates += 1;
+        } else if (status == VisionPrefillCacheBuildStatus::Ok) {
+          note_committed_cache_update(buffer_stats, cache_start_ms, cache_end_ms);
+        } else {
+          note_processed_visual_job(buffer_stats, cache_start_ms, cache_end_ms);
+        }
       }
       continue;
+    }
+#endif
+
+#if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+    if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::Prompt && vision_prefill_cache.valid) {
+      job.frames = vision_prefill_cache.frames;
+      job.frame_idx = last_frame_index(job.frames);
+    }
+    if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::Prompt) {
+      if (pending_prompt_jobs.load(std::memory_order_acquire) > 0) {
+        pending_prompt_jobs.fetch_sub(1, std::memory_order_acq_rel);
+      }
     }
 #endif
 
@@ -2070,7 +2446,7 @@ int main(int argc, char** argv) {
         "rc=" + std::to_string(rc));
     {
       std::lock_guard<std::mutex> lock(mu);
-      note_processed_visual_job(buffer_stats, decode_start_ms, decode_end_ms);
+      note_prompt_decode_job(buffer_stats, decode_start_ms, decode_end_ms);
     }
     ++handled_prompts;
   }

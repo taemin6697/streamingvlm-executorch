@@ -70,6 +70,28 @@ def test_common_phase_timeline_writer_outputs_phase_timeline_for_stream_rows(tmp
     assert not (tmp_path / "streaming_phase_timeline.png").exists()
 
 
+def test_vision_prefill_image_prefill_batch_rows_use_image_prefill_lane(tmp_path):
+    rows = [
+        _row("StreamPromptPrefill", 15.0, 15.0),
+        _row("VisionPrefillImagePrefillBatch", 15.20, 15.24),
+        _row("VisionPrefillImagePrefillBatch", 15.24, 15.28),
+        _row("D", 15.30, 15.35),
+    ]
+
+    phases, _markers, _origin, _end = runner_cli._phase_timeline_data(tmp_path, rows, stream_time=True)
+
+    image_prefill_rows = [phase for phase in phases if phase[0] == "ImagePrefill"]
+    assert len(image_prefill_rows) == 2
+    assert runner_cli._phase_timeline_name("VisionPrefillImagePrefillBatch") == "ImagePrefill"
+
+
+def test_phase_timeline_suppresses_in_bar_duration_labels():
+    assert runner_cli._phase_timeline_label_min_ms("ImagePrefill", stream_time=True) == float("inf")
+    assert runner_cli._phase_timeline_label_min_ms("V_Encode", stream_time=True) == float("inf")
+    assert runner_cli._phase_timeline_label_min_ms("T_Prefill", stream_time=True) == float("inf")
+    assert runner_cli._phase_timeline_label_min_ms("DynamicKVGrow", stream_time=False) == float("inf")
+
+
 def test_offline_phase_timeline_rebases_after_hidden_setup(tmp_path):
     rows = [
         _row("L_DecoderLoad", 0.0, 20.0),
