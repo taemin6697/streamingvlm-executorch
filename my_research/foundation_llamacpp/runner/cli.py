@@ -1239,12 +1239,7 @@ def _rebase_phase_timeline_phases(phases: list[tuple[str, float, float, int]]) -
     ]
 
 
-def _phase_timeline_data(
-    output_dir: Path,
-    phase_rows: list[dict[str, str]],
-    *,
-    stream_time: bool = False,
-) -> tuple[list[tuple[str, float, float, int]], list[float], float, float]:
+def _phase_timeline_stream_origin(output_dir: Path, phase_rows: list[dict[str, str]]) -> tuple[float, float]:
     stream_origin_elapsed = min((_phase_float(row, "elapsed_s_start") for row in phase_rows), default=0.0)
     stream_origin_video = 0.0
     events_path = _result_artifact_path(output_dir, "stream_events.csv")
@@ -1258,6 +1253,16 @@ def _phase_timeline_data(
                 break
             except ValueError:
                 continue
+    return stream_origin_elapsed, stream_origin_video
+
+
+def _phase_timeline_data(
+    output_dir: Path,
+    phase_rows: list[dict[str, str]],
+    *,
+    stream_time: bool = False,
+) -> tuple[list[tuple[str, float, float, int]], list[float], float, float]:
+    stream_origin_elapsed, stream_origin_video = _phase_timeline_stream_origin(output_dir, phase_rows)
 
     def to_plot_time(elapsed_s: float) -> float:
         if not stream_time:
@@ -1305,6 +1310,37 @@ def _phase_timeline_data(
     return phases, prompt_markers, timeline_origin, timeline_end
 
 
+def _phase_timeline_prompt_start_markers(
+    output_dir: Path,
+    phase_rows: list[dict[str, str]],
+    *,
+    stream_time: bool,
+    timeline_origin: float,
+    timeline_end: float,
+) -> list[tuple[int, float]]:
+    if not stream_time:
+        return []
+    events_path = _result_artifact_path(output_dir, "stream_events.csv")
+    if not events_path.exists():
+        return []
+    stream_origin_elapsed, stream_origin_video = _phase_timeline_stream_origin(output_dir, phase_rows)
+    markers: list[tuple[int, float]] = []
+    for event_row in _read_csv_dicts(events_path):
+        if event_row.get("event") != "StreamDecode":
+            continue
+        try:
+            prompt_idx = int(event_row.get("prompt_idx", "-1") or -1)
+            elapsed_start = float(event_row.get("elapsed_s_start", "0") or 0)
+        except ValueError:
+            continue
+        if prompt_idx < 0:
+            continue
+        marker = elapsed_start - stream_origin_elapsed + stream_origin_video
+        if marker >= timeline_origin and marker <= timeline_end:
+            markers.append((prompt_idx, marker))
+    return markers
+
+
 def _phase_timeline_label_min_ms(name: str, *, stream_time: bool) -> float:
     return float("inf")
 
@@ -1324,6 +1360,13 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
     phases, prompt_markers, timeline_origin, timeline_end = _phase_timeline_data(output_dir, phase_rows, stream_time=stream_time)
     if not phases:
         return
+    prompt_start_markers = _phase_timeline_prompt_start_markers(
+        output_dir,
+        phase_rows,
+        stream_time=stream_time,
+        timeline_origin=timeline_origin,
+        timeline_end=timeline_end,
+    )
 
     visible = [name for name in PHASE_TIMELINE_VISIBLE if any(phase[0] == name for phase in phases)]
     y_for = {name: idx for idx, name in enumerate(visible)}
@@ -1386,6 +1429,20 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
             va="bottom",
             fontsize=8,
             color="#2d3436",
+        )
+    for idx, marker in prompt_start_markers:
+        ax.axvline(marker, color="#d63031", linestyle=":", linewidth=1.15, alpha=0.9)
+        ax.text(
+            marker,
+            0.86,
+            f"Start {idx} @ {marker:.1f}s",
+            transform=ax.get_xaxis_transform(),
+            rotation=90,
+            ha="left",
+            va="bottom",
+            fontsize=8,
+            color="#d63031",
+            fontweight="bold",
         )
 
     ax.set_yticks(list(y_for.values()))
