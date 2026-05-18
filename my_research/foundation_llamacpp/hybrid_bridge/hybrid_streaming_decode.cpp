@@ -318,6 +318,7 @@ struct Args {
   bool force_generation = false;
   bool single_buffer = false;
   bool online_buffer = false;
+  bool latest_frame_only = false;
   bool partial_vision_kv = false;
   bool dynamic_kv_cache = false;
   bool no_kv_offload = false;
@@ -394,6 +395,8 @@ Args parse_args(int argc, char** argv) {
       args.single_buffer = true;
     } else if (a == "--online-buffer" || a == "--online_buffer") {
       args.online_buffer = true;
+    } else if (a == "--latest-frame-only" || a == "--latest_frame_only") {
+      args.latest_frame_only = true;
     } else if (a == "--partial-vision-kv" || a == "--partial_vision_kv") {
       args.partial_vision_kv = true;
     } else if (a == "--dynamic-kv-cache") {
@@ -2141,6 +2144,7 @@ struct StreamBufferStats {
   int committed_cache_updates = 0;
   int prompt_decode_jobs = 0;
   int skipped_cache_updates = 0;
+  int latest_frame_only_dropped_cache_updates = 0;
   long committed_cache_update_ms = 0;
   long prompt_decode_ms = 0;
   long first_input_ms = 0;
@@ -2159,6 +2163,24 @@ int drop_pending_cache_updates(std::deque<StreamJob>& stream_jobs) {
           [](const StreamJob& job) { return job.kind == StreamJobKind::CacheUpdate; }),
       stream_jobs.end());
   return static_cast<int>(before - stream_jobs.size());
+}
+
+bool cache_update_in_queue(const std::deque<StreamJob>& stream_jobs) {
+  return std::any_of(
+      stream_jobs.begin(),
+      stream_jobs.end(),
+      [](const StreamJob& job) { return job.kind == StreamJobKind::CacheUpdate; });
+}
+
+bool should_drop_cache_update_for_latest_frame_only(
+    const Args& args,
+    bool cache_worker_busy,
+    const std::deque<StreamJob>& stream_jobs,
+    const std::atomic<int>& pending_prompt_jobs) {
+  return args.latest_frame_only && args.stream_mode == "vision_prefill" &&
+         (cache_worker_busy ||
+          cache_update_in_queue(stream_jobs) ||
+          pending_prompt_jobs.load(std::memory_order_acquire) > 0);
 }
 
 std::vector<FrameRecord> resolve_online_buffer_frames(
@@ -2219,6 +2241,7 @@ void write_stream_buffer_summary(const Args& args, const Manifest& manifest, con
   const double avg_prompt_frame_lag_s =
       stats.prompt_frame_lag_s.empty() ? 0.0 : prompt_frame_lag_sum_s / stats.prompt_frame_lag_s.size();
   out << "online_buffer=" << (args.online_buffer ? "true" : "false") << "\n";
+  out << "latest_frame_only=" << (args.latest_frame_only ? "true" : "false") << "\n";
   out << "requested_input_fps=" << manifest.sampling_fps << "\n";
   out << "observed_input_fps=" << observed_input_fps << "\n";
   out << "input_frame_count=" << stats.input_frames << "\n";
@@ -2231,6 +2254,7 @@ void write_stream_buffer_summary(const Args& args, const Manifest& manifest, con
   out << "prompt_decode_jobs=" << stats.prompt_decode_jobs << "\n";
   out << "prompt_decode_total_s=" << prompt_decode_total_s << "\n";
   out << "skipped_cache_updates=" << stats.skipped_cache_updates << "\n";
+  out << "latest_frame_only_dropped_cache_updates=" << stats.latest_frame_only_dropped_cache_updates << "\n";
   out << "prompt_frame_lag_s_avg=" << avg_prompt_frame_lag_s << "\n";
   out << "prompt_frame_lag_s_count=" << stats.prompt_frame_lag_s.size() << "\n";
 }
@@ -2332,6 +2356,7 @@ int main(int argc, char** argv) {
   std::vector<FrameRecord> latest_available_frames;
   StreamBufferStats buffer_stats;
   std::atomic<int> pending_prompt_jobs{0};
+  bool cache_worker_busy = false;
 
   std::thread producer([&]() {
     double last_ts = 0.0;
@@ -2364,17 +2389,37 @@ int main(int argc, char** argv) {
         if (args.stream_mode == "vision_prefill") {
           PromptEvent cache_event;
           cache_event.timestamp_s = frame.timestamp_s;
-          if (args.online_buffer) {
-            buffer_stats.skipped_cache_updates += drop_pending_cache_updates(stream_jobs);
+          if (should_drop_cache_update_for_latest_frame_only(
+                  args,
+                  cache_worker_busy,
+                  stream_jobs,
+                  pending_prompt_jobs)) {
+            buffer_stats.skipped_cache_updates += 1;
+            buffer_stats.latest_frame_only_dropped_cache_updates += 1;
+            events.row(
+                "LatestFrameOnlyCacheDrop",
+                frame.index,
+                -1,
+                frame.timestamp_s,
+                origin_ms,
+                t,
+                t,
+                "cache_worker_busy_or_queued");
+          } else {
+            if (args.online_buffer) {
+              buffer_stats.skipped_cache_updates += drop_pending_cache_updates(stream_jobs);
+            }
+            stream_jobs.push_back(StreamJob{
+                StreamJobKind::CacheUpdate,
+                args.online_buffer && !args.latest_frame_only
+                    ? std::vector<FrameRecord>{}
+                    : select_prompt_frames(args, available_frames, current_frame, cache_event),
+                cache_event,
+                -1,
+                frame.index,
+                t,
+            });
           }
-          stream_jobs.push_back(StreamJob{
-              StreamJobKind::CacheUpdate,
-              args.online_buffer ? std::vector<FrameRecord>{} : select_prompt_frames(args, available_frames, current_frame, cache_event),
-              cache_event,
-              -1,
-              frame.index,
-              t,
-          });
         }
 #endif
         while (prompt_cursor < manifest.prompts.size() && manifest.prompts[prompt_cursor].timestamp_s <= frame.timestamp_s) {
@@ -2454,11 +2499,15 @@ int main(int argc, char** argv) {
       }
       job = stream_jobs.front();
       stream_jobs.pop_front();
+      cache_worker_busy = true;
       if (args.online_buffer && have_latest_frame) {
         const bool prompt_uses_committed_vision_cache =
             args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::Prompt;
         if (prompt_uses_committed_vision_cache) {
           buffer_stats.prompt_frame_lag_s.push_back(latest_frame.timestamp_s - job.prompt.timestamp_s);
+        } else if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::CacheUpdate && args.latest_frame_only && !job.frames.empty()) {
+          job.frame_idx = last_frame_index(job.frames);
+          job.prompt.timestamp_s = job.frames.back().timestamp_s;
         } else if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::CacheUpdate) {
           job.frames = {latest_frame};
           job.frame_idx = latest_frame.index;
@@ -2474,6 +2523,11 @@ int main(int argc, char** argv) {
         }
       }
     }
+
+    auto mark_cache_worker_idle = [&]() {
+      std::lock_guard<std::mutex> lock(mu);
+      cache_worker_busy = false;
+    };
 
 #if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
     if (job.kind == StreamJobKind::CacheUpdate) {
@@ -2494,6 +2548,7 @@ int main(int argc, char** argv) {
           std::lock_guard<std::mutex> lock(mu);
           buffer_stats.skipped_cache_updates += 1;
         }
+        mark_cache_worker_idle();
         continue;
       }
       const VisionPrefillCacheBuildStatus status = build_vision_prefill_cache(
@@ -2527,6 +2582,7 @@ int main(int argc, char** argv) {
           note_processed_visual_job(buffer_stats, cache_start_ms, cache_end_ms);
         }
       }
+      mark_cache_worker_idle();
       continue;
     }
 #endif
@@ -2591,6 +2647,7 @@ int main(int argc, char** argv) {
       std::lock_guard<std::mutex> lock(mu);
       note_prompt_decode_job(buffer_stats, decode_start_ms, decode_end_ms);
     }
+    mark_cache_worker_idle();
     ++handled_prompts;
   }
 

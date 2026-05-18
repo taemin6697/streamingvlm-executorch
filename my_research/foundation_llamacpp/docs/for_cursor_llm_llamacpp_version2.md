@@ -5,6 +5,35 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-17: Latest-Frame-Only Vision-Prefill Cache Updates
+
+- Created branch `codex/latest-frame-only-cache-updates`.
+- Added `--latest-frame-only` for streaming `vision-prefill` cache updates.
+  This flag changes only frame cache-update scheduling:
+  - if the worker is busy with an older cache update or prompt, newly arriving
+    frame cache updates are dropped;
+  - once the worker becomes idle, the next frame that arrives creates the next
+    cache update;
+  - prompt preemption is unchanged: prompts can still finish the current
+    partial image batch with `--partial-vision-kv` before answering.
+- Runner changes:
+  - `runner/cli.py` parses `--latest-frame-only` / `--latest_frame_only`;
+  - Android `hybrid_streaming_decode` receives `--latest-frame-only`;
+  - result directories add `_latest_frame_only`.
+- Bridge changes:
+  - `Args.latest_frame_only` controls the policy;
+  - `cache_worker_busy` tracks whether the consumer is processing a job;
+  - `should_drop_cache_update_for_latest_frame_only()` drops cache updates when
+    the worker is busy, another cache update is already queued, or a prompt is
+    pending;
+  - cache jobs created under this flag keep the frame selected at arrival even
+    when `--online-buffer` is enabled, so they do not silently switch to a later
+    buffered frame at pop time.
+- Artifacts:
+  - `stream_events.csv` records `LatestFrameOnlyCacheDrop`;
+  - `stream_buffer_summary.txt` records `latest_frame_only=true` and
+    `latest_frame_only_dropped_cache_updates=N`.
+
 ## 2026-05-15: Partial Vision-Prefill KV Commit
 
 - Added `--partial-vision-kv` for hybrid `--stream-mode vision-prefill`.

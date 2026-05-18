@@ -82,6 +82,21 @@ def test_online_buffer_uses_latest_frame_at_processing_start():
     assert "stream_buffer_summary.txt stream_response_*.txt" in runner_source
 
 
+def test_latest_frame_only_drops_frame_cache_updates_arriving_while_worker_is_busy():
+    source = STREAMING_CPP.read_text()
+    runner_source = (runner_cli.FOUNDATION_LLAMA / "runner" / "cli.py").read_text(encoding="utf-8")
+
+    assert "bool latest_frame_only = false" in source
+    assert '"--latest-frame-only"' in source
+    assert "latest_frame_only_arg" in runner_source
+    assert "cache_worker_busy" in source
+    assert "should_drop_cache_update_for_latest_frame_only" in source
+    assert "LatestFrameOnlyCacheDrop" in source
+    assert "latest_frame_only_dropped_cache_updates=" in source
+    assert "cache_update_in_queue(stream_jobs)" in source
+    assert "args.latest_frame_only && args.stream_mode == \"vision_prefill\"" in source
+
+
 def test_vision_prefill_cache_build_encodes_frames_on_demand():
     source = STREAMING_CPP.read_text()
     build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
