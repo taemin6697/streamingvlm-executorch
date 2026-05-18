@@ -321,6 +321,7 @@ struct Args {
   bool partial_vision_kv = false;
   bool dynamic_kv_cache = false;
   bool no_kv_offload = false;
+  bool mmproj_offload = true;
   bool no_warmup = false;
 };
 
@@ -402,6 +403,10 @@ Args parse_args(int argc, char** argv) {
       args.force_generation = true;
     } else if (a == "--no-kv-offload") {
       args.no_kv_offload = true;
+    } else if (a == "--no-mmproj-offload") {
+      args.mmproj_offload = false;
+    } else if (a == "--mmproj-offload") {
+      args.mmproj_offload = true;
     } else if (a == "--no-warmup") {
       args.no_warmup = true;
     } else if (a == "--no-realtime") {
@@ -578,6 +583,9 @@ std::vector<std::string> build_llama_args(const Args& args, const std::string& i
   }
   if (args.no_kv_offload) {
     out.push_back("--no-kv-offload");
+  }
+  if (!args.mmproj_offload) {
+    out.push_back("--no-mmproj-offload");
   }
   if (args.no_warmup) {
     out.push_back("--no-warmup");
@@ -1009,16 +1017,16 @@ bool eval_streaming_chunks_with_external_embedding(
       }
       const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
       const int32_t n_embd = decoder_embedding_size;
-      const int32_t n_feature_embd = embeddings->feature_dim_for_chunk(n_tokens, n_embd);
-      float* image_slice = embeddings->next_slice(n_tokens, n_feature_embd);
+      const embedding_cursor::embedding_slice slice = embeddings->next_slice_for_chunk(n_tokens, n_embd);
+      float* image_slice = slice.data;
       float* image_embedding = image_slice;
-      if (n_feature_embd != n_embd) {
+      if (slice.feature_tokens != n_tokens || slice.feature_dim != n_embd) {
         const long mmproj_start_ms = now_ms();
         if (mtmd_project_features(
                 ctx.ctx_vision.get(),
                 image_slice,
-                static_cast<int32_t>(n_tokens),
-                n_feature_embd) != 0) {
+                static_cast<int32_t>(slice.feature_tokens),
+                slice.feature_dim) != 0) {
           LOG_ERR("failed to project cached vision features with mmproj\n");
           return false;
         }
@@ -1214,10 +1222,10 @@ bool eval_streaming_chunks_with_on_demand_vision(
 
       const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
       const int32_t n_embd = decoder_embedding_size;
-      const int32_t n_feature_embd = embeddings.feature_dim_for_chunk(n_tokens, n_embd);
-      float* image_slice = embeddings.next_slice(n_tokens, n_feature_embd);
+      const embedding_cursor::embedding_slice slice = embeddings.next_slice_for_chunk(n_tokens, n_embd);
+      float* image_slice = slice.data;
       float* image_embedding = image_slice;
-      if (n_feature_embd != n_embd) {
+      if (slice.feature_tokens != n_tokens || slice.feature_dim != n_embd) {
         if (!allow_partial_image_commit && preempt()) {
           return false;
         }
@@ -1225,8 +1233,8 @@ bool eval_streaming_chunks_with_on_demand_vision(
         if (mtmd_project_features(
                 ctx.ctx_vision.get(),
                 image_slice,
-                static_cast<int32_t>(n_tokens),
-                n_feature_embd) != 0) {
+                static_cast<int32_t>(slice.feature_tokens),
+                slice.feature_dim) != 0) {
           LOG_ERR("failed to project on-demand vision features with mmproj\n");
           return false;
         }

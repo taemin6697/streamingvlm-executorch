@@ -248,8 +248,8 @@ MTMD_API int32_t mtmd_encode_chunk_split_timing(mtmd_context * ctx,
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
 // Project precomputed vision features through the mmproj loaded in mtmd_context.
-// Currently supports InternVL projector input after pixel_shuffle/downsample,
-// before multi_modal_projector.
+// Supports InternVL projector input after pixel_shuffle/downsample and
+// Qwen2-VL/Qwen2.5-VL pre-merger vision block features.
 MTMD_API int32_t mtmd_project_features(mtmd_context * ctx,
                                        const float * features,
                                        int32_t n_tokens,

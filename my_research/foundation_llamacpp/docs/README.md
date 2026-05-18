@@ -1108,6 +1108,49 @@ Reason:
   That file contains decoder-style keys and no `vision_tower.*` weights.
 ```
 
+### Qwen2.5-VL Vision Encoder Export
+
+Qwen2.5-VL uses dynamic image resize in the HF processor, so the QNN artifact
+is exported for one concrete resolution/grid at a time. This artifact stops
+before Qwen's `visual.patch_merger`, so it outputs pure vision block features.
+Pick either a fixed `--image-size HEIGHT WIDTH` or an expected
+`--image-tokens N`; when only tokens are given, the exporter infers a
+near-square patch grid whose height/width are divisible by `spatial_merge_size`.
+
+The exporter checks that the actual visual output token count equals
+`grid_t * grid_h * grid_w` and records the result in
+`vision_encoder_qnn_metadata.json`. For example, 448 x 448 becomes
+`image_grid_thw = [1, 32, 32]` and outputs 1024 pre-merger tokens.
+
+```bash
+PYTHONPATH=/workspace/streamingvlm:/workspace/streamingvlm/executorch \
+python -m my_research.foundation.models.qwen2_5_vl.vision_encoder.export_qnn \
+  --model-name qwen2_5_vl_3b \
+  --model-path Qwen/Qwen2.5-VL-3B-Instruct \
+  --artifact-root my_research/foundation_llamacpp/results/vision_models/qwen2_5_vl_3b_vision_encoder_premerger_qnn_1024tok_sm8750 \
+  --soc-model SM8750 \
+  --quant 16a8w \
+  --image-tokens 1024 \
+  --calibration-images \
+    my_research/foundation_llamacpp/sample_images/sample_coco_cats_448.jpg \
+    my_research/foundation_llamacpp/sample_images/golden_gate_bridge_448.jpg \
+  --calibration-num 2
+```
+
+Useful shape examples:
+
+```text
+--image-tokens 256
+  Infers 224 x 224, image_grid_thw = [1, 16, 16], output tokens = 256.
+
+--image-tokens 1024
+  Infers 448 x 448, image_grid_thw = [1, 32, 32], output tokens = 1024.
+
+--image-size 392 560 --image-tokens 1120
+  Uses the explicit rectangular export size and fails early if the token count
+  does not match.
+```
+
 ## Phase Names
 
 ```text

@@ -1139,19 +1139,32 @@ int32_t mtmd_project_features(mtmd_context * ctx, const float * features, int32_
         return 1;
     }
     auto proj_type = clip_get_projector_type(ctx_clip);
-    if (proj_type != PROJECTOR_TYPE_INTERNVL) {
-        LOG_ERR("%s: only InternVL projector is supported for external feature projection\n", __func__);
+    if (proj_type != PROJECTOR_TYPE_INTERNVL &&
+        proj_type != PROJECTOR_TYPE_QWEN2VL &&
+        proj_type != PROJECTOR_TYPE_QWEN25VL) {
+        LOG_ERR("%s: only InternVL and Qwen2-VL projectors are supported for external feature projection\n", __func__);
         return 1;
     }
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
     ctx->image_embd_v.resize((size_t) n_tokens * n_mmproj_embd);
-    bool ok = clip_project_internvl_features(
-        ctx_clip,
-        ctx->n_threads,
-        features,
-        n_tokens,
-        n_feature_embd,
-        ctx->image_embd_v.data());
+    bool ok = false;
+    if (proj_type == PROJECTOR_TYPE_INTERNVL) {
+        ok = clip_project_internvl_features(
+            ctx_clip,
+            ctx->n_threads,
+            features,
+            n_tokens,
+            n_feature_embd,
+            ctx->image_embd_v.data());
+    } else {
+        ok = clip_project_qwen2vl_features(
+            ctx_clip,
+            ctx->n_threads,
+            features,
+            n_tokens,
+            n_feature_embd,
+            ctx->image_embd_v.data());
+    }
     return ok ? 0 : 1;
 }
 
