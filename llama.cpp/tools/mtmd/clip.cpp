@@ -286,6 +286,64 @@ struct clip_graph_internvl_projector_only : clip_graph_internvl {
     }
 };
 
+struct clip_graph_qwen2vl_projector_only : clip_graph {
+    clip_graph_qwen2vl_projector_only(clip_ctx * ctx, const clip_image_f32 & img, const float * features, int n_tokens, int n_feature_embd)
+        : clip_graph(ctx, img), features(features), n_tokens(n_tokens), n_feature_embd(n_feature_embd) {}
+
+    const float * features;
+    int n_tokens;
+    int n_feature_embd;
+
+    ggml_cgraph * build() override {
+        GGML_ASSERT(proj_type == PROJECTOR_TYPE_QWEN2VL || proj_type == PROJECTOR_TYPE_QWEN25VL);
+        const int merge = hparams.n_merge > 0 ? hparams.n_merge : 2;
+        const int merge_factor = merge * merge;
+        const bool use_window_attn = proj_type == PROJECTOR_TYPE_QWEN25VL && hparams.n_wa_pattern > 0;
+        GGML_ASSERT(n_tokens % merge_factor == 0);
+
+        ggml_tensor * embeddings = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_feature_embd, n_tokens);
+        ggml_set_name(embeddings, "external_vision_features");
+        ggml_set_input(embeddings);
+
+        if (model.post_ln_w) {
+            norm_type norm_t = proj_type == PROJECTOR_TYPE_QWEN25VL
+                ? NORM_TYPE_RMS
+                : NORM_TYPE_NORMAL;
+            embeddings = build_norm(embeddings, model.post_ln_w, model.post_ln_b, norm_t, eps, -1);
+        }
+
+        embeddings = ggml_reshape_3d(ctx0, embeddings, n_feature_embd * merge_factor, n_tokens / merge_factor, 1);
+        if (use_window_attn) {
+            ggml_tensor * inv_window_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens / merge_factor);
+            ggml_set_name(inv_window_idx, "inv_window_idx");
+            ggml_set_input(inv_window_idx);
+            embeddings = ggml_reshape_2d(ctx0, embeddings, n_feature_embd * merge_factor, n_tokens / merge_factor);
+            embeddings = ggml_get_rows(ctx0, embeddings, inv_window_idx);
+            embeddings = ggml_reshape_3d(ctx0, embeddings, n_feature_embd * merge_factor, n_tokens / merge_factor, 1);
+        }
+
+        embeddings = build_ffn(
+                embeddings,
+                model.mm_0_w, model.mm_0_b,
+                nullptr, nullptr,
+                model.mm_1_w, model.mm_1_b,
+                FFN_GELU,
+                -1);
+
+        if (use_window_attn) {
+            ggml_tensor * window_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens / merge_factor);
+            ggml_set_name(window_idx, "window_idx");
+            ggml_set_input(window_idx);
+            embeddings = ggml_reshape_2d(ctx0, embeddings, hparams.projection_dim, n_tokens / merge_factor);
+            embeddings = ggml_get_rows(ctx0, embeddings, window_idx);
+            embeddings = ggml_reshape_3d(ctx0, embeddings, hparams.projection_dim, n_tokens / merge_factor, 1);
+        }
+
+        ggml_build_forward_expand(gf, embeddings);
+        return gf;
+    }
+};
+
 struct clip_graph_internvl_preprojector_only : clip_graph_internvl {
     clip_graph_internvl_preprojector_only(clip_ctx * ctx, const clip_image_f32 & img)
         : clip_graph_internvl(ctx, img) {}
@@ -2529,6 +2587,24 @@ struct clip_model_loader {
     static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         support_info_graph info;
 
+        const bool is_opencl_backend =
+            ctx_clip.backend &&
+            std::strcmp(ggml_backend_name(ctx_clip.backend), "OpenCL") == 0;
+        const bool is_qwen25_window_attn =
+            ctx_clip.model.proj_type == PROJECTOR_TYPE_QWEN25VL &&
+            ctx_clip.model.hparams.n_wa_pattern > 0;
+
+        // Qwen2.5-VL uses a windowed vision-attention mask. The current OpenCL
+        // FlashAttention path accepts the graph but produces incorrect visual
+        // embeddings on Adreno. Keep the whole CLIP graph on OpenCL, but route
+        // vision attention through the non-FA OpenCL ops for correctness.
+        if (is_opencl_backend && is_qwen25_window_attn &&
+            ctx_clip.flash_attn_type != CLIP_FLASH_ATTN_TYPE_DISABLED) {
+            LOG_WRN("%s: disabling CLIP FlashAttention for Qwen2.5-VL on OpenCL; using non-FA OpenCL vision attention for correctness\n",
+                    __func__);
+            ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
+        }
+
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
             // try to enable flash attention to see if it's supported
             ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
@@ -3878,6 +3954,157 @@ bool clip_project_internvl_features(clip_ctx * ctx, const int n_threads, const f
     const int expected_n_embd_out = clip_n_mmproj_embd(ctx);
     if (n_tokens_out != n_tokens || n_embd_out != expected_n_embd_out) {
         LOG_ERR("%s: expected output %d x %d, got %d x %d\n", __func__, expected_n_embd_out, n_tokens, n_embd_out, n_tokens_out);
+        return false;
+    }
+    ggml_backend_tensor_get(embeddings, vec, 0, ggml_nbytes(embeddings));
+    return true;
+}
+
+static bool clip_qwen2vl_build_window_indices(
+        const clip_ctx * ctx,
+        const int n_tokens,
+        const int merge,
+        std::vector<int32_t> & window_idx,
+        std::vector<int32_t> & inv_window_idx) {
+    const int merge_factor = merge * merge;
+    const int merged_tokens = n_tokens / merge_factor;
+    const int merged_side = static_cast<int>(std::llround(std::sqrt(static_cast<double>(merged_tokens))));
+    if (merged_side <= 0 || merged_side * merged_side != merged_tokens) {
+        LOG_ERR("%s: Qwen2.5-VL external pre-merger projection currently requires a square merged grid, got %d tokens\n",
+                __func__, merged_tokens);
+        return false;
+    }
+
+    const int patch_size = ctx->model.hparams.patch_size > 0 ? ctx->model.hparams.patch_size : 14;
+    const int attn_window_size = ctx->model.hparams.attn_window_size > 0 ? ctx->model.hparams.attn_window_size : 112;
+    const int grid_window = attn_window_size / patch_size / merge;
+    if (grid_window <= 0) {
+        LOG_ERR("%s: invalid Qwen2.5-VL window grid: attn_window_size=%d patch_size=%d merge=%d\n",
+                __func__, attn_window_size, patch_size, merge);
+        return false;
+    }
+
+    const int pw = merged_side;
+    const int ph = merged_side;
+    window_idx.assign(merged_tokens, 0);
+    inv_window_idx.assign(merged_tokens, 0);
+
+    int dst = 0;
+    for (int y = 0; y < ph; y += grid_window) {
+        for (int x = 0; x < pw; x += grid_window) {
+            const int win_h = std::min(grid_window, ph - y);
+            const int win_w = std::min(grid_window, pw - x);
+            for (int dy = 0; dy < win_h; dy++) {
+                for (int dx = 0; dx < win_w; dx++) {
+                    const int src = (y + dy) * pw + (x + dx);
+                    window_idx[src] = dst;
+                    inv_window_idx[dst] = src;
+                    dst++;
+                }
+            }
+        }
+    }
+
+    if (dst != merged_tokens) {
+        LOG_ERR("%s: built %d Qwen2.5-VL window indices, expected %d\n", __func__, dst, merged_tokens);
+        return false;
+    }
+    return true;
+}
+
+bool clip_project_qwen2vl_features(clip_ctx * ctx, const int n_threads, const float * features, int n_tokens, int n_feature_embd, float * vec) {
+    if (ctx->proj_type() != PROJECTOR_TYPE_QWEN2VL && ctx->proj_type() != PROJECTOR_TYPE_QWEN25VL) {
+        LOG_ERR("%s: only Qwen2-VL/Qwen2.5-VL projector is supported\n", __func__);
+        return false;
+    }
+    if (ctx->model.mm_0_w == nullptr || ctx->model.mm_1_w == nullptr) {
+        LOG_ERR("%s: Qwen2-VL merger tensors are missing\n", __func__);
+        return false;
+    }
+
+    const int merge = ctx->model.hparams.n_merge > 0 ? ctx->model.hparams.n_merge : 2;
+    const int merge_factor = merge * merge;
+    if (n_tokens <= 0 || n_tokens % merge_factor != 0) {
+        LOG_ERR("%s: expected pre-merger tokens divisible by %d, got %d\n", __func__, merge_factor, n_tokens);
+        return false;
+    }
+    const int expected_n_feature_embd = ctx->model.mm_0_w->ne[0] / merge_factor;
+    if (n_feature_embd != expected_n_feature_embd) {
+        LOG_ERR("%s: expected Qwen2-VL pre-merger feature dim %d, got %d\n",
+                __func__, expected_n_feature_embd, n_feature_embd);
+        return false;
+    }
+
+    const bool use_window_attn = ctx->proj_type() == PROJECTOR_TYPE_QWEN25VL && ctx->model.hparams.n_wa_pattern > 0;
+    std::vector<int32_t> window_idx;
+    std::vector<int32_t> inv_window_idx;
+    if (use_window_attn && !clip_qwen2vl_build_window_indices(ctx, n_tokens, merge, window_idx, inv_window_idx)) {
+        return false;
+    }
+
+    clip_image_f32 dummy;
+    dummy.nx = ctx->model.hparams.image_size > 0 ? ctx->model.hparams.image_size : ctx->model.hparams.patch_size * merge;
+    dummy.ny = dummy.nx;
+
+    if (ctx->buf_compute_meta.empty()) {
+        ctx->buf_compute_meta.resize(ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+    }
+    ctx->reset_sched();
+    clip_graph_qwen2vl_projector_only builder(ctx, dummy, features, n_tokens, n_feature_embd);
+    ggml_cgraph * gf = builder.build();
+    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+
+    ggml_tensor * inp = ggml_graph_get_tensor(gf, "external_vision_features");
+    if (inp == nullptr) {
+        LOG_ERR("%s: failed to get external feature input\n", __func__);
+        return false;
+    }
+    if (inp->type != GGML_TYPE_F32 || ggml_nelements(inp) != (int64_t) n_tokens * n_feature_embd) {
+        LOG_ERR("%s: invalid external feature tensor\n", __func__);
+        return false;
+    }
+    ggml_backend_tensor_set(inp, features, 0, ggml_nbytes(inp));
+
+    if (use_window_attn) {
+        ggml_tensor * inv_window_tensor = ggml_graph_get_tensor(gf, "inv_window_idx");
+        ggml_tensor * window_tensor = ggml_graph_get_tensor(gf, "window_idx");
+        if (inv_window_tensor == nullptr || window_tensor == nullptr) {
+            LOG_ERR("%s: failed to get Qwen2.5-VL window index tensors\n", __func__);
+            return false;
+        }
+        const int64_t expected_window_tokens = static_cast<int64_t>(n_tokens) / merge_factor;
+        if (ggml_nelements(inv_window_tensor) != expected_window_tokens ||
+            ggml_nelements(window_tensor) != expected_window_tokens) {
+            LOG_ERR("%s: invalid Qwen2.5-VL window index tensor shape\n", __func__);
+            return false;
+        }
+        ggml_backend_tensor_set(inv_window_tensor, inv_window_idx.data(), 0, ggml_nbytes(inv_window_tensor));
+        ggml_backend_tensor_set(window_tensor, window_idx.data(), 0, ggml_nbytes(window_tensor));
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) {
+        auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (ggml_backend_set_n_threads_fn) {
+            ggml_backend_set_n_threads_fn(ctx->backend_cpu, n_threads);
+        }
+    }
+
+    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
+        return false;
+    }
+
+    ggml_tensor * embeddings = ggml_graph_node(gf, -1);
+    const int n_tokens_out = embeddings->ne[1];
+    const int n_embd_out = embeddings->ne[0];
+    const int expected_n_tokens_out = n_tokens / merge_factor;
+    const int expected_n_embd_out = clip_n_mmproj_embd(ctx);
+    if (n_tokens_out != expected_n_tokens_out || n_embd_out != expected_n_embd_out) {
+        LOG_ERR("%s: expected output %d x %d, got %d x %d\n",
+                __func__, expected_n_embd_out, expected_n_tokens_out, n_embd_out, n_tokens_out);
         return false;
     }
     ggml_backend_tensor_get(embeddings, vec, 0, ggml_nbytes(embeddings));

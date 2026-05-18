@@ -101,11 +101,38 @@ struct embedding_cursor {
 
   explicit embedding_cursor(streamingvlm::hybrid_bridge::EmbeddingFile& embedding) : file(embedding) {}
 
+  struct embedding_slice {
+    float* data = nullptr;
+    size_t feature_tokens = 0;
+    int32_t feature_dim = 0;
+  };
+
+  embedding_slice next_slice_for_chunk(size_t image_tokens, int32_t n_embd) {
+    size_t feature_tokens = image_tokens;
+    int32_t feature_dim = 0;
+    if (file.shape.size() >= 2 && file.shape.back() > 0) {
+      const int64_t shape_tokens = file.shape[file.shape.size() - 2];
+      const int64_t shape_feature = file.shape.back();
+      if (shape_tokens > 0 && (shape_tokens == static_cast<int64_t>(image_tokens) || shape_feature != n_embd)) {
+        feature_tokens = static_cast<size_t>(shape_tokens);
+        feature_dim = static_cast<int32_t>(shape_feature);
+      }
+    }
+    if (feature_dim <= 0) {
+      const size_t remaining = file.values.size() - offset;
+      if (remaining >= image_tokens * static_cast<size_t>(n_embd)) {
+        feature_tokens = image_tokens;
+        feature_dim = n_embd;
+      }
+    }
+    return next_slice(feature_tokens, feature_dim);
+  }
+
   int32_t feature_dim_for_chunk(size_t n_tokens, int32_t n_embd) const {
     if (file.shape.size() >= 2 && file.shape.back() > 0) {
       const int64_t shape_tokens = file.shape[file.shape.size() - 2];
       const int64_t shape_feature = file.shape.back();
-      if (shape_tokens == static_cast<int64_t>(n_tokens)) {
+      if (shape_tokens > 0 && (shape_tokens == static_cast<int64_t>(n_tokens) || shape_feature != n_embd)) {
         return static_cast<int32_t>(shape_feature);
       }
     }
@@ -116,19 +143,19 @@ struct embedding_cursor {
     return 0;
   }
 
-  float* next_slice(size_t n_tokens, int32_t feature_dim) {
-    const size_t n_values = n_tokens * static_cast<size_t>(feature_dim);
+  embedding_slice next_slice(size_t feature_tokens, int32_t feature_dim) {
+    const size_t n_values = feature_tokens * static_cast<size_t>(feature_dim);
     if (feature_dim <= 0 || offset + n_values > file.values.size()) {
       die_fmt(
           "embedding size mismatch: file has %zu floats, consumed %zu, next image chunk expects %zu x %d",
           file.values.size(),
           offset,
-          n_tokens,
+          feature_tokens,
           feature_dim);
     }
     float* ptr = file.values.data() + offset;
     offset += n_values;
-    return ptr;
+    return embedding_slice{ptr, feature_tokens, feature_dim};
   }
 
   void finish() const {
@@ -343,10 +370,10 @@ int eval_with_external_embedding(
     if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
       const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
       const int32_t n_embd = decoder_embedding_size;
-      const int32_t n_feature_embd = embeddings.feature_dim_for_chunk(n_tokens, n_embd);
-      float* image_slice = embeddings.next_slice(n_tokens, n_feature_embd);
+      const embedding_cursor::embedding_slice slice = embeddings.next_slice_for_chunk(n_tokens, n_embd);
+      float* image_slice = slice.data;
       float* image_embedding = image_slice;
-      if (n_feature_embd == n_embd) {
+      if (slice.feature_tokens == n_tokens && slice.feature_dim == n_embd) {
         // Already projected into the decoder input embedding dimension.
         LOG_INF(
             "external embedding slice is already projected: tokens=%zu embd=%d consumed_floats=%zu/%zu\n",
@@ -356,9 +383,10 @@ int eval_with_external_embedding(
             embedding.values.size());
       } else {
         LOG_INF(
-            "external embedding slice is pre-projector: tokens=%zu feature_embd=%d projected_embd=%d consumed_floats=%zu/%zu\n",
+            "external embedding slice is pre-projector: feature_tokens=%zu image_tokens=%zu feature_embd=%d projected_embd=%d consumed_floats=%zu/%zu\n",
+            slice.feature_tokens,
             n_tokens,
-            n_feature_embd,
+            slice.feature_dim,
             n_embd,
             embeddings.offset,
             embedding.values.size());
@@ -366,8 +394,8 @@ int eval_with_external_embedding(
         if (mtmd_project_features(
                 ctx.ctx_vision.get(),
                 image_slice,
-                static_cast<int32_t>(n_tokens),
-                n_feature_embd) != 0) {
+                static_cast<int32_t>(slice.feature_tokens),
+                slice.feature_dim) != 0) {
           die("failed to project external vision features with mmproj");
         }
         const long mmproj_end_ms = ggml_time_ms();

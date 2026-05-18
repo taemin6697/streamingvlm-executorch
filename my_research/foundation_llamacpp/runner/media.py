@@ -95,28 +95,49 @@ def build_streaming_video_prompt(frames: list[dict[str, object]], raw_prompt: st
     return internvl3_video_prompt([int(frame.get("num_patches", 1) or 1) for frame in frames], raw_prompt)
 
 
-def normalize_image_to_bin(image, output_path: Path, image_size: int = 448) -> None:
+def _resize_size(image_size: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(image_size, tuple):
+        height, width = image_size
+        return int(width), int(height)
+    return int(image_size), int(image_size)
+
+
+def normalize_image_to_bin(
+    image,
+    output_path: Path,
+    image_size: int | tuple[int, int] = 448,
+    *,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
+) -> None:
     from PIL import Image
 
     if not isinstance(image, Image.Image):
         image = Image.fromarray(image)
     resampling = getattr(Image, "Resampling", Image).BICUBIC
-    image = image.convert("RGB").resize((image_size, image_size), resampling)
+    image = image.convert("RGB").resize(_resize_size(image_size), resampling)
     arr = np.asarray(image).astype("float32") / 255.0
-    mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
-    std = np.asarray(IMAGENET_STD, dtype=np.float32)
-    arr = (arr - mean) / std
+    mean_arr = np.asarray(mean, dtype=np.float32)
+    std_arr = np.asarray(std, dtype=np.float32)
+    arr = (arr - mean_arr) / std_arr
     arr = np.transpose(arr, (2, 0, 1))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     arr.astype("float32").tofile(output_path)
 
 
-def prepare_warmup_image(image: Path, work_dir: Path) -> tuple[Path, Path]:
+def prepare_warmup_image(
+    image: Path,
+    work_dir: Path,
+    *,
+    image_size: int | tuple[int, int] = 448,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
+) -> tuple[Path, Path]:
     load_image = importlib.import_module("transformers.image_utils").load_image
 
     warmup_bin = work_dir / "warmup_golden_gate_448.bin"
     warmup_layout = work_dir / image.name
-    normalize_image_to_bin(load_image(str(image)), warmup_bin)
+    normalize_image_to_bin(load_image(str(image)), warmup_bin, image_size=image_size, mean=mean, std=std)
     if image.resolve() != warmup_layout.resolve():
         warmup_layout.write_bytes(image.read_bytes())
     return warmup_bin, warmup_layout
@@ -180,12 +201,20 @@ def dynamic_preprocess_tiles(image, *, image_size: int = 448, max_num: int = 1, 
     return processed_images
 
 
-def prepare_image_media(image: Path, work_dir: Path, prompt: str) -> PreparedMedia:
+def prepare_image_media(
+    image: Path,
+    work_dir: Path,
+    prompt: str,
+    *,
+    image_size: int | tuple[int, int] = 448,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
+) -> PreparedMedia:
     load_image = importlib.import_module("transformers.image_utils").load_image
 
     frame_bin = work_dir / "frame_0000.bin"
     layout_image = work_dir / image.name
-    normalize_image_to_bin(load_image(str(image)), frame_bin)
+    normalize_image_to_bin(load_image(str(image)), frame_bin, image_size=image_size, mean=mean, std=std)
     if image.resolve() != layout_image.resolve():
         layout_image.write_bytes(image.read_bytes())
     media_prompt = internvl3_image_prompt(prompt)
@@ -223,7 +252,15 @@ def prepare_image_media(image: Path, work_dir: Path, prompt: str) -> PreparedMed
     )
 
 
-def prepare_multi_image_media(images: list[Path], work_dir: Path, prompt: str) -> PreparedMedia:
+def prepare_multi_image_media(
+    images: list[Path],
+    work_dir: Path,
+    prompt: str,
+    *,
+    image_size: int | tuple[int, int] = 448,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
+) -> PreparedMedia:
     if not images:
         raise SystemExit("--multi-image requires at least one image path")
     load_image = importlib.import_module("transformers.image_utils").load_image
@@ -235,7 +272,7 @@ def prepare_multi_image_media(images: list[Path], work_dir: Path, prompt: str) -
         frame_bin = work_dir / f"image_{image_i:04d}.bin"
         suffix = image.suffix if image.suffix else ".png"
         layout_image = work_dir / f"image_{image_i + 1:04d}{suffix}"
-        normalize_image_to_bin(load_image(str(image)), frame_bin)
+        normalize_image_to_bin(load_image(str(image)), frame_bin, image_size=image_size, mean=mean, std=std)
         if image.resolve() != layout_image.resolve():
             layout_image.write_bytes(image.read_bytes())
         frame_bins.append(frame_bin)
@@ -289,7 +326,17 @@ def prepare_multi_image_media(images: list[Path], work_dir: Path, prompt: str) -
     )
 
 
-def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segments: int, max_num: int) -> PreparedMedia:
+def prepare_video_media(
+    video: Path,
+    work_dir: Path,
+    prompt: str,
+    *,
+    num_segments: int,
+    max_num: int,
+    image_size: int | tuple[int, int] = 448,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
+) -> PreparedMedia:
     from PIL import Image
 
     decord = importlib.import_module("decord")
@@ -312,7 +359,7 @@ def prepare_video_media(video: Path, work_dir: Path, prompt: str, *, num_segment
             stem = f"frame_{frame_i:04d}_tile_{tile_i:04d}"
             frame_bin = work_dir / f"{stem}.bin"
             layout_image = work_dir / f"{stem}.png"
-            normalize_image_to_bin(tile, frame_bin)
+            normalize_image_to_bin(tile, frame_bin, image_size=image_size, mean=mean, std=std)
             tile.save(layout_image)
             frame_bins.append(frame_bin)
             layout_images.append(layout_image)
@@ -373,6 +420,9 @@ def prepare_streaming_video_media(
     window_sec: float | None = None,
     window_max_frames: int = 8,
     single_buffer: bool = False,
+    image_size: int | tuple[int, int] = 448,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
 ) -> PreparedMedia:
     from PIL import Image
 
@@ -407,7 +457,7 @@ def prepare_streaming_video_media(
         if use_single_buffer_frames:
             frame_bin = work_dir / f"stream_frame_{stream_i:04d}.bin"
             layout_image = work_dir / f"stream_frame_{stream_i:04d}.png"
-            normalize_image_to_bin(image, frame_bin)
+            normalize_image_to_bin(image, frame_bin, image_size=image_size, mean=mean, std=std)
             image.save(layout_image)
             frame_bins.append(frame_bin)
             layout_images.append(layout_image)
@@ -429,7 +479,7 @@ def prepare_streaming_video_media(
             stem = f"stream_frame_{stream_i:04d}_tile_{tile_i:04d}"
             frame_bin = work_dir / f"{stem}.bin"
             layout_image = work_dir / f"{stem}.png"
-            normalize_image_to_bin(tile, frame_bin)
+            normalize_image_to_bin(tile, frame_bin, image_size=image_size, mean=mean, std=std)
             tile.save(layout_image)
             frame_bins.append(frame_bin)
             layout_images.append(layout_image)
@@ -482,6 +532,7 @@ def prepare_streaming_video_media(
 
 
 def prepare_media(args, work_dir: Path) -> PreparedMedia:
+    preprocess = getattr(args, "vision_preprocess", {}) or {}
     if getattr(args, "streaming_video", None) is not None:
         return prepare_streaming_video_media(
             args.streaming_video,
@@ -494,12 +545,13 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
             window_sec=getattr(args, "window_sec", None),
             window_max_frames=getattr(args, "window_max_frames", 8),
             single_buffer=getattr(args, "single_buffer", False),
+            **preprocess,
         )
     multi_image = getattr(args, "multi_image", None)
     if multi_image is None:
         multi_image = getattr(args, "images", None)
     if multi_image is not None:
-        return prepare_multi_image_media(multi_image, work_dir, args.prompt)
+        return prepare_multi_image_media(multi_image, work_dir, args.prompt, **preprocess)
     if args.video is not None:
         return prepare_video_media(
             args.video,
@@ -507,7 +559,8 @@ def prepare_media(args, work_dir: Path) -> PreparedMedia:
             args.prompt,
             num_segments=args.num_segments,
             max_num=args.max_num,
+            **preprocess,
         )
     if args.image is None:
         raise SystemExit("media preparation requires --image, --multi-image, --images, or --video")
-    return prepare_image_media(args.image, work_dir, args.prompt)
+    return prepare_image_media(args.image, work_dir, args.prompt, **preprocess)

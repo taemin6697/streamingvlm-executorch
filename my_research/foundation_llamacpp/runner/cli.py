@@ -146,6 +146,29 @@ def _prepare_media(args: argparse.Namespace, work_dir: Path) -> PreparedMedia:
     return prepare_media(args, work_dir)
 
 
+def _vision_preprocess_from_metadata(encoder_pte: Path | None) -> dict[str, object]:
+    if encoder_pte is None:
+        return {}
+    metadata_path = encoder_pte.with_name("vision_encoder_qnn_metadata.json")
+    if not metadata_path.exists():
+        return {}
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    preprocess: dict[str, object] = {}
+    image_mean = metadata.get("image_mean")
+    image_std = metadata.get("image_std")
+    if isinstance(image_mean, list) and len(image_mean) == 3:
+        preprocess["mean"] = tuple(float(v) for v in image_mean)
+    if isinstance(image_std, list) and len(image_std) == 3:
+        preprocess["std"] = tuple(float(v) for v in image_std)
+    output = metadata.get("output", {})
+    if isinstance(output, dict):
+        image_height = output.get("image_height")
+        image_width = output.get("image_width")
+        if image_height and image_width:
+            preprocess["image_size"] = (int(image_height), int(image_width))
+    return preprocess
+
+
 def _load_manifest(manifest_path: Path) -> dict:
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     base = manifest_path.parent
@@ -1696,6 +1719,32 @@ def _result_kv_suffix(cache_type_k: str | None, cache_type_v: str | None) -> str
     return f"_kv{k}_{v}"
 
 
+def _looks_like_qwen_vl(args: argparse.Namespace) -> bool:
+    names = [
+        str(getattr(args, "model", "") or ""),
+        str(getattr(args, "mmproj", "") or ""),
+    ]
+    text = " ".join(names).lower().replace("_", "-")
+    return any(marker in text for marker in ("qwen2.5-vl", "qwen25-vl", "qwen2-vl", "qwen2vl"))
+
+
+def _mmproj_offload_enabled(args: argparse.Namespace) -> bool:
+    explicit = getattr(args, "mmproj_offload", None)
+    if explicit is not None:
+        return bool(explicit)
+    return True
+
+
+def _mmproj_offload_shell_suffix(args: argparse.Namespace) -> str:
+    if _standalone_completion_mode(args) or getattr(args, "mmproj", None) is None:
+        return ""
+    explicit = getattr(args, "mmproj_offload", None)
+    enabled = _mmproj_offload_enabled(args)
+    if enabled and explicit is None:
+        return ""
+    return " --mmproj-offload" if enabled else " --no-mmproj-offload"
+
+
 def _result_model_name(
     model: Path,
     processor: str,
@@ -1886,7 +1935,7 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
     if use_precise_phases:
         cmd.extend(["--phase-stats-path", "foundation_phase_stats.csv"])
         cmd.extend(["--token-io-path", "foundation_token_io.txt"])
-        if getattr(args, "remote_warmup_layout_image", ""):
+        if getattr(args, "remote_warmup_layout_image", "") and not _looks_like_qwen_vl(args):
             cmd.extend(["--warmup-image", args.remote_warmup_layout_image])
         if args.force_generation:
             cmd.append("--force-generation")
@@ -1904,6 +1953,10 @@ def _build_standalone_command(args: argparse.Namespace, *, use_precise_phases: b
         cmd.extend(["--flash-attn", args.flash_attn])
     if getattr(args, "no_kv_offload", False):
         cmd.append("--no-kv-offload")
+    if not _mmproj_offload_enabled(args):
+        cmd.append("--no-mmproj-offload")
+    elif getattr(args, "mmproj_offload", None) is True:
+        cmd.append("--mmproj-offload")
     if getattr(args, "no_warmup", False):
         cmd.append("--no-warmup")
     _extend_llama_rope_cli(cmd, args)
@@ -2035,6 +2088,7 @@ def _build_hybrid_remote_script(args: argparse.Namespace, *, encoder_pte: Path, 
     fit_suffix = _fit_shell_suffix(args)
     rope_suffix = _rope_shell_suffix(args)
     flash_kv_suffix = _flash_attn_kv_shell_suffix(args)
+    mmproj_offload_suffix = _mmproj_offload_shell_suffix(args)
     ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     env_exports = _remote_llama_env_exports(args)
     return f"""#!/system/bin/sh
@@ -2056,7 +2110,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
   --wait-for-embedding --wait-timeout-ms 120000 \\
   --token-io-path foundation_token_io.txt {('--force-generation' if args.force_generation else '')} \\
   -p {prompt} -n {args.force_generation or args.n_predict}{ctx_dynamic_kv_suffix} -b {args.batch_size} -ub {args.ubatch_size} \\
-  -ngl {args.gpu_layers} {device_arg}{cache_suffix}{fit_suffix}{rope_suffix}{flash_kv_suffix} > hybrid_decode_stdout.txt 2>&1 &
+  -ngl {args.gpu_layers} {device_arg}{cache_suffix}{fit_suffix}{rope_suffix}{flash_kv_suffix}{mmproj_offload_suffix} > hybrid_decode_stdout.txt 2>&1 &
 decoder_pid=$!
 
 ./hybrid_vision_dump --encoder_path={shlex.quote(encoder_pte.name)} \\
@@ -2113,6 +2167,7 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
     fit_suffix = _fit_shell_suffix(args)
     rope_suffix = _rope_shell_suffix(args)
     flash_kv_suffix = _flash_attn_kv_shell_suffix(args)
+    mmproj_offload_suffix = _mmproj_offload_shell_suffix(args)
     ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     force_arg = "--force-generation" if args.force_generation else ""
     online_buffer_arg = "--online-buffer" if getattr(args, "online_buffer", False) else ""
@@ -2151,7 +2206,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
   --output foundation_output.txt --token-io-path foundation_token_io.txt \\
   -n {args.force_generation or args.n_predict}{ctx_dynamic_kv_suffix} -b {args.batch_size} -ub {args.ubatch_size} \\
   -ngl {args.gpu_layers} -t {args.threads} --temp {args.temperature} \\
-  {device_arg}{cache_suffix}{fit_suffix}{rope_suffix}{flash_kv_suffix} {force_arg} > {stdout_name} 2>&1 &
+  {device_arg}{cache_suffix}{fit_suffix}{rope_suffix}{flash_kv_suffix}{mmproj_offload_suffix} {force_arg} > {stdout_name} 2>&1 &
 runner_pid=$!
 
 {memory_loop}
@@ -2392,6 +2447,32 @@ def main() -> int:
         dest="no_kv_offload",
         help="Pass --no-kv-offload (-nkvo) to llama (standalone GPU/CPU and hybrid_decode).",
     )
+    parser.set_defaults(mmproj_offload=None)
+    parser.add_argument(
+        "--mmproj-offload",
+        action="store_true",
+        dest="mmproj_offload",
+        help="Force GPU offload for mtmd vision/mmproj. Defaults to enabled when multimodal input is used.",
+    )
+    parser.add_argument(
+        "--no-mmproj-offload",
+        action="store_false",
+        dest="mmproj_offload",
+        help="Run mtmd vision/mmproj on CPU while keeping the text decoder on the selected llama.cpp backend.",
+    )
+    parser.set_defaults(qwen_cpu_vision_fallback=False)
+    parser.add_argument(
+        "--qwen-cpu-vision-fallback",
+        action="store_true",
+        dest="qwen_cpu_vision_fallback",
+        help="For Qwen-VL hybrid runs, bypass QNN vision and use llama.cpp CPU mtmd vision/mmproj with the OpenCL decoder. Disabled by default.",
+    )
+    parser.add_argument(
+        "--no-qwen-cpu-vision-fallback",
+        action="store_false",
+        dest="qwen_cpu_vision_fallback",
+        help="Disable the Qwen-VL correctness fallback and run the QNN hybrid vision path.",
+    )
     parser.add_argument(
         "--disable-attn-kv-rotation",
         action="store_true",
@@ -2563,6 +2644,15 @@ def main() -> int:
             args.video = args.video.resolve()
         if args.streaming_video is not None:
             args.streaming_video = args.streaming_video.resolve()
+        if getattr(args, "qwen_cpu_vision_fallback", False) and _looks_like_qwen_vl(args):
+            print(
+                "[qwen-fallback] Qwen-VL hybrid correctness fallback enabled: "
+                "using llama.cpp CPU mtmd vision/mmproj with the OpenCL decoder."
+            )
+            args.processor = "gpu"
+            args.backend_mode = backend_mode_from_processor(args.processor)
+            args.vision_encoder = None
+            args.manifest = None
     elif _standalone_completion_mode(args):
         args.mmproj = None
         args.image = None
@@ -2658,11 +2748,16 @@ def main() -> int:
                 manifest = _load_manifest(args.manifest.resolve())
                 encoder_pte = Path(manifest["paths"]["vision_encoder_pte"])
             args.remote_encoder_pte = encoder_pte.name
+            args.vision_preprocess = _vision_preprocess_from_metadata(encoder_pte)
             streaming_bin = _find_executable(args.vision_build_dir, "hybrid_streaming_decode")
             if not streaming_bin.exists():
                 raise SystemExit("Missing hybrid_streaming_decode. Build hybrid_bridge first.")
             media = _prepare_media(args, Path(tmp))
-            warmup_bin, warmup_layout = prepare_warmup_image(args.warmup_image, Path(tmp))
+            warmup_bin, warmup_layout = prepare_warmup_image(
+                args.warmup_image,
+                Path(tmp),
+                **args.vision_preprocess,
+            )
             args.remote_warmup_bin = warmup_bin.name
             args.remote_warmup_layout_image = warmup_layout.name
             args.remote_warmup_embedding = "warmup_vision_embedding.svlmemb"
@@ -2693,7 +2788,11 @@ def main() -> int:
             streaming_mode = args.streaming_video is not None
             if not completion_mode:
                 media = _prepare_media(args, Path(tmp))
-                _, warmup_layout = prepare_warmup_image(args.warmup_image, Path(tmp))
+                _, warmup_layout = prepare_warmup_image(
+                    args.warmup_image,
+                    Path(tmp),
+                    **getattr(args, "vision_preprocess", {}),
+                )
                 args.remote_warmup_layout_image = warmup_layout.name
                 args.remote_prompt = media.prompt
                 args.remote_layout_images = [path.name for path in media.layout_images]
@@ -2731,7 +2830,11 @@ def main() -> int:
                 return run_res.returncode
             else:
                 llama_cli = _find_executable(args.llama_build_dir, "llama-mtmd-cli")
-                use_precise_phases = args.processor == "gpu" and _find_executable(args.llama_build_dir, "opencl_phase_mtmd").exists()
+                use_precise_phases = (
+                    args.processor == "gpu"
+                    and _find_executable(args.llama_build_dir, "opencl_phase_mtmd").exists()
+                    and not _looks_like_qwen_vl(args)
+                )
                 if not use_precise_phases and not llama_cli.exists():
                     raise SystemExit("Missing llama-mtmd-cli. Build llama.cpp first.")
                 chmod_targets = "llama-mtmd-cli"
