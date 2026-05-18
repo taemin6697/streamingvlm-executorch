@@ -45,6 +45,12 @@ User-facing CLI cleanup:
   frames from the latest buffer at processing start, and stale pending
   vision-prefill cache updates are coalesced.
 
+--latest-frame-only
+  Streaming vision-prefill cache-update policy. If a frame arrives while the
+  worker is already handling an older cache update or prompt, the new frame's
+  cache update is dropped. The next cache update starts only from a frame that
+  arrives after the worker becomes idle.
+
 --partial-vision-kv
   Hybrid vision-prefill preemption mode. If a prompt arrives while an image
   prefill cache update is running, the current image micro-batch is finished,
@@ -161,6 +167,7 @@ InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_sliding_window_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_4096_streaming_vision_prefill_kv16_dynamic_online
 InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic_partialkv
+InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic_online_latest_frame_only
 ```
 
 Each run directory is normalized into three report folders after finalization:
@@ -876,6 +883,14 @@ validated 2B Q8 hybrid run completed the `1024 -> 16384` grow in about
   processing start. In vision-prefill mode, pending stale cache-update jobs are
   coalesced so the worker spends time on the newest cache state instead of
   replaying every queued intermediate snapshot.
+
+--latest-frame-only
+  Streaming vision-prefill only. Frame cache updates arriving while the worker
+  is busy are dropped instead of queued. This differs from prompt preemption:
+  prompts may partially commit the current image KV before answering, but stale
+  frame cache updates are simply ignored. `stream_events.csv` records
+  `LatestFrameOnlyCacheDrop`, and `stream_buffer_summary.txt` records
+  `latest_frame_only=true` plus `latest_frame_only_dropped_cache_updates=N`.
 
 stream_events.csv
   Frame arrival, `OnDemandBufferUpdate`, prompt arrival, and prompt decode events.

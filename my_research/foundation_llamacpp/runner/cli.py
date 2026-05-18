@@ -1239,12 +1239,7 @@ def _rebase_phase_timeline_phases(phases: list[tuple[str, float, float, int]]) -
     ]
 
 
-def _phase_timeline_data(
-    output_dir: Path,
-    phase_rows: list[dict[str, str]],
-    *,
-    stream_time: bool = False,
-) -> tuple[list[tuple[str, float, float, int]], list[float], float, float]:
+def _phase_timeline_stream_origin(output_dir: Path, phase_rows: list[dict[str, str]]) -> tuple[float, float]:
     stream_origin_elapsed = min((_phase_float(row, "elapsed_s_start") for row in phase_rows), default=0.0)
     stream_origin_video = 0.0
     events_path = _result_artifact_path(output_dir, "stream_events.csv")
@@ -1258,6 +1253,16 @@ def _phase_timeline_data(
                 break
             except ValueError:
                 continue
+    return stream_origin_elapsed, stream_origin_video
+
+
+def _phase_timeline_data(
+    output_dir: Path,
+    phase_rows: list[dict[str, str]],
+    *,
+    stream_time: bool = False,
+) -> tuple[list[tuple[str, float, float, int]], list[float], float, float]:
+    stream_origin_elapsed, stream_origin_video = _phase_timeline_stream_origin(output_dir, phase_rows)
 
     def to_plot_time(elapsed_s: float) -> float:
         if not stream_time:
@@ -1305,6 +1310,37 @@ def _phase_timeline_data(
     return phases, prompt_markers, timeline_origin, timeline_end
 
 
+def _phase_timeline_prompt_start_markers(
+    output_dir: Path,
+    phase_rows: list[dict[str, str]],
+    *,
+    stream_time: bool,
+    timeline_origin: float,
+    timeline_end: float,
+) -> list[tuple[int, float]]:
+    if not stream_time:
+        return []
+    events_path = _result_artifact_path(output_dir, "stream_events.csv")
+    if not events_path.exists():
+        return []
+    stream_origin_elapsed, stream_origin_video = _phase_timeline_stream_origin(output_dir, phase_rows)
+    markers: list[tuple[int, float]] = []
+    for event_row in _read_csv_dicts(events_path):
+        if event_row.get("event") != "StreamDecode":
+            continue
+        try:
+            prompt_idx = int(event_row.get("prompt_idx", "-1") or -1)
+            elapsed_start = float(event_row.get("elapsed_s_start", "0") or 0)
+        except ValueError:
+            continue
+        if prompt_idx < 0:
+            continue
+        marker = elapsed_start - stream_origin_elapsed + stream_origin_video
+        if marker >= timeline_origin and marker <= timeline_end:
+            markers.append((prompt_idx, marker))
+    return markers
+
+
 def _phase_timeline_label_min_ms(name: str, *, stream_time: bool) -> float:
     return float("inf")
 
@@ -1324,6 +1360,13 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
     phases, prompt_markers, timeline_origin, timeline_end = _phase_timeline_data(output_dir, phase_rows, stream_time=stream_time)
     if not phases:
         return
+    prompt_start_markers = _phase_timeline_prompt_start_markers(
+        output_dir,
+        phase_rows,
+        stream_time=stream_time,
+        timeline_origin=timeline_origin,
+        timeline_end=timeline_end,
+    )
 
     visible = [name for name in PHASE_TIMELINE_VISIBLE if any(phase[0] == name for phase in phases)]
     y_for = {name: idx for idx, name in enumerate(visible)}
@@ -1386,6 +1429,20 @@ def _write_png_phase_timeline(output_dir: Path, phase_rows: list[dict[str, str]]
             va="bottom",
             fontsize=8,
             color="#2d3436",
+        )
+    for idx, marker in prompt_start_markers:
+        ax.axvline(marker, color="#d63031", linestyle=":", linewidth=1.15, alpha=0.9)
+        ax.text(
+            marker,
+            0.86,
+            f"Start {idx} @ {marker:.1f}s",
+            transform=ax.get_xaxis_transform(),
+            rotation=90,
+            ha="left",
+            va="bottom",
+            fontsize=8,
+            color="#d63031",
+            fontweight="bold",
         )
 
     ax.set_yticks(list(y_for.values()))
@@ -1652,6 +1709,7 @@ def _result_model_name(
     stream_mode: str | None = None,
     dynamic_kv_cache: bool = False,
     online_buffer: bool = False,
+    latest_frame_only: bool = False,
 ) -> str:
     suffix = "opencl" if processor == "gpu" else processor
     kv = _result_kv_suffix(cache_type_k, cache_type_v)
@@ -1670,7 +1728,8 @@ def _result_model_name(
         mid = ""
     dynamic = "_dynamic" if dynamic_kv_cache else ""
     online = "_online" if online_buffer else ""
-    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}{online}"
+    latest = "_latest_frame_only" if latest_frame_only else ""
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}{online}{latest}"
 
 
 def _find_executable(build_dir: Path, name: str) -> Path:
@@ -2057,6 +2116,7 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
     ctx_dynamic_kv_suffix = _ctx_dynamic_kv_shell_suffix(args)
     force_arg = "--force-generation" if args.force_generation else ""
     online_buffer_arg = "--online-buffer" if getattr(args, "online_buffer", False) else ""
+    latest_frame_only_arg = "--latest-frame-only" if getattr(args, "latest_frame_only", False) else ""
     partial_vision_kv_arg = "--partial-vision-kv" if getattr(args, "partial_vision_kv", False) else ""
     stream_mode_arg = f"--stream-mode {shlex.quote(args.stream_mode)}"
     media_mode_arg = f"--media-mode {shlex.quote('streaming' if args.streaming_video is not None else args.media_mode.value.replace('_', '-'))}"
@@ -2081,7 +2141,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
 {baseline_loop}
 
-./{runner_bin} {online_buffer_arg} {partial_vision_kv_arg} --runner ./opencl_phase_mtmd \\
+./{runner_bin} {online_buffer_arg} {latest_frame_only_arg} {partial_vision_kv_arg} --runner ./opencl_phase_mtmd \\
   {encoder_arg} {warmup_image_arg} \\
   {media_mode_arg} \\
   {stream_mode_arg} {window_sec_arg} {window_max_frames_arg} \\
@@ -2261,6 +2321,7 @@ def main() -> int:
         help="Streaming strategy for --streaming-video. Defaults to on-demand; --single-buffer remains an alias.",
     )
     parser.add_argument("--online-buffer", "--online_buffer", dest="online_buffer", action="store_true", help="Use latest-only online stream buffer semantics.")
+    parser.add_argument("--latest-frame-only", "--latest_frame_only", dest="latest_frame_only", action="store_true", help="For vision-prefill streaming, drop frame cache updates that arrive while the worker is busy so the next cache update starts only from a newly arrived frame.")
     parser.add_argument("--partial-vision-kv", "--partial_vision_kv", dest="partial_vision_kv", action="store_true", help="In vision-prefill streaming, commit the current image prefill chunk when a prompt preempts cache construction.")
     parser.add_argument("--num-segments", type=int, default=8, help="Uniform temporal samples for --video.")
     parser.add_argument("--sampling-fps", "--sampling_fps", dest="sampling_fps", type=float, default=None, help="Frame sampling FPS for --streaming-video.")
@@ -2568,6 +2629,7 @@ def main() -> int:
         stream_mode=getattr(args, "stream_mode", None),
         dynamic_kv_cache=getattr(args, "dynamic_kv_cache", False),
         online_buffer=getattr(args, "online_buffer", False),
+        latest_frame_only=getattr(args, "latest_frame_only", False),
     )
     result_dir.mkdir(parents=True, exist_ok=True)
     _clear_result_artifact_dirs(result_dir)

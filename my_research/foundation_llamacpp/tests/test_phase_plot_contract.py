@@ -70,6 +70,32 @@ def test_common_phase_timeline_writer_outputs_phase_timeline_for_stream_rows(tmp
     assert not (tmp_path / "streaming_phase_timeline.png").exists()
 
 
+def test_phase_timeline_reads_prompt_start_markers_from_stream_decode_events(tmp_path):
+    (tmp_path / "stream_events.csv").write_text(
+        "\n".join(
+            [
+                "event,frame_idx,prompt_idx,video_time_s,elapsed_s_start,elapsed_s_end,detail",
+                "StreamFrameEnqueue,0,-1,0,10.000000,10.000000,queued",
+                "StreamDecode,5,0,5,18.000000,19.000000,rc=0",
+                "StreamDecode,8,1,8,20.000000,21.000000,rc=0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    markers = runner_cli._phase_timeline_prompt_start_markers(
+        tmp_path,
+        [],
+        stream_time=True,
+        timeline_origin=0.0,
+        timeline_end=12.0,
+    )
+
+    assert [idx for idx, _marker in markers] == [0, 1]
+    assert [marker for _idx, marker in markers] == pytest.approx([8.0, 10.0])
+
+
 def test_vision_prefill_image_prefill_batch_rows_use_image_prefill_lane(tmp_path):
     rows = [
         _row("StreamPromptPrefill", 15.0, 15.0),

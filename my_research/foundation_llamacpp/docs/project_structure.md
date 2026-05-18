@@ -61,6 +61,11 @@ online buffer
   cadence; delayed work uses the latest frame/window at processing start and
   vision-prefill coalesces stale pending cache jobs.
 
+latest-frame-only
+  optional --latest-frame-only for streaming vision_prefill drops frame cache
+  updates that arrive while the worker is busy. The next cache update starts
+  from the next frame arrival after the worker becomes idle.
+
 partial vision prefill
   optional --partial-vision-kv for hybrid vision_prefill lets a prompt preempt
   image-prefill cache work after the current image micro-batch commits. The
@@ -149,7 +154,7 @@ Important responsibilities still in `cli.py`:
 - remote shell script construction for standalone and hybrid flows.
 - result directory naming.
 - streaming flag forwarding, including `--stream-mode`, `--online-buffer`,
-  `--dynamic-kv-cache`, and `--partial-vision-kv`.
+  `--latest-frame-only`, `--dynamic-kv-cache`, and `--partial-vision-kv`.
 - memory timeline shell snippets.
 - summary extraction from logs.
 - final artifact pulling and post-processing.
@@ -301,6 +306,12 @@ With `--online-buffer`, prompt/cache jobs do not freeze their selected frames at
 request timestamp. They read the latest buffered frame/window when the consumer
 actually starts the job, and stale pending vision-prefill cache updates are
 coalesced.
+
+With `--latest-frame-only`, frame cache updates use a stricter live-camera
+policy. A frame arriving while the consumer is busy with an older cache update
+or prompt does not queue a cache update. It is counted as
+`LatestFrameOnlyCacheDrop`; the next cache update can only start from a frame
+that arrives after the consumer becomes idle.
 
 In `--stream-mode sliding-window`, prompt events capture a selected list of
 sampled frames rather than one latest frame. The selection is bounded by
