@@ -1152,6 +1152,38 @@ python -m my_research.foundation.models.qwen2_5_vl.vision_encoder.export_qnn \
   --calibration-num 2
 ```
 
+Expected artifacts:
+
+```text
+my_research/foundation_llamacpp/results/vision_models/qwen2_5_vl_3b_vision_encoder_premerger_qnn_1024tok_sm8750/vision_encoder_qnn.pte
+my_research/foundation_llamacpp/results/vision_models/qwen2_5_vl_3b_vision_encoder_premerger_qnn_1024tok_sm8750/vision_encoder_qnn_metadata.json
+```
+
+Validated export metadata:
+
+```text
+patch_merger_included: false
+projector_included: false
+output_shape: [1, 1024, 1280]
+image_grid_thw: [1, 32, 32]
+token_count_check: actual_tokens=1024, expected_tokens=1024, passed=true
+```
+
+For a host export run that leaves room for other jobs while giving QNN lowering
+36 CPU cores, prefix the command with:
+
+```bash
+export OMP_NUM_THREADS=36
+export MKL_NUM_THREADS=36
+export OPENBLAS_NUM_THREADS=36
+export NUMEXPR_MAX_THREADS=36
+export NUMEXPR_NUM_THREADS=36
+export VECLIB_MAXIMUM_THREADS=36
+export MALLOC_ARENA_MAX=4
+
+taskset -c 0-35 python -m my_research.foundation.models.qwen2_5_vl.vision_encoder.export_qnn ...
+```
+
 Useful shape examples:
 
 ```text
