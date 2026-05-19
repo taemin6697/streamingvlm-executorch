@@ -57,6 +57,7 @@ PHASE_PLOT_ALIASES = {
     "VisionPrefillImagePrefill": "ImagePrefill",
     "VisionPrefillImagePrefillBatch": "ImagePrefill",
     "VisionPrefillT_Prefill": "T_Prefill",
+    "VisionPrefillTailReplayT_Prefill": "T_Prefill",
 }
 PHASE_PLOT_EXCLUDED = {
     "EmbeddingFileWrite",
@@ -78,6 +79,9 @@ PHASE_PLOT_EXCLUDED = {
     "VisionPrefillImageLoad",
     "VisionPrefillLayoutTokenize",
     "VisionPrefillSuffixTokenize",
+    "VisionPrefillTailReplayTokenize",
+    "VisionPrefillVideoPrefixRestore",
+    "VisionPrefillVideoPrefixSave",
     *DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values(),
 }
 PHASE_TIMELINE_VISIBLE = [
