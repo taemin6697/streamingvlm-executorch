@@ -13,7 +13,9 @@ the current on-demand/sliding-window/KV vision-prefill details live in
 vision-prefill KV preemption details live in
 `archive/partial_vision_prefill_kv.md`. Future video-compression KV/RoPE
 repositioning notes live in
-`archive/kv_rope_reposition_for_video_compression.md`.
+`archive/kv_rope_reposition_for_video_compression.md`. The current
+model/prompt-policy/KV extension refactor is summarized in
+`archive/streaming_research_refactor_model_policy_kv.md`.
 
 ## Current Baseline
 
@@ -67,6 +69,13 @@ User-facing CLI cleanup:
   forward with `llama_memory_seq_add`. This is a KV/RoPE reposition experiment
   for future video compression; it preserves text/chat KV and compacts vision
   spans only.
+
+--prompt-format internvl3|qwen2_5_vl
+  Prompt layout profile used by media manifests and streaming frame-prefix
+  generation. `internvl3` is the current validated baseline. `qwen2_5_vl`
+  is registered as an extension boundary so future Qwen/Gemma support can
+  change prompt, media marker, and M-RoPE policy without touching streaming
+  scheduling code.
 ```
 
 ## Common Setup

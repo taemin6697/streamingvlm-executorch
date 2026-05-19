@@ -16,6 +16,28 @@ struct KvTokenRange {
   }
 };
 
+enum class KvPositionEncodingKind {
+  Rope1D,
+  MRope,
+};
+
+struct KvRepositionStrategy {
+  KvPositionEncodingKind position_encoding = KvPositionEncodingKind::Rope1D;
+  bool requires_k_shift_rebuild = true;
+  bool supports_axis_aware_rewrite = false;
+};
+
+inline KvRepositionStrategy rope_1d_reposition_strategy() {
+  return KvRepositionStrategy{KvPositionEncodingKind::Rope1D, true, false};
+}
+
+inline KvRepositionStrategy mrope_reposition_strategy_placeholder() {
+  // Future Qwen-style M-RoPE support should preserve per-axis position metadata
+  // before shifting/reapplying cached K. The current bridge only performs the
+  // llama.cpp linear position shift used by 1D RoPE models such as InternVL3.
+  return KvRepositionStrategy{KvPositionEncodingKind::MRope, true, true};
+}
+
 struct KvTailCompactionPlan {
   KvTokenRange removed;
   llama_pos sequence_end = 0;

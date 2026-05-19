@@ -76,6 +76,13 @@ KV/RoPE reposition
   records committed frame vision-KV spans, removes older spans with
   llama_memory_seq_rm, and shifts later cached tokens with llama_memory_seq_add.
   This is the current streaming hook for future video compression experiments.
+
+prompt and policy profiles
+  runner/prompt_formats.py owns host-side media prompt layouts;
+  hybrid_bridge/streaming_prompt_format.hpp owns Android streaming frame-prefix
+  layouts; hybrid_bridge/streaming_policy.hpp owns on-demand/sliding-window/
+  vision-prefill frame selection. New model families should extend these
+  boundaries instead of adding model-specific logic inside scheduling loops.
 ```
 
 ## Top-Level Layout
@@ -124,6 +131,7 @@ my_research/foundation_llamacpp/runner/
   cli.py
   config.py
   media.py
+  prompt_formats.py
   remote.py
   artifacts.py
   finalize.py
@@ -168,6 +176,8 @@ Important responsibilities still in `cli.py`:
   align them to the `streaming_phase_stats.csv` `clock_origin_ms`, split the
   aggregate `Prefill` row around `DynamicKVGrow`, and clip retry-side
   `ImagePrefill` timing so grow/retry overhead is shown as the black grow bar.
+- prompt format forwarding through `--prompt-format` so media manifests and
+  Android streaming frame-prefix generation use the same model-family profile.
 
 ### `runner/config.py`
 
@@ -217,6 +227,12 @@ that are all presented to the model at once.
 
 `media.py` owns image and video preparation.
 
+Prompt layout is intentionally delegated to `runner/prompt_formats.py`.
+InternVL3 remains the default validated profile, while Qwen2.5-VL is registered
+as a named profile for future expansion. The media preparer writes
+`prompt_format` into `media_manifest.json`, so the Android bridge can use the
+same family profile for streaming prompt-prefix updates.
+
 For image mode:
 
 ```text
@@ -258,6 +274,47 @@ layout_images: images used for mtmd prompt layout
 frames: per-frame tile metadata for video
 prompt: final media-expanded prompt
 raw_prompt: original user prompt for video
+prompt_format: model-family prompt profile name, e.g. internvl3
+```
+
+### `runner/prompt_formats.py`
+
+`prompt_formats.py` is the host-side extension boundary for model-family prompt
+layouts:
+
+```text
+normalize_prompt_format()
+get_prompt_formatter()
+PromptFormatter.image_prompt()
+PromptFormatter.multi_image_prompt()
+PromptFormatter.video_prompt()
+```
+
+Add a new model family here when the Python media manifest needs a different
+image marker, multi-image prefix, or video frame prefix. Do not thread new
+model-specific prompt strings through `cli.py`.
+
+## C++ Bridge Helpers
+
+The Android streaming bridge now has small header-only boundaries for extension
+points that used to be embedded in `hybrid_streaming_decode.cpp`:
+
+```text
+hybrid_bridge/streaming_prompt_format.hpp
+  PromptFormatProfile and frame-prefix helpers. This mirrors the Python
+  prompt-format registry for Android streaming and marks Qwen2.5-VL as an
+  M-RoPE-using family.
+
+hybrid_bridge/streaming_policy.hpp
+  StreamingPolicyConfig and frame selection for on-demand, sliding-window, and
+  vision-prefill. Add new streaming research policies here first, then call
+  them from the consumer loop.
+
+hybrid_bridge/kv_reposition.hpp
+  KV span planning and the first KvRepositionStrategy boundary. Current
+  InternVL3 uses 1D RoPE shift through llama.cpp K-shift; future Qwen/Gemma
+  M-RoPE support should add axis-aware position metadata and rewrite policy
+  behind the strategy boundary.
 ```
 
 For hybrid video with `--num-segments 8 --max-num 1`, the expected QNN bridge

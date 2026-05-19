@@ -21,6 +21,7 @@ from my_research.foundation_llamacpp.runner.config import (
     backend_mode_from_processor,
     media_mode_from_args,
 )
+from my_research.foundation_llamacpp.runner.media import normalize_prompt_format
 from my_research.foundation_llamacpp.runner.media import normalize_stream_mode
 from my_research.foundation_llamacpp.runner.media import prepare_media
 from my_research.foundation_llamacpp.runner.media import prepare_warmup_image
@@ -2202,6 +2203,7 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
         else ""
     )
     stream_mode_arg = f"--stream-mode {shlex.quote(args.stream_mode)}"
+    prompt_format_arg = f"--prompt-format {shlex.quote(args.prompt_format)}"
     media_mode_arg = f"--media-mode {shlex.quote('streaming' if args.streaming_video is not None else args.media_mode.value.replace('_', '-'))}"
     window_sec_arg = f"--window-sec {args.window_sec}" if args.window_sec is not None else ""
     window_max_frames_arg = f"--window-max-frames {args.window_max_frames}"
@@ -2227,7 +2229,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 ./{runner_bin} {online_buffer_arg} {latest_frame_only_arg} {partial_vision_kv_arg} {kv_reposition_arg} --runner ./opencl_phase_mtmd \\
   {encoder_arg} {warmup_image_arg} \\
   {media_mode_arg} \\
-  {stream_mode_arg} {window_sec_arg} {window_max_frames_arg} \\
+  {stream_mode_arg} {prompt_format_arg} {window_sec_arg} {window_max_frames_arg} \\
   -m {shlex.quote(args.model.name)} --mmproj {shlex.quote(args.mmproj.name)} \\
   --stream-manifest media_manifest.json \\
   --stream-events-path stream_events.csv --phase-stats-path streaming_phase_stats.csv \\
@@ -2415,6 +2417,14 @@ def main() -> int:
     parser.add_argument("--time", default=None, help="JSON list of prompt timestamps for --streaming-video, e.g. '[5.0, 10.0]'.")
     parser.add_argument("--max-num", type=int, default=1, help="Max InternVL dynamic-preprocess tiles per sampled video frame.")
     parser.add_argument("--prompt", default="Describe this image briefly.")
+    parser.add_argument(
+        "--prompt-format",
+        "--prompt_format",
+        dest="prompt_format",
+        default="internvl3",
+        choices=("internvl3", "qwen2_5_vl", "qwen2.5-vl", "qwen2-5-vl"),
+        help="Model-family prompt layout profile used in media manifests and streaming frame prefixes.",
+    )
     parser.add_argument("--n-predict", "--max-new-tokens", dest="n_predict", type=int, default=32)
     parser.add_argument(
         "--force-generation",
@@ -2620,6 +2630,10 @@ def main() -> int:
 
     args.remote_root = args.remote_root.rstrip("/")
     args.baseline_window = max(args.baseline_window, 0.0)
+    try:
+        args.prompt_format = normalize_prompt_format(args.prompt_format)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     args.model = args.model.resolve()
     args.warmup_image = args.warmup_image.resolve()
     if args.vision_encoder is not None:

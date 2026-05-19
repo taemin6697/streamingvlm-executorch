@@ -20,7 +20,20 @@ Hybrid bridge prototype:
   float32 embedding file.
 - `hybrid_decode` runs llama.cpp with OpenCL and injects that external
   embedding through the public mtmd helper path.
+- `hybrid_streaming_decode` is the current unified hybrid path for image,
+  multi-image, offline video, and streaming runs.
 - `run_android_hybrid_bridge.py` orchestrates the split process on Android.
+
+Current extension boundaries:
+
+- `runner/prompt_formats.py` owns host-side model-family prompt layouts.
+- `hybrid_bridge/streaming_prompt_format.hpp` mirrors that profile boundary for
+  Android streaming frame-prefix updates.
+- `hybrid_bridge/streaming_policy.hpp` owns streaming frame selection policies.
+- `hybrid_bridge/kv_reposition.hpp` owns KV/RoPE rewrite helpers and now marks
+  the future M-RoPE strategy boundary.
+- `scripts/run_refactor_regression_internvl_1b2b.sh` runs the targeted
+  InternVL3 1B/2B regression matrix for this research path.
 
 Use the runner to collect:
 
