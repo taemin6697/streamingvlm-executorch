@@ -3246,7 +3246,7 @@ int main(int argc, char** argv) {
   }
   args.stream_mode = normalize_stream_mode(args.stream_mode, args.single_buffer);
   args.single_buffer = args.stream_mode == "on_demand";
-  if (args.kv_reposition_keep_latest_frames > 0) {
+  if (args.stream_mode == "vision_prefill") {
     setenv("LLAMA_ALLOW_KV_GAP_FILL", "1", 1);
   }
   if (manifest.frames.empty()) {
