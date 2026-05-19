@@ -17,12 +17,16 @@ would be too expensive, so the cache needs a KV-level reposition operation.
 llama.cpp already exposes the needed primitive for one-dimensional RoPE models:
 
 ```cpp
+llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 llama_memory_seq_rm(mem, seq_id, p0, p1);
 llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 ```
 
-`seq_rm` removes a logical position range from the sequence. `seq_add` changes
-the logical position metadata of remaining tokens. Internally, changing
+`seq_cp` can add another sequence id to existing KV cells without copying data
+when both sequences share the same KV stream. This is used as a temporary
+parking lane for append-only-safe insertion. `seq_rm` removes a logical position
+range from the sequence. `seq_add` changes the logical position metadata of
+remaining tokens. Internally, changing
 positions marks KV cells as shifted. On the next memory update/decode,
 `llama_kv_cache::build_rope_shift()` applies the corresponding RoPE delta to
 the cached K tensor.
@@ -73,6 +77,29 @@ build_rewrite_compaction_plan(KvTokenRange{128, 384}, 32, 1024, &plan, &error);
 ```
 
 That removes `[160, 384)` and shifts the tail by `-224`.
+
+The same helper also contains `KvTailParkingPlan` for inserting a late frame
+into the already-closed video prefix. Directly shifting the tail right and then
+decoding into the gap does not work with llama.cpp because `llama_decode()`
+requires the next batch for a sequence to start at `seq_pos_max + 1`. The safe
+sequence is therefore:
+
+```text
+seq_cp(seq0 -> seq1, tail)
+seq_rm(seq0, tail)
+decode inserted frame at the old video-prefix end in seq0
+seq_add(seq1, tail, inserted_len)
+seq_cp(seq1 -> seq0, shifted_tail)
+seq_rm(seq1, all)
+```
+
+This keeps the physical KV for the old user/assistant tail, but changes its
+logical RoPE positions after the new frame KV has been appended. This path is
+kept as a helper for future non-dynamic or multi-sequence experiments. The
+current dynamic-KV prototype only supports one non-unified sequence, so the
+streaming implementation uses a different runtime strategy: it stores a
+host-format snapshot of the open video-prefix KV, appends late frames to that
+prefix, and replays only the small text tail before saving the new cache.
 
 ## Host Probe
 
@@ -146,6 +173,41 @@ span it builds a tail compaction plan, calls `llama_memory_seq_rm()` for the
 removed range, calls `llama_memory_seq_add()` to shift the later cached tokens,
 updates `ctx.n_past`, then saves the compacted cache snapshot. The removed
 range is vision KV only; closed user/assistant text KV is preserved and shifted.
+
+For a frame that arrives after the first user video turn has already been
+closed, the dynamic-KV streaming path uses a video-prefix snapshot rather than
+direct middle insertion:
+
+```text
+prompt time:
+  save host-format KV state for the open video prefix
+  prefill the question suffix and decode the answer
+
+late frame time:
+  restore the saved video-prefix KV
+  append the new frame's vision KV at the prefix end
+  compact older frame KV if keep_latest_frames requires it
+  save the updated video-prefix snapshot
+  replay only the cached text tail, not the old vision KV
+```
+
+This produces the intended logical prompt layout:
+
+```text
+<|im_start|>user
+Frame1: <image>
+Frame2: <image>
+Frame3: <image>
+What is this situation?
+<|im_end|>
+<|im_start|>assistant
+...
+<|im_end|>
+<|im_start|>user
+What did I ask earlier???
+<|im_end|>
+<|im_start|>assistant
+```
 
 This is intentionally separate from the frame scheduling policy:
 

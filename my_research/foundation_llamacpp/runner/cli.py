@@ -86,6 +86,8 @@ PHASE_TIMELINE_VISIBLE = [
     "Mmproj",
     "ImagePrefill",
     "T_Prefill",
+    "KVRepositionInsert",
+    "KVRepositionTailRestore",
     "KVRepositionCompact",
     "DynamicKVGrow",
     "Decode",
