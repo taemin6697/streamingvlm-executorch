@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -821,6 +822,10 @@ struct VisionPrefillCache {
   std::vector<common_chat_msg> chat_history;
   std::string open_user_content;
   bool open_user_prefix = false;
+  std::string prefill_trace_body;
+  std::string prefill_trace_flat;
+  std::size_t prefill_trace_next_chunk_idx = 0;
+  std::size_t prefill_trace_next_image_idx = 0;
   std::vector<uint8_t> state;
   std::vector<uint8_t> host_state;
   llama_state_seq_flags state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
@@ -990,6 +995,89 @@ bool build_formatted_question_suffix(
   return split_formatted_at_question_sentinel(format_user_message_for_current_history(ctx, content), nullptr, &out);
 }
 
+struct RenderedPrefillTrace {
+  std::string body;
+  std::string flat;
+  std::size_t next_chunk_idx = 0;
+  std::size_t next_image_idx = 0;
+};
+
+RenderedPrefillTrace render_prefill_trace_for_chunks(
+    decode_context& ctx,
+    mtmd::input_chunks& chunks,
+    std::size_t chunk_idx_offset = 0,
+    std::size_t image_idx_offset = 0,
+    const std::vector<std::size_t>* visible_image_tokens = nullptr,
+    std::size_t max_committed_chunks = std::numeric_limits<std::size_t>::max()) {
+  RenderedPrefillTrace rendered;
+  rendered.next_chunk_idx = chunk_idx_offset;
+  rendered.next_image_idx = image_idx_offset;
+  const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+  const size_t n_visible_chunks = std::min(n_chunks, max_committed_chunks);
+  std::size_t image_visible_idx = 0;
+
+  for (size_t ci = 0; ci < n_visible_chunks; ++ci) {
+    const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks.ptr.get(), ci);
+    const auto ctype = mtmd_input_chunk_get_type(ch);
+    if (ctype == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+      size_t nt = 0;
+      const llama_token* toks = mtmd_input_chunk_get_tokens_text(ch, &nt);
+      rendered.body += "## CHUNK " + std::to_string(rendered.next_chunk_idx) +
+                       " TEXT n_tokens=" + std::to_string(nt) + "\n";
+      for (size_t ti = 0; ti < nt; ++ti) {
+        const std::string piece = common_token_to_piece(ctx.lctx, toks[ti], true);
+        const std::string esc = streamingvlm::hybrid_bridge::inference_trace_collector::escape_piece_str(piece);
+        const std::string line = std::to_string(static_cast<long long>(toks[ti])) + "\t" + esc + "\n";
+        rendered.body += line;
+        rendered.flat += line;
+      }
+      ++rendered.next_chunk_idx;
+    } else if (ctype == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+      const std::size_t nominal_tokens = mtmd_input_chunk_get_n_tokens(ch);
+      std::size_t visible_tokens = nominal_tokens;
+      if (visible_image_tokens != nullptr) {
+        if (image_visible_idx >= visible_image_tokens->size()) {
+          break;
+        }
+        visible_tokens = std::min<std::size_t>((*visible_image_tokens)[image_visible_idx], nominal_tokens);
+      }
+      ++image_visible_idx;
+      if (visible_tokens == 0) {
+        break;
+      }
+      rendered.body += "## CHUNK " + std::to_string(rendered.next_chunk_idx) +
+                       " IMAGE image_index=" + std::to_string(rendered.next_image_idx + 1) +
+                       " n_placeholder_tokens=" + std::to_string(visible_tokens);
+      if (visible_tokens != nominal_tokens) {
+        rendered.body += " nominal_placeholder_tokens=" + std::to_string(nominal_tokens);
+      }
+      const char* cid = mtmd_input_chunk_get_id(ch);
+      if (cid != nullptr && cid[0]) {
+        rendered.body += std::string(" mtmd_chunk_id=") + cid;
+      }
+      rendered.body += "\n";
+      for (std::size_t slot_i = 0; slot_i < visible_tokens; ++slot_i) {
+        const std::string piece =
+            streamingvlm::hybrid_bridge::inference_trace_collector::vision_slot_piece(slot_i + 1);
+        const std::string line = std::string("-1\t") + piece + "\n";
+        rendered.body += line;
+        rendered.flat += line;
+      }
+      rendered.body += "# (each slot: projected vision embedding into decoder KV; not a BPE vocab id)\n";
+      ++rendered.next_chunk_idx;
+      ++rendered.next_image_idx;
+    }
+  }
+  return rendered;
+}
+
+void append_rendered_trace_to_cache(VisionPrefillCache& cache, const RenderedPrefillTrace& trace) {
+  cache.prefill_trace_body += trace.body;
+  cache.prefill_trace_flat += trace.flat;
+  cache.prefill_trace_next_chunk_idx = trace.next_chunk_idx;
+  cache.prefill_trace_next_image_idx = trace.next_image_idx;
+}
+
 bool eval_streaming_chunks_with_external_embedding(
     decode_context& ctx,
     mtmd::input_chunks& chunks,
@@ -1107,7 +1195,9 @@ bool eval_streaming_chunks_with_on_demand_vision(
     bool allow_partial_image_commit = false,
     bool* partial_image_committed = nullptr,
     const std::atomic<int>* pending_prompt_jobs = nullptr,
-    bool* preempted = nullptr) {
+    bool* preempted = nullptr,
+    std::vector<std::size_t>* committed_image_tokens = nullptr,
+    std::size_t* committed_chunk_count = nullptr) {
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
   bool used_image = false;
   size_t image_chunk_idx = 0;
@@ -1116,6 +1206,23 @@ bool eval_streaming_chunks_with_on_demand_vision(
   if (partial_image_committed != nullptr) {
     *partial_image_committed = false;
   }
+  if (committed_image_tokens != nullptr) {
+    committed_image_tokens->clear();
+  }
+  if (committed_chunk_count != nullptr) {
+    *committed_chunk_count = 0;
+  }
+  auto mark_committed_chunk = [&](std::size_t count) {
+    if (committed_chunk_count != nullptr) {
+      *committed_chunk_count = std::max(*committed_chunk_count, count);
+    }
+  };
+  auto record_committed_image_tokens = [&](llama_pos before, llama_pos after) {
+    if (committed_image_tokens == nullptr || after <= before) {
+      return;
+    }
+    committed_image_tokens->push_back(static_cast<std::size_t>(after - before));
+  };
   auto preempt = [&]() {
     if (!cache_preempt_requested(pending_prompt_jobs)) {
       return false;
@@ -1176,6 +1283,7 @@ bool eval_streaming_chunks_with_on_demand_vision(
       if (!eval_text_chunk(drain_chunk, logits_last && drain_idx == n_chunks - 1)) {
         return false;
       }
+      mark_committed_chunk(drain_idx + 1);
     }
     return true;
   };
@@ -1293,6 +1401,8 @@ bool eval_streaming_chunks_with_on_demand_vision(
         if (allow_partial_image_commit && new_n_past > image_n_past_before) {
           ctx.n_past = new_n_past;
           llm_state_mutated = true;
+          record_committed_image_tokens(image_n_past_before, new_n_past);
+          mark_committed_chunk(i + 1);
           if (!drain_text_chunks_after_partial_image(i + 1)) {
             return false;
           }
@@ -1308,6 +1418,8 @@ bool eval_streaming_chunks_with_on_demand_vision(
       }
       ctx.n_past = new_n_past;
       llm_state_mutated = true;
+      record_committed_image_tokens(image_n_past_before, new_n_past);
+      mark_committed_chunk(i + 1);
       embeddings.finish();
       used_image = true;
       ++image_chunk_idx;
@@ -1328,6 +1440,7 @@ bool eval_streaming_chunks_with_on_demand_vision(
         return false;
       }
       new_n_past = ctx.n_past;
+      mark_committed_chunk(i + 1);
       if (allow_partial_image_commit) {
         if (!next_chunk_is_image(i) && commit_partial_cache_preempt()) {
           return false;
@@ -1598,6 +1711,12 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     }
     next_cache.open_user_content = cache.open_user_content + formatted_prefix;
     next_cache.open_user_prefix = true;
+    if (cache.open_user_prefix) {
+      next_cache.prefill_trace_body = cache.prefill_trace_body;
+      next_cache.prefill_trace_flat = cache.prefill_trace_flat;
+      next_cache.prefill_trace_next_chunk_idx = cache.prefill_trace_next_chunk_idx;
+      next_cache.prefill_trace_next_image_idx = cache.prefill_trace_next_image_idx;
+    }
     if (!cache.open_user_prefix) {
       next_cache.open_user_content = formatted_prefix;
       if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
@@ -1664,6 +1783,8 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
 
   bool preempted = false;
   bool partial_image_committed = false;
+  std::vector<std::size_t> committed_image_tokens;
+  std::size_t committed_chunk_count = 0;
   const int32_t image_prefill_batch_size = std::max(1, args.ubatch_size);
   if (!eval_streaming_chunks_with_on_demand_vision(
           ctx,
@@ -1683,9 +1804,20 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
           args.partial_vision_kv,
           &partial_image_committed,
           pending_prompt_jobs,
-          &preempted)) {
+          &preempted,
+          &committed_image_tokens,
+          &committed_chunk_count)) {
     if (preempted) {
       if (partial_image_committed) {
+        append_rendered_trace_to_cache(
+            next_cache,
+            render_prefill_trace_for_chunks(
+                ctx,
+                chunks,
+                next_cache.prefill_trace_next_chunk_idx,
+                next_cache.prefill_trace_next_image_idx,
+                &committed_image_tokens,
+                committed_chunk_count));
         if (!save_vision_prefill_cache_state(ctx, next_cache, cache_phases, args.partial_vision_kv)) {
           cache = std::move(next_cache);
           return VisionPrefillCacheBuildStatus::Failed;
@@ -1703,6 +1835,15 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     cache = std::move(next_cache);
     return VisionPrefillCacheBuildStatus::Failed;
   }
+  append_rendered_trace_to_cache(
+      next_cache,
+      render_prefill_trace_for_chunks(
+          ctx,
+          chunks,
+          next_cache.prefill_trace_next_chunk_idx,
+          next_cache.prefill_trace_next_image_idx,
+          &committed_image_tokens,
+          committed_chunk_count));
   if (cache_preempt_requested(pending_prompt_jobs) && !args.partial_vision_kv) {
     if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, true)) {
       return VisionPrefillCacheBuildStatus::Failed;
@@ -1771,14 +1912,27 @@ int run_vision_prefill_prompt_from_committed_cache(
     if (suffix_ready) {
       mtmd::bitmaps empty_bitmaps;
       mtmd::input_chunks suffix_chunks(mtmd_input_chunks_init());
-      if (tokenize_formatted_text(
+      const bool tokenized_suffix = tokenize_formatted_text(
               ctx,
               suffix,
               empty_bitmaps,
               add_special,
               prompt_phases,
               "VisionPrefillSuffixTokenize",
-              suffix_chunks) &&
+              suffix_chunks);
+      if (tokenized_suffix && trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+        trace_writer->write_prefill_header();
+        trace_writer->append_prefill_trace_body(
+            vision_cache->prefill_trace_body,
+            vision_cache->prefill_trace_flat);
+        const RenderedPrefillTrace suffix_trace = render_prefill_trace_for_chunks(
+            ctx,
+            suffix_chunks,
+            vision_cache->prefill_trace_next_chunk_idx,
+            vision_cache->prefill_trace_next_image_idx);
+        trace_writer->append_prefill_trace_body(suffix_trace.body, suffix_trace.flat);
+      }
+      if (tokenized_suffix &&
           eval_streaming_chunks_with_external_embedding(
               ctx,
               suffix_chunks,
@@ -1799,6 +1953,10 @@ int run_vision_prefill_prompt_from_committed_cache(
         vision_cache->images = images;
         vision_cache->open_user_prefix = false;
         vision_cache->open_user_content.clear();
+        vision_cache->prefill_trace_body.clear();
+        vision_cache->prefill_trace_flat.clear();
+        vision_cache->prefill_trace_next_chunk_idx = 0;
+        vision_cache->prefill_trace_next_image_idx = 0;
         if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, args.partial_vision_kv)) {
           rc = 1;
         } else {

@@ -77,25 +77,47 @@ struct inference_trace_collector {
     }
   }
 
+  void append_prefill_trace_body(const std::string& body, const std::string& flat) {
+    if (!out.is_open()) return;
+    out << body;
+    prefill_flat_ += flat;
+    in_decode_ = false;
+  }
+
   void chunk_image_begin(std::size_t idx, std::size_t n_tok, const char* cid) {
     chunk_image_begin(idx, n_tok, cid, 0);
   }
 
   void chunk_image_begin(std::size_t idx, std::size_t n_tok, const char* cid, std::size_t image_idx) {
+    chunk_image_begin_visible(idx, n_tok, n_tok, cid, image_idx);
+  }
+
+  void chunk_image_begin_visible(
+      std::size_t idx,
+      std::size_t visible_tok,
+      std::size_t nominal_tok,
+      const char* cid,
+      std::size_t image_idx) {
     if (!out.is_open()) return;
     out << "## CHUNK " << idx << " IMAGE image_index=" << (image_idx + 1)
-        << " n_placeholder_tokens=" << n_tok;
+        << " n_placeholder_tokens=" << visible_tok;
+    if (nominal_tok != visible_tok) {
+      out << " nominal_placeholder_tokens=" << nominal_tok;
+    }
     if (cid != nullptr && cid[0]) {
       out << " mtmd_chunk_id=" << cid;
     }
     out << "\n";
-    for (size_t i = 0; i < n_tok; ++i) {
-      const std::string piece =
-          "<VISION_KV_SLOT " + std::to_string(i + 1) + "/" + std::to_string(n_tok) + ">";
+    for (size_t i = 0; i < visible_tok; ++i) {
+      const std::string piece = vision_slot_piece(i + 1);
       out << static_cast<long long>(-1) << '\t' << piece << '\n';
       prefill_flat_ += std::string("-1\t") + piece + "\n";
     }
     out << "# (each slot: projected vision embedding into decoder KV; not a BPE vocab id)\n";
+  }
+
+  static std::string vision_slot_piece(std::size_t one_based_idx) {
+    return "<VISION_KV_SLOT " + std::to_string(one_based_idx) + ">";
   }
 
   void decode_header() {

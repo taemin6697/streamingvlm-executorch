@@ -15,6 +15,7 @@ def test_organize_result_artifacts_moves_run_files_into_three_folders(tmp_path):
         "phase_timeline.png": "png-bytes",
         "foundation_output.txt": "assistant output",
         "media_manifest.json": "{}\n",
+        "run_command.txt": "python3 run_android_hybrid_bridge.py --processor hybrid\n",
         "vision_embedding.svlmemb": "raw embedding",
     }.items():
         (result_dir / name).write_text(text, encoding="utf-8")
@@ -25,6 +26,7 @@ def test_organize_result_artifacts_moves_run_files_into_three_folders(tmp_path):
     assert (result_dir / "png" / "phase_timeline.png").exists()
     assert (result_dir / "txt_json" / "foundation_output.txt").exists()
     assert (result_dir / "txt_json" / "media_manifest.json").exists()
+    assert (result_dir / "txt_json" / "run_command.txt").exists()
     assert (result_dir / "txt_json" / "vision_embedding.svlmemb").exists()
     assert sorted(path.name for path in result_dir.iterdir()) == ["csv", "png", "txt_json"]
 

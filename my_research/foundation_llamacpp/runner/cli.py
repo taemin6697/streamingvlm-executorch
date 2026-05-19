@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -121,6 +122,11 @@ def _organize_result_artifacts(result_dir: Path) -> None:
         if destination.exists():
             destination.unlink()
         path.replace(destination)
+
+
+def _write_run_command_artifact(result_dir: Path, argv: list[str]) -> None:
+    command = " ".join(shlex.quote(part) for part in argv)
+    (result_dir / "run_command.txt").write_text(command + "\n", encoding="utf-8")
 
 
 def _standalone_completion_mode(args: argparse.Namespace) -> bool:
@@ -2825,6 +2831,7 @@ def main() -> int:
                 _pull_outputs(adb, args.remote_root, result_dir, pull_names)
                 if not (result_dir / "foundation_exit_code.txt").exists():
                     (result_dir / "foundation_exit_code.txt").write_text(str(run_res.returncode), encoding="utf-8")
+                _write_run_command_artifact(result_dir, sys.argv)
                 _finalize_hybrid_streaming_outputs(result_dir)
                 _organize_result_artifacts(result_dir)
                 return run_res.returncode
@@ -2851,6 +2858,7 @@ def main() -> int:
     _pull_outputs(adb, args.remote_root, result_dir, pull_names)
     if not (result_dir / "foundation_exit_code.txt").exists():
         (result_dir / "foundation_exit_code.txt").write_text(str(run_res.returncode), encoding="utf-8")
+    _write_run_command_artifact(result_dir, sys.argv)
     return_code = (result_dir / "foundation_exit_code.txt").read_text(encoding="utf-8").strip()
 
     if args.processor == "hybrid":

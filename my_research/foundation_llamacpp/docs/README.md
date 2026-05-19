@@ -201,6 +201,10 @@ txt_json/foundation_inference_tokens.txt
 txt_json/stream_inference_tokens_<idx>.txt
   Per-turn raw token traces for streaming mode.
 
+txt_json/run_command.txt
+  Exact host-side command used for this run. This is written for image,
+  multi-image, video, and streaming runs before artifacts are grouped.
+
 csv/foundation_proc.csv
   Canonical phase timing CSV. Dynamic KV runs add `DynamicKVGrow` rows when
   physical KV capacity increases. For these rows, `kv_pos` is the old cell
@@ -954,6 +958,16 @@ Partial vision-prefill scheduling
   and uncommitted visual placeholder slots are not counted as present. For a
   256-token InternVL3 image and `--ubatch-size 64`, the cache can be visible to
   the prompt after 64, 128, 192, or 256 image tokens.
+
+Token trace contract
+  `foundation_inference_tokens.txt` and `stream_inference_tokens_<idx>.txt`
+  show mtmd prefill chunks followed by decode tokens. Vision-prefill cache
+  prompt turns replay the committed cached visual prefix into this trace before
+  the question suffix, so cached image KV is visible in the same sequential
+  order as on-demand/sliding-window prompts. Image slots are emitted as
+  `<VISION_KV_SLOT N>`; partial image commits emit only the committed slots and
+  add `nominal_placeholder_tokens=256` when fewer than the full image token
+  count was committed.
 ```
 
 Example sliding-window run:
@@ -1024,6 +1038,37 @@ with `foundation_exit_code.txt=0`, fifteen `VisionPrefillCacheBuild` rows, four
 `VisionPrefillV_Encode` / `VisionPrefillImagePrefill` rows for fifteen sampled
 frames. Prompt 1 answered that the previous question was about the red panda's
 activity, confirming chat history is preserved.
+
+### Merge Regression Script
+
+Before merging feature branches that touch prompt formatting, media handoff,
+streaming scheduling, KV cache behavior, or token tracing, run:
+
+```bash
+my_research/foundation_llamacpp/scripts/run_merge_regression_internvl_qwen.sh
+```
+
+The script runs InternVL3-1B and Qwen2.5-VL-3B through single image,
+multi-image, offline video, streaming on-demand, streaming sliding-window, and
+streaming vision-prefill. Streaming runs use dynamic KV growth,
+`--online-buffer`, a small `--ubatch-size`, and for vision-prefill also
+`--partial-vision-kv` plus `--latest-frame-only`.
+
+By default it writes under:
+
+```text
+my_research/foundation_llamacpp/results/log/merge_regression_internvl_qwen_<timestamp>/
+```
+
+The script intentionally avoids pushing model artifacts. Populate the remote
+root once, or point each model family at its cached remote root:
+
+```bash
+INTERNVL_REMOTE_ROOT=/data/local/tmp/streamingvlm_smoke_modes \
+QWEN_REMOTE_ROOT=/data/local/tmp/streamingvlm_qwen25 \
+RESULTS_ROOT=my_research/foundation_llamacpp/results/log/merge_regression_manual \
+my_research/foundation_llamacpp/scripts/run_merge_regression_internvl_qwen.sh
+```
 
 Example partial vision-prefill run, using 64-token image KV commit points:
 

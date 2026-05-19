@@ -234,6 +234,23 @@ def test_partial_vision_prefill_uses_ubatch_size_for_visible_chunks():
     assert "k_preemptible_image_prefill_batch" not in source
 
 
+def test_inference_trace_uses_committed_vision_slots_without_nominal_suffix():
+    trace_source = (ROOT / "my_research/foundation_llamacpp/hybrid_bridge/inference_trace.hpp").read_text()
+    streaming_source = STREAMING_CPP.read_text()
+
+    assert "vision_slot_piece" in trace_source
+    assert '"<VISION_KV_SLOT " + std::to_string(one_based_idx) + ">"' in trace_source
+    assert '"/" + std::to_string(n_tok)' not in trace_source
+    assert "chunk_image_begin_visible" in trace_source
+    assert "nominal_placeholder_tokens" in trace_source
+
+    assert "committed_image_tokens" in streaming_source
+    assert "record_committed_image_tokens" in streaming_source
+    assert "render_prefill_trace_for_chunks" in streaming_source
+    assert "append_prefill_trace_body" in streaming_source
+    assert "prefill_trace_next_chunk_idx" in streaming_source
+
+
 def test_vision_prefill_preserves_chat_history_across_prompt_events():
     source = STREAMING_CPP.read_text()
     cache_struct = source.split("struct VisionPrefillCache {", 1)[1].split("\n};", 1)[0]
@@ -246,6 +263,8 @@ def test_vision_prefill_preserves_chat_history_across_prompt_events():
     assert "std::vector<common_chat_msg> chat_history" in cache_struct
     assert "std::string open_user_content" in cache_struct
     assert "bool open_user_prefix" in cache_struct
+    assert "std::string prefill_trace_body" in cache_struct
+    assert "std::string prefill_trace_flat" in cache_struct
     assert "ctx.chat_history = cache.chat_history" in restore_fn
     assert "cache.chat_history = ctx.chat_history" in source
     assert 'args.stream_mode == "vision_prefill"' not in singleton_fn

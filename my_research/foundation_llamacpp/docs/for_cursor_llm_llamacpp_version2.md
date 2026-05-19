@@ -5,6 +5,33 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-18: Full Streaming Prefill Token Trace
+
+- Created branch `codex/full-streaming-prefill-token-trace`.
+- Updated streaming inference token tracing so vision-prefill prompt turns write
+  the committed cached visual prefix plus the question suffix before decode.
+  This makes `foundation_inference_tokens.txt` consistent with on-demand and
+  sliding-window traces instead of showing decode tokens only.
+- Vision placeholder trace format is now `<VISION_KV_SLOT N>`.
+  Partial image KV commits emit only the slots that actually reached decoder KV;
+  if the full image would have been larger, the image chunk header records
+  `nominal_placeholder_tokens=...`.
+- `runner/cli.py` now writes `run_command.txt` for every run before artifact
+  grouping, so it lands under `txt_json/run_command.txt`.
+- Added `scripts/run_merge_regression_internvl_qwen.sh` as the pre-merge
+  Android regression matrix for InternVL3-1B and Qwen2.5-VL-3B:
+  image, multi-image, offline video, streaming on-demand, streaming
+  sliding-window, and streaming vision-prefill with dynamic KV, online buffer,
+  partial vision KV, and latest-frame-only where applicable.
+- Validation completed:
+  - `python3 -m pytest my_research/foundation_llamacpp/tests/test_vision_prefill_kv_cache_contract.py my_research/foundation_llamacpp/tests/test_result_artifact_layout.py -q`
+    -> 31 passed.
+  - Android build:
+    `cmake --build ... --target hybrid_streaming_decode opencl_phase_mtmd hybrid_decode hybrid_vision_dump -j2`.
+  - Android streaming vision-prefill runs completed for InternVL3 1B, 2B, and
+    8B. All returned `foundation_exit_code.txt=0`; 2B and 8B produced partial
+    image-slot traces with no `/256` slot suffix.
+
 ## 2026-05-17: Latest-Frame-Only Vision-Prefill Cache Updates
 
 - Created branch `codex/latest-frame-only-cache-updates`.

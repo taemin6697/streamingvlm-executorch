@@ -917,7 +917,13 @@ txt_json/foundation_token_io.txt:
   user/assistant text plus trace appendix when available
 
 txt_json/foundation_inference_tokens.txt:
-  detailed chunk/token trace; best file for checking media chunk count
+  detailed chunk/token trace; best file for checking media chunk count.
+  Streaming vision-prefill includes the committed cached visual prefix,
+  question suffix, and decode tokens in order. Partial image KV emits only the
+  committed `<VISION_KV_SLOT N>` entries.
+
+txt_json/run_command.txt:
+  exact host command used to produce the sample
 
 csv/android_memory_timeline.csv:
   sampled Android memory timeline
@@ -971,7 +977,8 @@ stream_token_io_<idx>.txt:
   compact per-turn user/assistant and token appendix
 
 stream_inference_tokens_<idx>.txt:
-  raw per-turn mtmd/GGUF token trace
+  raw per-turn mtmd/GGUF token trace. Vision-prefill prompt turns replay
+  committed cached image slots here before the prompt suffix.
 
 foundation_inference_tokens.txt:
   aggregate of all streaming turns with prompt headers
