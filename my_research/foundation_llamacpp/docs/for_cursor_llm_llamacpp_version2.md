@@ -5,6 +5,29 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-19: Live Vision-Prefill Pipeline Archive Note
+
+- Added `docs/archive/streaming_vision_prefill_live_kv_pipeline.md` as the
+  current handoff note for the combined live streaming vision-prefill path.
+- The note ties together the implementation split across:
+  - `runner/prompt_formats.py`
+  - `runner/media.py`
+  - `runner/cli.py`
+  - `hybrid_bridge/streaming_prompt_format.hpp`
+  - `hybrid_bridge/streaming_policy.hpp`
+  - `hybrid_bridge/kv_reposition.hpp`
+  - `hybrid_bridge/hybrid_streaming_decode.cpp`
+- It documents how `--online-buffer`, `--latest-frame-only`,
+  `--partial-vision-kv`, dynamic KV growth, and video-prefix tail insertion
+  interact in `--stream-mode vision-prefill`.
+- It also records the 448x448 red-panda validation:
+  - InternVL3-1B Q8_0 completed with `foundation_exit_code.txt=0`,
+    `input_frame_count=21`, `processed_visual_jobs=15`, and
+    `committed_cache_updates=11`.
+  - InternVL3-2B Q8_0 completed with `foundation_exit_code.txt=0`,
+    `input_frame_count=21`, `processed_visual_jobs=10`, and
+    `committed_cache_updates=6`.
+
 ## 2026-05-19: Streaming Research Extensibility Refactor
 
 - Created branch `codex/streaming-research-refactor` from `main`.

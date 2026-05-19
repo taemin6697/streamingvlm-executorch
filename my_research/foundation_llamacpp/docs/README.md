@@ -15,7 +15,11 @@ vision-prefill KV preemption details live in
 repositioning notes live in
 `archive/kv_rope_reposition_for_video_compression.md`. The current
 model/prompt-policy/KV extension refactor is summarized in
-`archive/streaming_research_refactor_model_policy_kv.md`.
+`archive/streaming_research_refactor_model_policy_kv.md`. The live
+vision-prefill pipeline that combines online buffer, latest-frame-only,
+partial KV, multi-turn video-prefix insertion, and the 448x448 red-panda
+validation is summarized in
+`archive/streaming_vision_prefill_live_kv_pipeline.md`.
 
 ## Current Baseline
 
