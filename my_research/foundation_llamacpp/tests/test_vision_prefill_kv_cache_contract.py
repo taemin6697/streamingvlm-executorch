@@ -272,10 +272,40 @@ def test_vision_prefill_preserves_chat_history_across_prompt_events():
     assert "cache.chat_history = ctx.chat_history" in source
     assert 'args.stream_mode == "vision_prefill"' not in singleton_fn
     assert "next_cache.prefill_trace_body = cache.prefill_trace_body" in build_fn
-    assert "restored_trace_body = vision_cache->prefill_trace_body + suffix_trace.body" in prompt_fn
-    assert "decode_history_body(restored_next_chunk_idx)" in prompt_fn
+    assert "tail_trace_body = vision_cache->prefill_trace_tail_body + suffix_trace.body" in prompt_fn
+    assert "rebuild_prefill_trace_from_video_and_tail(*vision_cache)" in prompt_fn
+    assert "decode_history_body(tail_next_chunk_idx)" in prompt_fn
     assert "vision_cache->open_user_prefix = false" in prompt_fn
     assert "save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, args.partial_vision_kv)" in prompt_fn
+
+
+def test_vision_prefill_inserts_late_frames_into_initial_video_prefix():
+    source = STREAMING_CPP.read_text()
+    cache_struct = source.split("struct VisionPrefillCache {", 1)[1].split("\n};", 1)[0]
+    build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
+        "\n}\n\nint run_vision_prefill_prompt_from_committed_cache", 1
+    )[0]
+    prompt_fn = source.split("int run_vision_prefill_prompt_from_committed_cache(", 1)[1].split(
+        "\n}\n\nint run_single_buffer_prompt", 1
+    )[0]
+
+    assert "llama_pos video_prefix_insert_pos" in cache_struct
+    assert "bool video_prefix_insert_pos_valid" in cache_struct
+    assert "video_prefix_state_valid" in cache_struct
+    assert "insert_frame_into_closed_video_prefix" in build_fn
+    assert "build_tail_insertion_plan" in build_fn
+    assert "apply_tail_insertion_plan" in build_fn
+    assert "compact_unused_insert_gap" in build_fn
+    assert 'setenv("LLAMA_ALLOW_KV_GAP_FILL", "1", 1)' in source
+    assert "llama_memory_seq_add" in (ROOT / "my_research/foundation_llamacpp/hybrid_bridge/kv_reposition.hpp").read_text()
+    assert "replay_cached_conversation_tail_after_video_prefix" not in build_fn
+    assert "VisionPrefillTailReplayT_Prefill" not in build_fn
+    assert "KVRepositionTailShift" in build_fn
+    assert "update_first_video_user_message" in source
+    assert "save_vision_prefill_video_prefix_state(ctx, *vision_cache" in prompt_fn
+    assert "vision_cache->video_prefix_insert_pos = video_prefix_insert_pos_before_suffix" in prompt_fn
+    assert "next_cache.open_user_prefix = false" in build_fn
+    assert "next_cache.open_user_content.clear()" in build_fn
 
 
 def test_vision_prefill_uses_global_stream_frame_labels_for_interleaved_turns():

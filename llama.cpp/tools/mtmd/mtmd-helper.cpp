@@ -358,6 +358,9 @@ int32_t mtmd_helper_decode_image_chunk_with_abort_and_progress(
 
         int64_t t1 = ggml_time_ms();
         int32_t ret = llama_decode(lctx, batch_embd_view);
+        if (ret == 0 && on_batch_done != nullptr) {
+            llama_synchronize(lctx);
+        }
         int64_t t2 = ggml_time_ms();
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);

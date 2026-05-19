@@ -298,7 +298,12 @@ bool llama_batch_allocr::init(
                 bool ok = true;
 
                 if (seq_pos_min(s) != p0 + 1) {
-                    ok = false;
+                    const char * allow_gap_fill_env = getenv("LLAMA_ALLOW_KV_GAP_FILL");
+                    const bool allow_gap_fill =
+                        allow_gap_fill_env != nullptr &&
+                        strcmp(allow_gap_fill_env, "0") != 0 &&
+                        seq_pos_min(s) <= p0 + 1;
+                    ok = allow_gap_fill;
                 }
 
                 if (!ok) {

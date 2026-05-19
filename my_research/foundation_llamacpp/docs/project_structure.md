@@ -70,6 +70,12 @@ partial vision prefill
   optional --partial-vision-kv for hybrid vision_prefill lets a prompt preempt
   image-prefill cache work after the current image micro-batch commits. The
   partial commit size is controlled by --ubatch-size.
+
+KV/RoPE reposition
+  optional --kv-reposition-keep-latest-frames N for hybrid vision_prefill
+  records committed frame vision-KV spans, removes older spans with
+  llama_memory_seq_rm, and shifts later cached tokens with llama_memory_seq_add.
+  This is the current streaming hook for future video compression experiments.
 ```
 
 ## Top-Level Layout
@@ -444,11 +450,13 @@ my_research/foundation_llamacpp/hybrid_bridge/
   hybrid_decode.cpp
   opencl_phase_mtmd.cpp
   hybrid_streaming_decode.cpp
+  kv_reposition_probe.cpp
   hybrid_vision_dump.cpp
   hybrid_embedding_file.h
   hybrid_embedding_file.cpp
   inference_trace.hpp
   file_sync.hpp
+  kv_reposition.hpp
   phase_trace.hpp
   vision_encoder_et.hpp
   vision_encoder_et.cpp
@@ -612,6 +620,29 @@ decode token lines
 
 Use `foundation_inference_tokens.txt` to verify that image/video prompt layout
 matches the expected number of IMAGE chunks.
+
+`kv_reposition.hpp`
+
+Defines the experimental KV tail-compaction contract for future video
+compression. The helper builds and applies a `llama_memory_seq_rm` plus
+`llama_memory_seq_add` plan so llama.cpp can update cached K RoPE positions
+without re-prefilling the unchanged suffix. The current helper is intentionally
+policy-free: compression decides which visual token range is removed or
+rewritten, then this helper shifts the remaining logical positions.
+
+`hybrid_streaming_decode.cpp` currently uses this helper only when
+`--stream-mode vision-prefill --kv-reposition-keep-latest-frames N` is set. In
+that mode each committed image chunk records a `VisionKvSpan`; older frame
+vision spans are compacted after cache updates and the compacted seq-0 snapshot
+is saved for later prompt restores.
+
+`kv_reposition_probe.cpp`
+
+Host-only validation binary for the KV/RoPE reposition helper. It compares a
+compact reference prefill with a `prefix + removed + history` cache that has the
+removed span deleted and the history tail shifted before a fresh suffix prefill.
+Use it to check whether a proposed compression policy preserves practical
+answers before wiring that policy into streaming video.
 
 `file_sync.hpp`
 
@@ -875,6 +906,12 @@ batch to finish, closes the image wrapper with the following text chunks, and
 then evaluates the question suffix from the partial KV state. For the current
 InternVL3 one-tile path, a 256-token visual image with `--ubatch-size 64` can
 therefore answer from 64, 128, 192, or 256 committed visual KV tokens.
+
+With `--kv-reposition-keep-latest-frames N`, the same mode becomes a live
+KV-compaction experiment. Closed chat text remains cached, but older frame
+vision-token ranges are removed and later cached tokens are shifted forward.
+This records `KVRepositionCompact` phase rows and summary counters so the run
+shows both streaming behavior and actual KV-level position compaction.
 
 ## Result Artifacts
 

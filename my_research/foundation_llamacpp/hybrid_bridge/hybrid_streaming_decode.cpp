@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstddef>
@@ -13,9 +14,11 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
@@ -24,6 +27,8 @@
 #else
 #include "opencl_phase_mtmd.cpp"
 #endif
+
+#include "kv_reposition.hpp"
 
 namespace {
 
@@ -311,6 +316,7 @@ struct Args {
   int ubatch_size = 512;
   int gpu_layers = 99;
   int threads = 4;
+  int kv_reposition_keep_latest_frames = 0;
   double temperature = 0.0;
   double window_sec = -1.0;
   double play_speed = 1.0;
@@ -385,6 +391,9 @@ Args parse_args(int argc, char** argv) {
       args.gpu_layers = std::atoi(tmp.c_str());
     } else if (read_string("-t", tmp) || read_string("--threads", tmp)) {
       args.threads = std::atoi(tmp.c_str());
+    } else if (read_string("--kv-reposition-keep-latest-frames", tmp) ||
+               read_string("--kv_reposition_keep_latest_frames", tmp)) {
+      args.kv_reposition_keep_latest_frames = std::atoi(tmp.c_str());
     } else if (read_string("--temp", tmp) || read_string("--temperature", tmp)) {
       args.temperature = std::atof(tmp.c_str());
     } else if (read_string("--window-sec", tmp) || read_string("--window_sec", tmp)) {
@@ -706,6 +715,54 @@ std::string build_stream_video_prompt_prefix(const std::vector<FrameRecord>& fra
   return out;
 }
 
+size_t next_non_frame_prefix_offset(const std::string& content) {
+  size_t pos = 0;
+  const std::string marker = mtmd_default_marker();
+  while (pos < content.size()) {
+    const size_t line_start = pos;
+    if (content.compare(pos, 5, "Frame") != 0) {
+      break;
+    }
+    pos += 5;
+    const size_t digits_begin = pos;
+    while (pos < content.size() && std::isdigit(static_cast<unsigned char>(content[pos]))) {
+      ++pos;
+    }
+    if (pos == digits_begin || pos + 2 > content.size() || content[pos] != ':' || content[pos + 1] != ' ') {
+      pos = line_start;
+      break;
+    }
+    pos += 2;
+    bool saw_image_marker = false;
+    while (content.compare(pos, marker.size(), marker) == 0) {
+      saw_image_marker = true;
+      pos += marker.size();
+    }
+    if (!saw_image_marker || pos >= content.size() || content[pos] != '\n') {
+      pos = line_start;
+      break;
+    }
+    ++pos;
+  }
+  return pos;
+}
+
+std::string strip_stream_video_prompt_prefix(const std::string& content) {
+  return content.substr(next_non_frame_prefix_offset(content));
+}
+
+bool update_first_video_user_message(
+    std::vector<common_chat_msg>& chat_history,
+    const std::vector<FrameRecord>& frames) {
+  for (common_chat_msg& msg : chat_history) {
+    if (msg.role == "user") {
+      msg.content = build_stream_video_prompt_prefix(frames) + strip_stream_video_prompt_prefix(msg.content);
+      return true;
+    }
+  }
+  return false;
+}
+
 std::string build_video_prompt(const std::vector<FrameRecord>& frames, const std::string& raw_prompt) {
   std::string out = build_video_prompt_prefix(frames);
   out += raw_prompt;
@@ -728,6 +785,45 @@ std::vector<std::string> layout_images_for_frames(const std::vector<FrameRecord>
       if (!tile.layout_image.empty()) {
         out.push_back(tile.layout_image);
       }
+    }
+  }
+  return out;
+}
+
+std::vector<int> image_frame_indices_for_frames(const std::vector<FrameRecord>& frames) {
+  std::vector<int> out;
+  for (const FrameRecord& frame : frames) {
+    const size_t n_tiles = std::max<size_t>(1, frame.tiles.size());
+    for (size_t tile_i = 0; tile_i < n_tiles; ++tile_i) {
+      out.push_back(frame.index);
+    }
+  }
+  return out;
+}
+
+std::vector<FrameRecord> filter_frames_by_index_set(
+    const std::vector<FrameRecord>& frames,
+    const std::set<int>& keep) {
+  std::vector<FrameRecord> out;
+  for (const FrameRecord& frame : frames) {
+    if (keep.find(frame.index) != keep.end()) {
+      out.push_back(frame);
+    }
+  }
+  return out;
+}
+
+std::vector<FrameRecord> filter_frames_by_index_list(
+    const std::vector<FrameRecord>& frames,
+    const std::vector<int>& indices) {
+  std::vector<FrameRecord> out;
+  for (int index : indices) {
+    auto it = std::find_if(
+        frames.begin(),
+        frames.end(),
+        [&](const FrameRecord& frame) { return frame.index == index; });
+    if (it != frames.end()) {
+      out.push_back(*it);
     }
   }
   return out;
@@ -814,23 +910,50 @@ std::unique_ptr<streamingvlm::hybrid_bridge::VisionEncoderSession> load_single_b
 #endif
 
 #if defined(STREAMINGVLM_STREAMING_DECODE_USE_QNN)
+struct VisionKvSpan {
+  int frame_index = -1;
+  llama_pos begin = 0;
+  llama_pos end = 0;
+
+  llama_pos length() const {
+    return end - begin;
+  }
+};
+
 struct VisionPrefillCache {
   bool valid = false;
   std::vector<FrameRecord> frames;
   std::vector<int> frame_indices;
+  std::vector<VisionKvSpan> frame_kv_spans;
+  std::vector<int> open_user_frame_indices;
   std::vector<std::string> images;
   std::vector<common_chat_msg> chat_history;
   std::string open_user_content;
   bool open_user_prefix = false;
   std::string prefill_trace_body;
   std::string prefill_trace_flat;
+  std::string prefill_trace_video_body;
+  std::string prefill_trace_video_flat;
+  std::string prefill_trace_tail_body;
+  std::string prefill_trace_tail_flat;
   std::size_t prefill_trace_next_chunk_idx = 0;
   std::size_t prefill_trace_next_image_idx = 0;
+  std::size_t prefill_trace_video_next_chunk_idx = 0;
+  std::size_t prefill_trace_video_next_image_idx = 0;
   std::vector<uint8_t> state;
   std::vector<uint8_t> host_state;
+  std::vector<uint8_t> video_prefix_state;
   llama_state_seq_flags state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
   llama_state_seq_flags host_state_flags = static_cast<llama_state_seq_flags>(0);
+  llama_state_seq_flags video_prefix_state_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
   llama_pos n_past = 0;
+  llama_pos video_prefix_n_past = 0;
+  llama_pos video_prefix_insert_pos = 0;
+  bool video_prefix_insert_pos_valid = false;
+  bool video_prefix_state_valid = false;
+  int last_kv_reposition_compactions = 0;
+  int last_kv_reposition_removed_frames = 0;
+  llama_pos last_kv_reposition_removed_tokens = 0;
 };
 
 bool vision_prefill_cache_matches(const VisionPrefillCache& cache, const std::vector<FrameRecord>& frames) {
@@ -944,6 +1067,13 @@ std::string format_user_message_for_current_history(decode_context& ctx, const s
 void append_user_message_to_history(decode_context& ctx, const std::string& content) {
   common_chat_msg msg;
   msg.role = "user";
+  msg.content = content;
+  ctx.chat_history.push_back(std::move(msg));
+}
+
+void append_assistant_message_to_history(decode_context& ctx, const std::string& content) {
+  common_chat_msg msg;
+  msg.role = "assistant";
   msg.content = content;
   ctx.chat_history.push_back(std::move(msg));
 }
@@ -1078,6 +1208,112 @@ void append_rendered_trace_to_cache(VisionPrefillCache& cache, const RenderedPre
   cache.prefill_trace_next_image_idx = trace.next_image_idx;
 }
 
+std::size_t count_trace_chunks(const std::string& body) {
+  std::size_t count = 0;
+  std::istringstream in(body);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.rfind("## CHUNK ", 0) == 0) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t count_trace_images(const std::string& body) {
+  std::size_t count = 0;
+  std::istringstream in(body);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.rfind("## CHUNK ", 0) == 0 && line.find(" IMAGE image_index=") != std::string::npos) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::string replace_trace_number_after(std::string line, const std::string& marker, std::size_t value) {
+  const size_t marker_pos = line.find(marker);
+  if (marker_pos == std::string::npos) {
+    return line;
+  }
+  const size_t value_begin = marker_pos + marker.size();
+  size_t value_end = value_begin;
+  while (value_end < line.size() && std::isdigit(static_cast<unsigned char>(line[value_end]))) {
+    ++value_end;
+  }
+  line.replace(value_begin, value_end - value_begin, std::to_string(value));
+  return line;
+}
+
+std::string renumber_trace_body(
+    const std::string& body,
+    std::size_t first_chunk_idx,
+    std::size_t first_image_idx) {
+  std::ostringstream out;
+  std::istringstream in(body);
+  std::string line;
+  std::size_t next_chunk = first_chunk_idx;
+  std::size_t next_image = first_image_idx;
+  while (std::getline(in, line)) {
+    if (line.rfind("## CHUNK ", 0) == 0) {
+      line = replace_trace_number_after(std::move(line), "## CHUNK ", next_chunk++);
+      if (line.find(" IMAGE image_index=") != std::string::npos) {
+        line = replace_trace_number_after(std::move(line), " IMAGE image_index=", next_image + 1);
+        ++next_image;
+      }
+    }
+    out << line << "\n";
+  }
+  return out.str();
+}
+
+void rebuild_prefill_trace_from_video_and_tail(VisionPrefillCache& cache) {
+  const std::string tail_body = renumber_trace_body(
+      cache.prefill_trace_tail_body,
+      cache.prefill_trace_video_next_chunk_idx,
+      cache.prefill_trace_video_next_image_idx);
+  cache.prefill_trace_body = cache.prefill_trace_video_body + tail_body;
+  cache.prefill_trace_flat = cache.prefill_trace_video_flat + cache.prefill_trace_tail_flat;
+  cache.prefill_trace_next_chunk_idx =
+      cache.prefill_trace_video_next_chunk_idx + count_trace_chunks(cache.prefill_trace_tail_body);
+  cache.prefill_trace_next_image_idx =
+      cache.prefill_trace_video_next_image_idx + count_trace_images(cache.prefill_trace_tail_body);
+}
+
+void append_rendered_video_trace_to_cache(VisionPrefillCache& cache, const RenderedPrefillTrace& trace) {
+  cache.prefill_trace_video_body += trace.body;
+  cache.prefill_trace_video_flat += trace.flat;
+  cache.prefill_trace_video_next_chunk_idx = trace.next_chunk_idx;
+  cache.prefill_trace_video_next_image_idx = trace.next_image_idx;
+  rebuild_prefill_trace_from_video_and_tail(cache);
+}
+
+void set_open_video_trace_from_combined(VisionPrefillCache& cache) {
+  cache.prefill_trace_video_body = cache.prefill_trace_body;
+  cache.prefill_trace_video_flat = cache.prefill_trace_flat;
+  cache.prefill_trace_video_next_chunk_idx = cache.prefill_trace_next_chunk_idx;
+  cache.prefill_trace_video_next_image_idx = cache.prefill_trace_next_image_idx;
+  cache.prefill_trace_tail_body.clear();
+  cache.prefill_trace_tail_flat.clear();
+}
+
+llama_pos count_chunk_positions(mtmd::input_chunks& chunks) {
+  llama_pos total = 0;
+  const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+  for (size_t i = 0; i < n_chunks; ++i) {
+    const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
+    if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+      size_t n_tokens = 0;
+      (void)mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
+      total += static_cast<llama_pos>(n_tokens);
+    } else if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+      total += static_cast<llama_pos>(mtmd_input_chunk_get_n_tokens(chunk));
+    }
+  }
+  return total;
+}
+
 bool eval_streaming_chunks_with_external_embedding(
     decode_context& ctx,
     mtmd::input_chunks& chunks,
@@ -1197,6 +1433,7 @@ bool eval_streaming_chunks_with_on_demand_vision(
     const std::atomic<int>* pending_prompt_jobs = nullptr,
     bool* preempted = nullptr,
     std::vector<std::size_t>* committed_image_tokens = nullptr,
+    std::vector<streamingvlm::hybrid_bridge::KvTokenRange>* committed_image_kv_ranges = nullptr,
     std::size_t* committed_chunk_count = nullptr) {
   const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
   bool used_image = false;
@@ -1209,6 +1446,9 @@ bool eval_streaming_chunks_with_on_demand_vision(
   if (committed_image_tokens != nullptr) {
     committed_image_tokens->clear();
   }
+  if (committed_image_kv_ranges != nullptr) {
+    committed_image_kv_ranges->clear();
+  }
   if (committed_chunk_count != nullptr) {
     *committed_chunk_count = 0;
   }
@@ -1218,10 +1458,16 @@ bool eval_streaming_chunks_with_on_demand_vision(
     }
   };
   auto record_committed_image_tokens = [&](llama_pos before, llama_pos after) {
-    if (committed_image_tokens == nullptr || after <= before) {
+    if (after <= before) {
       return;
     }
-    committed_image_tokens->push_back(static_cast<std::size_t>(after - before));
+    if (committed_image_tokens != nullptr) {
+      committed_image_tokens->push_back(static_cast<std::size_t>(after - before));
+    }
+    if (committed_image_kv_ranges != nullptr) {
+      committed_image_kv_ranges->push_back(
+          streamingvlm::hybrid_bridge::KvTokenRange{before, after});
+    }
   };
   auto preempt = [&]() {
     if (!cache_preempt_requested(pending_prompt_jobs)) {
@@ -1506,6 +1752,106 @@ bool load_layout_bitmaps(
   return true;
 }
 
+bool eval_cached_text_segment(
+    decode_context& ctx,
+    const std::string& formatted,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
+    const char* tokenize_phase,
+    const char* eval_phase,
+    bool add_special = false,
+    bool logits_last = false) {
+  if (formatted.empty()) {
+    return true;
+  }
+  mtmd::bitmaps empty_bitmaps;
+  mtmd::input_chunks chunks(mtmd_input_chunks_init());
+  if (!tokenize_formatted_text(ctx, formatted, empty_bitmaps, add_special, phases, tokenize_phase, chunks)) {
+    return false;
+  }
+  return eval_streaming_chunks_with_external_embedding(
+      ctx,
+      chunks,
+      nullptr,
+      phases,
+      0,
+      logits_last,
+      eval_phase,
+      "ImagePrefill",
+      "Mmproj",
+      false);
+}
+
+bool replay_cached_conversation_tail_after_video_prefix(
+    decode_context& ctx,
+    const std::vector<common_chat_msg>& updated_history,
+    const std::vector<FrameRecord>& target_frames,
+    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+  if (updated_history.empty()) {
+    return true;
+  }
+  if (updated_history.front().role != "user") {
+    LOG_ERR("cannot replay cached tail: first cached message is not a user message\n");
+    return false;
+  }
+
+  ctx.chat_history.clear();
+  const std::string open_user_content = build_stream_video_prompt_prefix(target_frames);
+  const std::string first_question = strip_stream_video_prompt_prefix(updated_history.front().content);
+  std::string first_suffix;
+  if (!build_formatted_question_suffix(ctx, open_user_content, first_question, first_suffix)) {
+    LOG_ERR("failed to format first cached user suffix while replaying closed video-prefix tail\n");
+    return false;
+  }
+  if (!eval_cached_text_segment(
+          ctx,
+          first_suffix,
+          phases,
+          "VisionPrefillTailReplayTokenize",
+          "VisionPrefillTailReplayT_Prefill")) {
+    return false;
+  }
+  append_user_message_to_history(ctx, updated_history.front().content);
+
+  for (size_t i = 1; i < updated_history.size(); ++i) {
+    const common_chat_msg& msg = updated_history[i];
+    if (msg.role == "assistant") {
+      if (!eval_cached_text_segment(
+              ctx,
+              msg.content,
+              phases,
+              "VisionPrefillTailReplayTokenize",
+              "VisionPrefillTailReplayT_Prefill")) {
+        return false;
+      }
+      append_assistant_message_to_history(ctx, msg.content);
+    } else if (msg.role == "user") {
+      const std::string formatted = format_user_message_for_current_history(ctx, msg.content);
+      if (!eval_cached_text_segment(
+              ctx,
+              formatted,
+              phases,
+              "VisionPrefillTailReplayTokenize",
+              "VisionPrefillTailReplayT_Prefill")) {
+        return false;
+      }
+      append_user_message_to_history(ctx, msg.content);
+    } else {
+      const std::string formatted =
+          common_chat_format_single(ctx.tmpls.get(), ctx.chat_history, msg, false, ctx.use_jinja);
+      if (!eval_cached_text_segment(
+              ctx,
+              formatted,
+              phases,
+              "VisionPrefillTailReplayTokenize",
+              "VisionPrefillTailReplayT_Prefill")) {
+        return false;
+      }
+      ctx.chat_history.push_back(msg);
+    }
+  }
+  return true;
+}
+
 bool save_vision_prefill_cache_state_blob(
     decode_context& ctx,
     std::vector<uint8_t>& state,
@@ -1584,6 +1930,58 @@ bool save_vision_prefill_cache_state(
   return true;
 }
 
+bool save_vision_prefill_video_prefix_state(
+    decode_context& ctx,
+    VisionPrefillCache& cache,
+    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+  cache.video_prefix_state_flags = static_cast<llama_state_seq_flags>(0);
+  if (!save_vision_prefill_cache_state_blob(
+          ctx,
+          cache.video_prefix_state,
+          cache.video_prefix_state_flags,
+          phases,
+          "VisionPrefillVideoPrefixSave")) {
+    cache.video_prefix_state.clear();
+    cache.video_prefix_state_valid = false;
+    return false;
+  }
+  cache.video_prefix_n_past = ctx.n_past;
+  cache.video_prefix_insert_pos = ctx.n_past;
+  cache.video_prefix_insert_pos_valid = true;
+  cache.video_prefix_state_valid = true;
+  return true;
+}
+
+bool restore_vision_prefill_video_prefix_state(
+    decode_context& ctx,
+    const VisionPrefillCache& cache,
+    streamingvlm::hybrid_bridge::phase_recorder& phases,
+    const char* phase_name = "VisionPrefillVideoPrefixRestore") {
+  if (!cache.video_prefix_state_valid || cache.video_prefix_state.empty()) {
+    return false;
+  }
+  reset_decode_context_for_singleton(ctx);
+  const long restore_start_ms = now_ms();
+  const size_t restored = llama_state_seq_set_data_ext(
+      ctx.lctx,
+      cache.video_prefix_state.data(),
+      cache.video_prefix_state.size(),
+      0,
+      cache.video_prefix_state_flags);
+  llama_synchronize(ctx.lctx);
+  phases.row(phase_name, restore_start_ms, now_ms());
+  if (restored != cache.video_prefix_state.size()) {
+    LOG_ERR(
+        "failed to restore vision video-prefix state: restored %zu of %zu bytes\n",
+        restored,
+        cache.video_prefix_state.size());
+    return false;
+  }
+  ctx.n_past = cache.video_prefix_n_past;
+  ctx.chat_history.clear();
+  return true;
+}
+
 bool restore_vision_prefill_cache_state(
     decode_context& ctx,
     const VisionPrefillCache& cache,
@@ -1638,6 +2036,188 @@ bool rollback_vision_prefill_cache_build(
   return restore_vision_prefill_cache_state(ctx, cache, phases, "VisionPrefillCacheRollback", true);
 }
 
+void refresh_vision_prefill_cache_frame_views(VisionPrefillCache& cache) {
+  std::set<int> resident_frame_indices;
+  for (const VisionKvSpan& span : cache.frame_kv_spans) {
+    if (span.end > span.begin) {
+      resident_frame_indices.insert(span.frame_index);
+    }
+  }
+  if (!resident_frame_indices.empty()) {
+    cache.frames = filter_frames_by_index_set(cache.frames, resident_frame_indices);
+  } else {
+    cache.frames.clear();
+  }
+  cache.frame_indices = frame_indices_for(cache.frames);
+  cache.images = layout_images_for_frames(cache.frames);
+
+  std::vector<int> open_indices;
+  for (int index : cache.open_user_frame_indices) {
+    if (resident_frame_indices.find(index) != resident_frame_indices.end()) {
+      open_indices.push_back(index);
+    }
+  }
+  cache.open_user_frame_indices = std::move(open_indices);
+  if (cache.open_user_prefix) {
+    cache.open_user_content =
+        build_stream_video_prompt_prefix(filter_frames_by_index_list(cache.frames, cache.open_user_frame_indices));
+  }
+}
+
+bool compact_vision_prefill_cache_frames(
+    const Args& args,
+    decode_context& ctx,
+    VisionPrefillCache& cache,
+    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+  cache.last_kv_reposition_compactions = 0;
+  cache.last_kv_reposition_removed_frames = 0;
+  cache.last_kv_reposition_removed_tokens = 0;
+  if (args.kv_reposition_keep_latest_frames <= 0 || cache.frame_kv_spans.empty()) {
+    return true;
+  }
+
+  std::set<int> keep_frames;
+  for (auto it = cache.frame_kv_spans.rbegin(); it != cache.frame_kv_spans.rend(); ++it) {
+    if (it->end <= it->begin) {
+      continue;
+    }
+    keep_frames.insert(it->frame_index);
+    if (static_cast<int>(keep_frames.size()) >= args.kv_reposition_keep_latest_frames) {
+      break;
+    }
+  }
+
+  std::vector<size_t> remove_indices;
+  std::set<int> removed_frames;
+  for (size_t i = 0; i < cache.frame_kv_spans.size(); ++i) {
+    const VisionKvSpan& span = cache.frame_kv_spans[i];
+    if (span.end > span.begin && keep_frames.find(span.frame_index) == keep_frames.end()) {
+      remove_indices.push_back(i);
+      removed_frames.insert(span.frame_index);
+    }
+  }
+  if (remove_indices.empty()) {
+    return true;
+  }
+
+  llama_pos sequence_end = ctx.n_past;
+  llama_pos removed_tokens = 0;
+  int compactions = 0;
+  for (auto rit = remove_indices.rbegin(); rit != remove_indices.rend(); ++rit) {
+    const size_t remove_idx = *rit;
+    if (remove_idx >= cache.frame_kv_spans.size()) {
+      continue;
+    }
+    const VisionKvSpan span = cache.frame_kv_spans[remove_idx];
+    if (span.end <= span.begin) {
+      continue;
+    }
+    streamingvlm::hybrid_bridge::KvTailCompactionPlan plan;
+    std::string error;
+    if (!streamingvlm::hybrid_bridge::build_tail_compaction_plan(
+            streamingvlm::hybrid_bridge::KvTokenRange{span.begin, span.end},
+            sequence_end,
+            &plan,
+            &error)) {
+      LOG_ERR("failed to build KV reposition compaction plan: %s\n", error.c_str());
+      return false;
+    }
+    const long compact_start_ms = now_ms();
+    if (!streamingvlm::hybrid_bridge::apply_tail_compaction_plan(
+            llama_get_memory(ctx.lctx),
+            0,
+            plan,
+            &error)) {
+      LOG_ERR("failed to apply KV reposition compaction plan: %s\n", error.c_str());
+      return false;
+    }
+    llama_synchronize(ctx.lctx);
+    phases.row("KVRepositionCompact", compact_start_ms, now_ms());
+
+	    const llama_pos delta = plan.removed.length();
+	    removed_tokens += delta;
+	    sequence_end = plan.compacted_sequence_end;
+	    ctx.n_past = sequence_end;
+	    cache.n_past = sequence_end;
+	    if (cache.video_prefix_insert_pos_valid) {
+	      cache.video_prefix_insert_pos =
+	          streamingvlm::hybrid_bridge::compacted_position_after(
+	              streamingvlm::hybrid_bridge::KvTokenRange{span.begin, span.end},
+	              cache.video_prefix_insert_pos);
+	    }
+	    ++compactions;
+
+    for (size_t j = remove_idx + 1; j < cache.frame_kv_spans.size(); ++j) {
+      cache.frame_kv_spans[j].begin -= delta;
+      cache.frame_kv_spans[j].end -= delta;
+    }
+  }
+
+  std::vector<bool> remove_mask(cache.frame_kv_spans.size(), false);
+  for (size_t idx : remove_indices) {
+    if (idx < remove_mask.size()) {
+      remove_mask[idx] = true;
+    }
+  }
+  std::vector<VisionKvSpan> kept_spans;
+  kept_spans.reserve(cache.frame_kv_spans.size() - remove_indices.size());
+  for (size_t i = 0; i < cache.frame_kv_spans.size(); ++i) {
+    if (!remove_mask[i]) {
+      kept_spans.push_back(cache.frame_kv_spans[i]);
+    }
+	  }
+	  cache.frame_kv_spans = std::move(kept_spans);
+	  refresh_vision_prefill_cache_frame_views(cache);
+	  if (!cache.open_user_prefix && !cache.chat_history.empty()) {
+	    (void)update_first_video_user_message(cache.chat_history, cache.frames);
+	    ctx.chat_history = cache.chat_history;
+	  }
+	  cache.last_kv_reposition_compactions = compactions;
+  cache.last_kv_reposition_removed_frames = static_cast<int>(removed_frames.size());
+  cache.last_kv_reposition_removed_tokens = removed_tokens;
+	  cache.prefill_trace_body +=
+	      "## KV_REPOSITION_COMPACT removed_frames=" +
+      std::to_string(cache.last_kv_reposition_removed_frames) +
+      " removed_vision_tokens=" +
+      std::to_string(static_cast<long long>(cache.last_kv_reposition_removed_tokens)) +
+      " keep_latest_frames=" +
+      std::to_string(args.kv_reposition_keep_latest_frames) + "\n";
+	  return true;
+	}
+
+bool compact_unused_insert_gap(
+    decode_context& ctx,
+    llama_pos gap_begin,
+    llama_pos gap_end,
+    llama_pos expanded_sequence_end,
+    streamingvlm::hybrid_bridge::phase_recorder& phases) {
+  if (gap_end <= gap_begin) {
+    return true;
+  }
+  streamingvlm::hybrid_bridge::KvTailCompactionPlan plan;
+  std::string error;
+  if (!streamingvlm::hybrid_bridge::build_tail_compaction_plan(
+          streamingvlm::hybrid_bridge::KvTokenRange{gap_begin, gap_end},
+          expanded_sequence_end,
+          &plan,
+          &error)) {
+    LOG_ERR("failed to build unused insert-gap compaction plan: %s\n", error.c_str());
+    return false;
+  }
+  const long compact_start_ms = now_ms();
+  if (!streamingvlm::hybrid_bridge::apply_tail_compaction_plan(
+          llama_get_memory(ctx.lctx),
+          0,
+          plan,
+          &error)) {
+    LOG_ERR("failed to compact unused insert gap: %s\n", error.c_str());
+    return false;
+  }
+  llama_synchronize(ctx.lctx);
+  phases.row("KVRepositionCompact", compact_start_ms, now_ms());
+  return true;
+}
+
 VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     const Args& args,
     decode_context& ctx,
@@ -1666,6 +2246,9 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
   next_cache.frames = target_frames;
   next_cache.frame_indices = frame_indices_for(target_frames);
   next_cache.images = layout_images_for_frames(frames);
+  next_cache.last_kv_reposition_compactions = 0;
+  next_cache.last_kv_reposition_removed_frames = 0;
+  next_cache.last_kv_reposition_removed_tokens = 0;
   if (target_frames.empty() || next_cache.images.empty()) {
     LOG_ERR("cannot build vision prefill cache for frame %d: missing bins or layout images\n", frame_idx);
     cache = std::move(next_cache);
@@ -1697,13 +2280,35 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
   bool formatted_prefix_add_special = false;
   std::vector<std::string> bins;
   std::vector<std::string> images_to_load;
+  std::vector<FrameRecord> frames_loaded_for_kv_span;
+  bool insert_frame_into_closed_video_prefix = false;
+  bool shift_tail_for_closed_video_prefix = false;
+  bool closed_video_prefix_tail_shifted = false;
+  streamingvlm::hybrid_bridge::KvTailInsertionPlan closed_video_prefix_insert_plan;
+  llama_pos closed_video_prefix_original_sequence_end = 0;
 
-  if (can_append_incrementally &&
-      restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore")) {
+  const bool can_insert_into_closed_video_prefix =
+      can_append_incrementally && !cache.open_user_prefix && cache.video_prefix_insert_pos_valid;
+  bool restored_for_incremental_append = false;
+  if (can_insert_into_closed_video_prefix) {
+    restored_for_incremental_append =
+        restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore");
+    if (restored_for_incremental_append) {
+      closed_video_prefix_original_sequence_end = cache.n_past;
+    }
+  } else if (can_append_incrementally) {
+    restored_for_incremental_append =
+        restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore");
+  }
+
+  if (can_append_incrementally && restored_for_incremental_append) {
     auto append_begin = target_frames.begin() + static_cast<std::ptrdiff_t>(cached_prefix_size);
     std::vector<FrameRecord> append_frames(append_begin, append_begin + 1);
+    frames_loaded_for_kv_span = append_frames;
     bins = bins_for_frames(append_frames);
     images_to_load = layout_images_for_frames(append_frames);
+    next_cache.frame_kv_spans = cache.frame_kv_spans;
+    next_cache.open_user_frame_indices = cache.open_user_frame_indices;
     if (!build_formatted_incremental_vision_cache_append(append_frames, formatted_prefix)) {
       LOG_ERR("failed to build incremental vision prefill cache append\n");
       cache = std::move(next_cache);
@@ -1713,24 +2318,44 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     next_cache.open_user_prefix = true;
     next_cache.prefill_trace_body = cache.prefill_trace_body;
     next_cache.prefill_trace_flat = cache.prefill_trace_flat;
+    next_cache.prefill_trace_video_body = cache.prefill_trace_video_body;
+    next_cache.prefill_trace_video_flat = cache.prefill_trace_video_flat;
+    next_cache.prefill_trace_tail_body = cache.prefill_trace_tail_body;
+    next_cache.prefill_trace_tail_flat = cache.prefill_trace_tail_flat;
     next_cache.prefill_trace_next_chunk_idx = cache.prefill_trace_next_chunk_idx;
     next_cache.prefill_trace_next_image_idx = cache.prefill_trace_next_image_idx;
+    next_cache.prefill_trace_video_next_chunk_idx = cache.prefill_trace_video_next_chunk_idx;
+    next_cache.prefill_trace_video_next_image_idx = cache.prefill_trace_video_next_image_idx;
+    next_cache.chat_history = cache.chat_history;
+    next_cache.video_prefix_insert_pos = cache.video_prefix_insert_pos;
+    next_cache.video_prefix_insert_pos_valid = cache.video_prefix_insert_pos_valid;
+    next_cache.video_prefix_state = cache.video_prefix_state;
+    next_cache.video_prefix_state_flags = cache.video_prefix_state_flags;
+    next_cache.video_prefix_n_past = cache.video_prefix_n_past;
+    next_cache.video_prefix_state_valid = cache.video_prefix_state_valid;
+    for (const FrameRecord& frame : append_frames) {
+      next_cache.open_user_frame_indices.push_back(frame.index);
+    }
     if (!cache.open_user_prefix) {
+      insert_frame_into_closed_video_prefix = true;
+      shift_tail_for_closed_video_prefix = true;
       next_cache.open_user_content = formatted_prefix;
-      if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
-        LOG_ERR("failed to split formatted post-answer vision prefill cache prefix\n");
-        cache = std::move(next_cache);
-        return VisionPrefillCacheBuildStatus::Failed;
-      }
-      formatted_prefix_add_special = ctx.chat_history.empty();
+      next_cache.open_user_content.clear();
+      next_cache.open_user_prefix = false;
+      next_cache.open_user_frame_indices.clear();
+      formatted_prefix_add_special = false;
     }
     use_incremental_append = true;
   } else {
     reset_decode_context_for_singleton(ctx);
+    frames_loaded_for_kv_span = target_frames;
     bins = bins_for_frames(target_frames);
     images_to_load = next_cache.images;
     next_cache.open_user_content = build_stream_video_prompt_prefix(target_frames);
     next_cache.open_user_prefix = true;
+    next_cache.open_user_frame_indices = frame_indices_for(target_frames);
+    next_cache.video_prefix_insert_pos_valid = false;
+    next_cache.video_prefix_insert_pos = 0;
     if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
       LOG_ERR("failed to split formatted vision prefill cache prefix\n");
       cache = std::move(next_cache);
@@ -1779,11 +2404,93 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     return VisionPrefillCacheBuildStatus::Preempted;
   }
 
+  if (shift_tail_for_closed_video_prefix) {
+    llama_pos reserved_insert_len = 0;
+    const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+    for (size_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+      const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), chunk_idx);
+      reserved_insert_len += static_cast<llama_pos>(mtmd_input_chunk_get_n_tokens(chunk));
+    }
+    std::string error;
+    if (!streamingvlm::hybrid_bridge::build_tail_insertion_plan(
+            cache.video_prefix_insert_pos,
+            reserved_insert_len,
+            closed_video_prefix_original_sequence_end,
+            &closed_video_prefix_insert_plan,
+            &error)) {
+      LOG_ERR("failed to build KV tail insertion plan: %s\n", error.c_str());
+      cache = std::move(next_cache);
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    const long shift_start_ms = now_ms();
+    if (!streamingvlm::hybrid_bridge::apply_tail_insertion_plan(
+            llama_get_memory(ctx.lctx),
+            0,
+            closed_video_prefix_insert_plan,
+            &error)) {
+      LOG_ERR("failed to shift KV tail before video-prefix insert: %s\n", error.c_str());
+      cache = std::move(next_cache);
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    llama_synchronize(ctx.lctx);
+    cache_phases.row("KVRepositionTailShift", shift_start_ms, now_ms());
+    ctx.n_past = closed_video_prefix_insert_plan.insert_pos;
+    closed_video_prefix_tail_shifted = true;
+  }
+
   bool preempted = false;
   bool partial_image_committed = false;
   std::vector<std::size_t> committed_image_tokens;
+  std::vector<streamingvlm::hybrid_bridge::KvTokenRange> committed_image_kv_ranges;
   std::size_t committed_chunk_count = 0;
   const int32_t image_prefill_batch_size = std::max(1, args.ubatch_size);
+  auto finish_closed_video_prefix_insert = [&]() {
+    if (!insert_frame_into_closed_video_prefix) {
+      return true;
+    }
+    if (!update_first_video_user_message(next_cache.chat_history, target_frames)) {
+      next_cache.chat_history = cache.chat_history;
+      if (!update_first_video_user_message(next_cache.chat_history, target_frames)) {
+        LOG_ERR("failed to update cached first video user message before tail replay\n");
+        return false;
+      }
+    }
+    if (shift_tail_for_closed_video_prefix) {
+      if (!closed_video_prefix_tail_shifted) {
+        LOG_ERR("cannot finish closed video-prefix insert: KV tail was not shifted\n");
+        return false;
+      }
+      const llama_pos inserted_len = ctx.n_past - closed_video_prefix_insert_plan.insert_pos;
+      if (inserted_len < 0 || inserted_len > closed_video_prefix_insert_plan.insert_len) {
+        LOG_ERR("invalid closed video-prefix insert length: %lld\n", static_cast<long long>(inserted_len));
+        return false;
+      }
+      if (inserted_len < closed_video_prefix_insert_plan.insert_len) {
+        const llama_pos gap_begin = closed_video_prefix_insert_plan.insert_pos + inserted_len;
+        const llama_pos gap_end = closed_video_prefix_insert_plan.insert_pos + closed_video_prefix_insert_plan.insert_len;
+        if (!compact_unused_insert_gap(
+                ctx,
+                gap_begin,
+                gap_end,
+                closed_video_prefix_insert_plan.expanded_sequence_end,
+                cache_phases)) {
+          return false;
+        }
+      }
+      ctx.n_past = closed_video_prefix_original_sequence_end + inserted_len;
+      next_cache.n_past = ctx.n_past;
+      next_cache.video_prefix_insert_pos = closed_video_prefix_insert_plan.insert_pos + inserted_len;
+      next_cache.video_prefix_insert_pos_valid = true;
+      next_cache.video_prefix_state.clear();
+      next_cache.video_prefix_state_valid = false;
+    }
+    if (!compact_vision_prefill_cache_frames(args, ctx, next_cache, cache_phases)) {
+      return false;
+    }
+    next_cache.chat_history = ctx.chat_history;
+    next_cache.n_past = ctx.n_past;
+    return true;
+  };
   if (!eval_streaming_chunks_with_on_demand_vision(
           ctx,
           chunks,
@@ -1804,18 +2511,45 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
           pending_prompt_jobs,
           &preempted,
           &committed_image_tokens,
+          &committed_image_kv_ranges,
           &committed_chunk_count)) {
     if (preempted) {
       if (partial_image_committed) {
-        append_rendered_trace_to_cache(
-            next_cache,
-            render_prefill_trace_for_chunks(
-                ctx,
-                chunks,
-                next_cache.prefill_trace_next_chunk_idx,
-                next_cache.prefill_trace_next_image_idx,
-                &committed_image_tokens,
-                committed_chunk_count));
+        const std::vector<int> image_frame_indices = image_frame_indices_for_frames(frames_loaded_for_kv_span);
+        for (size_t span_i = 0; span_i < committed_image_kv_ranges.size(); ++span_i) {
+          const int frame_index = span_i < image_frame_indices.size() ? image_frame_indices[span_i] : frame_idx;
+          next_cache.frame_kv_spans.push_back(VisionKvSpan{
+              frame_index,
+              committed_image_kv_ranges[span_i].begin,
+              committed_image_kv_ranges[span_i].end});
+        }
+        const RenderedPrefillTrace rendered = render_prefill_trace_for_chunks(
+            ctx,
+            chunks,
+            insert_frame_into_closed_video_prefix
+                ? next_cache.prefill_trace_video_next_chunk_idx
+                : next_cache.prefill_trace_next_chunk_idx,
+            insert_frame_into_closed_video_prefix
+                ? next_cache.prefill_trace_video_next_image_idx
+                : next_cache.prefill_trace_next_image_idx,
+            &committed_image_tokens,
+            committed_chunk_count);
+        if (insert_frame_into_closed_video_prefix) {
+          append_rendered_video_trace_to_cache(next_cache, rendered);
+        } else {
+          append_rendered_trace_to_cache(next_cache, rendered);
+          if (next_cache.open_user_prefix) {
+            set_open_video_trace_from_combined(next_cache);
+          }
+        }
+        if (!finish_closed_video_prefix_insert()) {
+          cache = std::move(next_cache);
+          return VisionPrefillCacheBuildStatus::Failed;
+        }
+        if (next_cache.open_user_prefix) {
+          next_cache.video_prefix_insert_pos = ctx.n_past;
+          next_cache.video_prefix_insert_pos_valid = true;
+        }
         if (!save_vision_prefill_cache_state(ctx, next_cache, cache_phases, args.partial_vision_kv)) {
           cache = std::move(next_cache);
           return VisionPrefillCacheBuildStatus::Failed;
@@ -1833,15 +2567,37 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     cache = std::move(next_cache);
     return VisionPrefillCacheBuildStatus::Failed;
   }
-  append_rendered_trace_to_cache(
-      next_cache,
-      render_prefill_trace_for_chunks(
-          ctx,
-          chunks,
-          next_cache.prefill_trace_next_chunk_idx,
-          next_cache.prefill_trace_next_image_idx,
-          &committed_image_tokens,
-          committed_chunk_count));
+  const std::vector<int> image_frame_indices = image_frame_indices_for_frames(frames_loaded_for_kv_span);
+  for (size_t span_i = 0; span_i < committed_image_kv_ranges.size(); ++span_i) {
+    const int committed_frame_index = span_i < image_frame_indices.size() ? image_frame_indices[span_i] : frame_idx;
+    next_cache.frame_kv_spans.push_back(VisionKvSpan{
+        committed_frame_index,
+        committed_image_kv_ranges[span_i].begin,
+        committed_image_kv_ranges[span_i].end});
+  }
+	  const RenderedPrefillTrace rendered = render_prefill_trace_for_chunks(
+	      ctx,
+	      chunks,
+	      insert_frame_into_closed_video_prefix
+	          ? next_cache.prefill_trace_video_next_chunk_idx
+	          : next_cache.prefill_trace_next_chunk_idx,
+	      insert_frame_into_closed_video_prefix
+	          ? next_cache.prefill_trace_video_next_image_idx
+	          : next_cache.prefill_trace_next_image_idx,
+	      &committed_image_tokens,
+	      committed_chunk_count);
+	  if (insert_frame_into_closed_video_prefix) {
+	    append_rendered_video_trace_to_cache(next_cache, rendered);
+	  } else {
+	    append_rendered_trace_to_cache(next_cache, rendered);
+	    if (next_cache.open_user_prefix) {
+	      set_open_video_trace_from_combined(next_cache);
+	    }
+	  }
+  if (!finish_closed_video_prefix_insert()) {
+    cache = std::move(next_cache);
+    return VisionPrefillCacheBuildStatus::Failed;
+  }
   if (cache_preempt_requested(pending_prompt_jobs) && !args.partial_vision_kv) {
     if (!rollback_vision_prefill_cache_build(ctx, cache, cache_phases, true)) {
       return VisionPrefillCacheBuildStatus::Failed;
@@ -1849,6 +2605,16 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     return VisionPrefillCacheBuildStatus::Preempted;
   } else if (cache_preempt_requested(pending_prompt_jobs)) {
     record_cache_preempt(cache_phases);
+  }
+
+  if (!insert_frame_into_closed_video_prefix &&
+      !compact_vision_prefill_cache_frames(args, ctx, next_cache, cache_phases)) {
+    cache = std::move(next_cache);
+    return VisionPrefillCacheBuildStatus::Failed;
+  }
+  if (next_cache.open_user_prefix) {
+    next_cache.video_prefix_insert_pos = ctx.n_past;
+    next_cache.video_prefix_insert_pos_valid = true;
   }
 
   if (!save_vision_prefill_cache_state(ctx, next_cache, cache_phases, args.partial_vision_kv)) {
@@ -1901,6 +2667,8 @@ int run_vision_prefill_prompt_from_committed_cache(
   const bool prefer_host_restore = args.dynamic_kv_cache && !vision_cache->host_state.empty();
   if (restore_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, "VisionPrefillCacheRestore", prefer_host_restore)) {
     std::string suffix;
+    const bool prompt_closes_open_video_prefix = vision_cache->open_user_prefix;
+    const llama_pos video_prefix_insert_pos_before_suffix = ctx.n_past;
     const std::string user_content =
         vision_cache->open_user_prefix ? (vision_cache->open_user_content + prompt.prompt) : prompt.prompt;
     const bool add_special = ctx.chat_history.empty() && !vision_cache->open_user_prefix;
@@ -1908,9 +2676,13 @@ int run_vision_prefill_prompt_from_committed_cache(
         ? build_formatted_question_suffix(ctx, vision_cache->open_user_content, prompt.prompt, suffix)
         : (suffix = format_user_message_for_current_history(ctx, prompt.prompt), true);
     if (suffix_ready) {
+      if (prompt_closes_open_video_prefix &&
+          !save_vision_prefill_video_prefix_state(ctx, *vision_cache, prompt_phases)) {
+        rc = 1;
+      }
       mtmd::bitmaps empty_bitmaps;
       mtmd::input_chunks suffix_chunks(mtmd_input_chunks_init());
-      const bool tokenized_suffix = tokenize_formatted_text(
+      const bool tokenized_suffix = rc == 0 && tokenize_formatted_text(
               ctx,
               suffix,
               empty_bitmaps,
@@ -1949,16 +2721,15 @@ int run_vision_prefill_prompt_from_committed_cache(
         const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
         generated_text =
             generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
-        std::string restored_trace_body = vision_cache->prefill_trace_body + suffix_trace.body;
-        std::string restored_trace_flat = vision_cache->prefill_trace_flat + suffix_trace.flat;
-        std::size_t restored_next_chunk_idx = suffix_trace.next_chunk_idx;
-        const std::size_t restored_next_image_idx = suffix_trace.next_image_idx;
+        std::string tail_trace_body = vision_cache->prefill_trace_tail_body + suffix_trace.body;
+        std::string tail_trace_flat = vision_cache->prefill_trace_tail_flat + suffix_trace.flat;
+        std::size_t tail_next_chunk_idx = suffix_trace.next_chunk_idx;
         if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
-          const std::string decode_history_body = trace_writer->decode_history_body(restored_next_chunk_idx);
+          const std::string decode_history_body = trace_writer->decode_history_body(tail_next_chunk_idx);
           if (!decode_history_body.empty()) {
-            restored_trace_body += decode_history_body;
-            restored_trace_flat += trace_writer->decode_flat();
-            ++restored_next_chunk_idx;
+            tail_trace_body += decode_history_body;
+            tail_trace_flat += trace_writer->decode_flat();
+            ++tail_next_chunk_idx;
           }
         }
         vision_cache->frames = cached_frames;
@@ -1966,10 +2737,20 @@ int run_vision_prefill_prompt_from_committed_cache(
         vision_cache->images = images;
         vision_cache->open_user_prefix = false;
         vision_cache->open_user_content.clear();
-        vision_cache->prefill_trace_body = std::move(restored_trace_body);
-        vision_cache->prefill_trace_flat = std::move(restored_trace_flat);
-        vision_cache->prefill_trace_next_chunk_idx = restored_next_chunk_idx;
-        vision_cache->prefill_trace_next_image_idx = restored_next_image_idx;
+        vision_cache->open_user_frame_indices.clear();
+        if (prompt_closes_open_video_prefix) {
+          vision_cache->video_prefix_insert_pos = video_prefix_insert_pos_before_suffix;
+          vision_cache->video_prefix_insert_pos_valid = true;
+          if (vision_cache->prefill_trace_video_body.empty()) {
+            set_open_video_trace_from_combined(*vision_cache);
+          }
+          vision_cache->prefill_trace_tail_body = std::move(tail_trace_body);
+          vision_cache->prefill_trace_tail_flat = std::move(tail_trace_flat);
+        } else {
+          vision_cache->prefill_trace_tail_body = std::move(tail_trace_body);
+          vision_cache->prefill_trace_tail_flat = std::move(tail_trace_flat);
+        }
+        rebuild_prefill_trace_from_video_and_tail(*vision_cache);
         if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, args.partial_vision_kv)) {
           rc = 1;
         } else {
@@ -2324,6 +3105,9 @@ struct StreamBufferStats {
   int prompt_decode_jobs = 0;
   int skipped_cache_updates = 0;
   int latest_frame_only_dropped_cache_updates = 0;
+  int kv_reposition_compactions = 0;
+  int kv_reposition_removed_frames = 0;
+  llama_pos kv_reposition_removed_tokens = 0;
   long committed_cache_update_ms = 0;
   long prompt_decode_ms = 0;
   long first_input_ms = 0;
@@ -2434,6 +3218,10 @@ void write_stream_buffer_summary(const Args& args, const Manifest& manifest, con
   out << "prompt_decode_total_s=" << prompt_decode_total_s << "\n";
   out << "skipped_cache_updates=" << stats.skipped_cache_updates << "\n";
   out << "latest_frame_only_dropped_cache_updates=" << stats.latest_frame_only_dropped_cache_updates << "\n";
+  out << "kv_reposition_keep_latest_frames=" << args.kv_reposition_keep_latest_frames << "\n";
+  out << "kv_reposition_compactions=" << stats.kv_reposition_compactions << "\n";
+  out << "kv_reposition_removed_frames=" << stats.kv_reposition_removed_frames << "\n";
+  out << "kv_reposition_removed_tokens=" << stats.kv_reposition_removed_tokens << "\n";
   out << "prompt_frame_lag_s_avg=" << avg_prompt_frame_lag_s << "\n";
   out << "prompt_frame_lag_s_count=" << stats.prompt_frame_lag_s.size() << "\n";
 }
@@ -2458,6 +3246,9 @@ int main(int argc, char** argv) {
   }
   args.stream_mode = normalize_stream_mode(args.stream_mode, args.single_buffer);
   args.single_buffer = args.stream_mode == "on_demand";
+  if (args.stream_mode == "vision_prefill") {
+    setenv("LLAMA_ALLOW_KV_GAP_FILL", "1", 1);
+  }
   if (manifest.frames.empty()) {
     std::fprintf(stderr, "stream manifest has no frames: %s\n", args.manifest.c_str());
     return 2;
@@ -2590,9 +3381,11 @@ int main(int argc, char** argv) {
             }
             stream_jobs.push_back(StreamJob{
                 StreamJobKind::CacheUpdate,
-                args.online_buffer && !args.latest_frame_only
+                args.online_buffer
                     ? std::vector<FrameRecord>{}
-                    : select_prompt_frames(args, available_frames, current_frame, cache_event),
+                    : (args.latest_frame_only
+                           ? std::vector<FrameRecord>{current_frame}
+                           : select_prompt_frames(args, available_frames, current_frame, cache_event)),
                 cache_event,
                 -1,
                 frame.index,
@@ -2684,9 +3477,10 @@ int main(int argc, char** argv) {
             args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::Prompt;
         if (prompt_uses_committed_vision_cache) {
           buffer_stats.prompt_frame_lag_s.push_back(latest_frame.timestamp_s - job.prompt.timestamp_s);
-        } else if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::CacheUpdate && args.latest_frame_only && !job.frames.empty()) {
-          job.frame_idx = last_frame_index(job.frames);
-          job.prompt.timestamp_s = job.frames.back().timestamp_s;
+        } else if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::CacheUpdate && args.latest_frame_only) {
+          job.frames = {latest_frame};
+          job.frame_idx = latest_frame.index;
+          job.prompt.timestamp_s = latest_frame.timestamp_s;
         } else if (args.stream_mode == "vision_prefill" && job.kind == StreamJobKind::CacheUpdate) {
           job.frames = {latest_frame};
           job.frame_idx = latest_frame.index;
@@ -2757,6 +3551,9 @@ int main(int argc, char** argv) {
         } else if (status == VisionPrefillCacheBuildStatus::Ok ||
                    status == VisionPrefillCacheBuildStatus::Partial) {
           note_committed_cache_update(buffer_stats, cache_start_ms, cache_end_ms);
+          buffer_stats.kv_reposition_compactions += vision_prefill_cache.last_kv_reposition_compactions;
+          buffer_stats.kv_reposition_removed_frames += vision_prefill_cache.last_kv_reposition_removed_frames;
+          buffer_stats.kv_reposition_removed_tokens += vision_prefill_cache.last_kv_reposition_removed_tokens;
         } else {
           note_processed_visual_job(buffer_stats, cache_start_ms, cache_end_ms);
         }

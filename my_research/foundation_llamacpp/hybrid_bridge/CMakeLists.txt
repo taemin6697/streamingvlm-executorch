@@ -40,6 +40,10 @@ if(HYBRID_BRIDGE_BUILD_LLAMA_DECODER)
     hybrid_streaming_decode.cpp
     hybrid_embedding_file.cpp
   )
+  add_executable(
+    kv_reposition_probe
+    kv_reposition_probe.cpp
+  )
   target_include_directories(
     hybrid_decode
     PRIVATE
@@ -84,10 +88,18 @@ if(HYBRID_BRIDGE_BUILD_LLAMA_DECODER)
       "${LLAMA_CPP_ROOT}/ggml/include"
       "${LLAMA_CPP_ROOT}/ggml/src"
   )
+  target_include_directories(
+    kv_reposition_probe
+    PRIVATE
+      "${CMAKE_CURRENT_LIST_DIR}"
+      "${LLAMA_CPP_ROOT}/include"
+      "${LLAMA_CPP_ROOT}/ggml/include"
+  )
   target_link_libraries(hybrid_decode PRIVATE llama-common mtmd Threads::Threads)
   target_link_libraries(opencl_phase_mtmd PRIVATE llama-common mtmd Threads::Threads)
   target_link_libraries(hybrid_streaming_decode PRIVATE llama-common mtmd Threads::Threads)
   target_link_libraries(opencl_streaming_decode PRIVATE llama-common mtmd Threads::Threads)
+  target_link_libraries(kv_reposition_probe PRIVATE llama Threads::Threads)
   target_compile_definitions(
     hybrid_streaming_decode
     PRIVATE
@@ -99,6 +111,7 @@ if(HYBRID_BRIDGE_BUILD_LLAMA_DECODER)
   target_compile_features(opencl_phase_mtmd PRIVATE cxx_std_17)
   target_compile_features(hybrid_streaming_decode PRIVATE cxx_std_17)
   target_compile_features(opencl_streaming_decode PRIVATE cxx_std_17)
+  target_compile_features(kv_reposition_probe PRIVATE cxx_std_17)
 endif()
 
 if(HYBRID_BRIDGE_BUILD_EXECUTORCH_VISION)

@@ -5,6 +5,56 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-19: KV/RoPE Repositioning Prototype Branch
+
+- Created branch `codex/rope-kv-reposition-experiment` from `origin/main`.
+- Added `hybrid_bridge/kv_reposition.hpp` as the first policy-free helper for
+  future video compression. It builds a tail-compaction plan and applies it via
+  `llama_memory_seq_rm` plus `llama_memory_seq_add`, relying on llama.cpp's
+  existing K-shift update to re-apply RoPE to cached K on the next memory
+  update/decode.
+- Added `hybrid_bridge/kv_reposition_probe.cpp` for host validation against an
+  actual GGUF model. The probe compares compact re-prefill against
+  `prefix + removed + history -> remove+shift -> suffix`.
+- Documented the design in
+  `docs/archive/kv_rope_reposition_for_video_compression.md`.
+- Actual host probe results:
+  - InternVL3-1B Q8_0: top-1 next token matched and both paths answered
+    "The user asked about alpha."; logits RMS delta was 0.438441459.
+  - InternVL3-2B Q4_K_M: top-1 next token matched and both paths answered
+    "The user previously asked about alpha."; logits RMS delta was 0.473699338.
+- Scope note: this does not yet physically shrink OpenCL KV allocation and does
+  not solve M-RoPE visual-axis remapping. Also, logits are not identical because
+  shifted tail tokens were originally computed under the old context. Treat this
+  as a practical KV-level approximation unless the preserved tail states are
+  acceptable for the compression policy.
+- Wired the helper into real hybrid streaming vision-prefill behind
+  `--kv-reposition-keep-latest-frames N`.
+  - `VisionPrefillCache` now tracks per-frame `VisionKvSpan` records for the
+    committed image KV ranges.
+  - `compact_vision_prefill_cache_frames()` removes old frame vision spans with
+    `llama_memory_seq_rm`, shifts the remaining tail with
+    `llama_memory_seq_add`, updates `ctx.n_past`, and saves the compacted cache
+    snapshot.
+  - `--latest-frame-only` cache updates were corrected to enqueue/process only
+    the live latest frame, not a cumulative selected frame list.
+  - `runner/cli.py` forwards the new arg, adds the result suffix
+    `_kvreposition_keep<N>`, and includes `KVRepositionCompact` in the common
+    phase labels.
+- Actual Android streaming validation with
+  `--online-buffer --latest-frame-only --partial-vision-kv
+  --kv-reposition-keep-latest-frames 4`:
+  - InternVL3-1B Q8_0:
+    `results/log/kv_rope_reposition_streaming_compact_1b_keep4_fixed/...`
+    completed with `foundation_exit_code.txt=0`,
+    `kv_reposition_compactions=11`, and
+    `kv_reposition_removed_tokens=2816`.
+  - InternVL3-2B Q8_0:
+    `results/log/kv_rope_reposition_streaming_compact_2b_keep4/...`
+    completed with `foundation_exit_code.txt=0`,
+    `kv_reposition_compactions=3`, and
+    `kv_reposition_removed_tokens=768`.
+
 ## 2026-05-18: Full Streaming Prefill Token Trace
 
 - Created branch `codex/full-streaming-prefill-token-trace`.

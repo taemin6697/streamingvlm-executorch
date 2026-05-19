@@ -43,7 +43,9 @@ inline const char* hybrid_decode_phase_description() {
          "ExternalEmbeddingRead: .svlmemb read  LayoutTokenize: mtmd text/image layout  "
          "Mmproj: OpenCL mmproj projection for QNN pre-projector features  "
          "Prefill: combined text/image prompt eval  ImagePrefill: external image embedding decode  "
-         "T_Prefill: text prompt eval  D: one generated-token decode";
+         "T_Prefill: text prompt eval  KVRepositionInsert: append late frame to restored video-prefix KV  "
+         "KVRepositionTailShift: shift cached text tail in-place and reapply RoPE via llama.cpp K-shift before video-prefix KV insert  "
+         "KVRepositionCompact: remove/close a KV gap and shift cached tail  D: one generated-token decode";
 }
 
 inline const char* opencl_phase_description() {
@@ -62,4 +64,3 @@ inline const char* vision_phase_description() {
 }
 
 } // namespace streamingvlm::hybrid_bridge
-

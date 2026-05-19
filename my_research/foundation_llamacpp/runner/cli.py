@@ -57,6 +57,7 @@ PHASE_PLOT_ALIASES = {
     "VisionPrefillImagePrefill": "ImagePrefill",
     "VisionPrefillImagePrefillBatch": "ImagePrefill",
     "VisionPrefillT_Prefill": "T_Prefill",
+    "VisionPrefillTailReplayT_Prefill": "TailReplay",
 }
 PHASE_PLOT_EXCLUDED = {
     "EmbeddingFileWrite",
@@ -78,6 +79,9 @@ PHASE_PLOT_EXCLUDED = {
     "VisionPrefillImageLoad",
     "VisionPrefillLayoutTokenize",
     "VisionPrefillSuffixTokenize",
+    "VisionPrefillTailReplayTokenize",
+    "VisionPrefillVideoPrefixRestore",
+    "VisionPrefillVideoPrefixSave",
     *DYNAMIC_KV_GROW_BREAKDOWN_PHASES.values(),
 }
 PHASE_TIMELINE_VISIBLE = [
@@ -86,6 +90,10 @@ PHASE_TIMELINE_VISIBLE = [
     "Mmproj",
     "ImagePrefill",
     "T_Prefill",
+    "TailReplay",
+    "KVRepositionInsert",
+    "KVRepositionTailShift",
+    "KVRepositionCompact",
     "DynamicKVGrow",
     "Decode",
 ]
@@ -801,6 +809,9 @@ def _phase_colors() -> dict[str, str]:
         "I_Prefill": "#0984e3",
         "ImagePrefill": "#0984e3",
         "T_Prefill": "#e17055",
+        "TailReplay": "#fab1a0",
+        "KVRepositionTailShift": "#2d3436",
+        "KVRepositionCompact": "#636e72",
         "Mmproj": "#00cec9",
         "DynamicKVGrow": "#2d3436",
         "DynamicKVGrowAlloc": "#636e72",
@@ -1765,6 +1776,7 @@ def _result_model_name(
     dynamic_kv_cache: bool = False,
     online_buffer: bool = False,
     latest_frame_only: bool = False,
+    kv_reposition_keep_latest_frames: int = 0,
 ) -> str:
     suffix = "opencl" if processor == "gpu" else processor
     kv = _result_kv_suffix(cache_type_k, cache_type_v)
@@ -1784,7 +1796,12 @@ def _result_model_name(
     dynamic = "_dynamic" if dynamic_kv_cache else ""
     online = "_online" if online_buffer else ""
     latest = "_latest_frame_only" if latest_frame_only else ""
-    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}{online}{latest}"
+    kv_reposition = (
+        f"_kvreposition_keep{kv_reposition_keep_latest_frames}"
+        if kv_reposition_keep_latest_frames and kv_reposition_keep_latest_frames > 0
+        else ""
+    )
+    return f"{model.stem}_{suffix}_ctx_{ctx_size}{mid}{kv}{dynamic}{online}{latest}{kv_reposition}"
 
 
 def _find_executable(build_dir: Path, name: str) -> Path:
@@ -2179,6 +2196,11 @@ def _build_hybrid_streaming_remote_script(args: argparse.Namespace) -> str:
     online_buffer_arg = "--online-buffer" if getattr(args, "online_buffer", False) else ""
     latest_frame_only_arg = "--latest-frame-only" if getattr(args, "latest_frame_only", False) else ""
     partial_vision_kv_arg = "--partial-vision-kv" if getattr(args, "partial_vision_kv", False) else ""
+    kv_reposition_arg = (
+        f"--kv-reposition-keep-latest-frames {args.kv_reposition_keep_latest_frames}"
+        if getattr(args, "kv_reposition_keep_latest_frames", 0)
+        else ""
+    )
     stream_mode_arg = f"--stream-mode {shlex.quote(args.stream_mode)}"
     media_mode_arg = f"--media-mode {shlex.quote('streaming' if args.streaming_video is not None else args.media_mode.value.replace('_', '-'))}"
     window_sec_arg = f"--window-sec {args.window_sec}" if args.window_sec is not None else ""
@@ -2202,7 +2224,7 @@ printf '%s\\n' '{_memory_csv_header()}' > {shlex.quote(remote_memory_csv)}
 
 {baseline_loop}
 
-./{runner_bin} {online_buffer_arg} {latest_frame_only_arg} {partial_vision_kv_arg} --runner ./opencl_phase_mtmd \\
+./{runner_bin} {online_buffer_arg} {latest_frame_only_arg} {partial_vision_kv_arg} {kv_reposition_arg} --runner ./opencl_phase_mtmd \\
   {encoder_arg} {warmup_image_arg} \\
   {media_mode_arg} \\
   {stream_mode_arg} {window_sec_arg} {window_max_frames_arg} \\
@@ -2384,6 +2406,7 @@ def main() -> int:
     parser.add_argument("--online-buffer", "--online_buffer", dest="online_buffer", action="store_true", help="Use latest-only online stream buffer semantics.")
     parser.add_argument("--latest-frame-only", "--latest_frame_only", dest="latest_frame_only", action="store_true", help="For vision-prefill streaming, drop frame cache updates that arrive while the worker is busy so the next cache update starts only from a newly arrived frame.")
     parser.add_argument("--partial-vision-kv", "--partial_vision_kv", dest="partial_vision_kv", action="store_true", help="In vision-prefill streaming, commit the current image prefill chunk when a prompt preempts cache construction.")
+    parser.add_argument("--kv-reposition-keep-latest-frames", "--kv_reposition_keep_latest_frames", dest="kv_reposition_keep_latest_frames", type=int, default=0, help="Experimental vision-prefill KV compaction: keep only the latest N frame vision-KV spans and RoPE-shift later cached tokens forward.")
     parser.add_argument("--num-segments", type=int, default=8, help="Uniform temporal samples for --video.")
     parser.add_argument("--sampling-fps", "--sampling_fps", dest="sampling_fps", type=float, default=None, help="Frame sampling FPS for --streaming-video.")
     parser.add_argument("--max-video-time", "--max_video_time", dest="max_video_time", type=float, default=None, help="Optional maximum streaming-video duration to sample, in seconds.")
@@ -2726,6 +2749,7 @@ def main() -> int:
         dynamic_kv_cache=getattr(args, "dynamic_kv_cache", False),
         online_buffer=getattr(args, "online_buffer", False),
         latest_frame_only=getattr(args, "latest_frame_only", False),
+        kv_reposition_keep_latest_frames=getattr(args, "kv_reposition_keep_latest_frames", 0),
     )
     result_dir.mkdir(parents=True, exist_ok=True)
     _clear_result_artifact_dirs(result_dir)
