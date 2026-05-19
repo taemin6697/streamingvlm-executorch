@@ -5,6 +5,41 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-19: Streaming Research Extensibility Refactor
+
+- Created branch `codex/streaming-research-refactor` from `main`.
+- Added host-side prompt profiles in `runner/prompt_formats.py`.
+  - `internvl3` remains the default validated layout.
+  - `qwen2_5_vl` is registered as the next model-family extension point.
+  - `runner/media.py` now writes `prompt_format` into every media manifest.
+  - `runner/cli.py` exposes `--prompt-format` and forwards it to
+    `hybrid_streaming_decode`.
+- Added Android bridge profile/policy helpers:
+  - `hybrid_bridge/streaming_prompt_format.hpp` owns `PromptFormatProfile`,
+    stream frame-prefix construction, first-video-user-message rewriting, and
+    frame-prefix stripping.
+  - `hybrid_bridge/streaming_policy.hpp` owns frame selection for
+    `on-demand`, `sliding-window`, and `vision-prefill`.
+  - `hybrid_streaming_decode.cpp` now delegates to those helpers while keeping
+    the previous behavior and helper names at the call sites.
+- Extended `hybrid_bridge/kv_reposition.hpp` with `KvRepositionStrategy`,
+  `KvPositionEncodingKind::Rope1D`, and `KvPositionEncodingKind::MRope`. The
+  current implementation still uses the 1D RoPE llama.cpp K-shift path, while
+  the M-RoPE placeholder documents where future Qwen-style axis-aware cached-K
+  rewrite should attach.
+- Added targeted contract tests in
+  `tests/test_streaming_research_refactor_contract.py` and updated the
+  vision-prefill contract tests to assert the new helper boundaries instead of
+  hard-coding implementation details inside `hybrid_streaming_decode.cpp`.
+- Added
+  `scripts/run_refactor_regression_internvl_1b2b.sh`, a targeted Android
+  regression matrix for InternVL3 1B/2B covering single image, multi-image,
+  offline video, streaming on-demand, streaming sliding-window, and streaming
+  vision-prefill with dynamic KV, online buffer, partial vision KV, and
+  latest-frame-only where applicable.
+- Detailed design notes live in
+  `docs/archive/streaming_research_refactor_model_policy_kv.md`.
+
 ## 2026-05-19: KV/RoPE Repositioning Prototype Branch
 
 - Created branch `codex/rope-kv-reposition-experiment` from `origin/main`.

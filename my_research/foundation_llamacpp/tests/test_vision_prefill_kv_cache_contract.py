@@ -58,10 +58,12 @@ def test_streaming_timeline_aliases_vision_prefill_to_standard_lanes():
 
 def test_vision_prefill_keeps_full_history_and_caches_every_frame():
     source = STREAMING_CPP.read_text()
+    policy_source = (ROOT / "my_research/foundation_llamacpp/hybrid_bridge/streaming_policy.hpp").read_text()
 
     assert 'args.stream_mode == "vision_prefill"' in source
-    assert 'mode == "sliding_window"' in source
-    assert "return selected;" in source
+    assert 'stream_mode == "vision_prefill"' in policy_source
+    assert 'stream_mode != "sliding_window"' in policy_source
+    assert "return selected;" in policy_source
     assert "StreamJobKind::CacheUpdate" in source
     assert "drop_pending_cache_updates(stream_jobs)" in source
 
@@ -310,16 +312,17 @@ def test_vision_prefill_inserts_late_frames_into_initial_video_prefix():
 
 def test_vision_prefill_uses_global_stream_frame_labels_for_interleaved_turns():
     source = STREAMING_CPP.read_text()
+    prompt_source = (ROOT / "my_research/foundation_llamacpp/hybrid_bridge/streaming_prompt_format.hpp").read_text()
 
     assert "build_stream_frame_prompt_line" in source
-    assert '"Frame" + std::to_string(frame.index + 1) + ": "' in source
+    assert "profile.frame_prefix + std::to_string(frame.index + 1) + profile.frame_separator" in prompt_source
 
 
 def test_streaming_cpp_uses_internvl_video_frame_labels_without_space():
-    source = STREAMING_CPP.read_text()
+    source = (ROOT / "my_research/foundation_llamacpp/hybrid_bridge/streaming_prompt_format.hpp").read_text()
 
-    assert '"Frame" + std::to_string(frame_i + 1) + ": "' in source
-    assert '"Frame" + std::to_string(frame.index + 1) + ": "' in source
+    assert 'frame_prefix = "Frame"' in source
+    assert 'frame_separator = ": "' in source
     assert '"Frame " + std::to_string' not in source
 
 

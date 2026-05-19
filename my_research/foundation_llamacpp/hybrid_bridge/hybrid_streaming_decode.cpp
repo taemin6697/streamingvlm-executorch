@@ -29,6 +29,8 @@
 #endif
 
 #include "kv_reposition.hpp"
+#include "streaming_prompt_format.hpp"
+#include "streaming_policy.hpp"
 
 namespace {
 
@@ -52,6 +54,7 @@ struct Manifest {
   std::string source_kind;
   double sampling_fps = 0.0;
   std::string stream_mode;
+  std::string prompt_format;
   double window_sec = -1.0;
   int window_max_frames = 0;
   std::string prompt;
@@ -214,6 +217,7 @@ Manifest parse_manifest(const std::string& path) {
   find_string_after(text, 0, "source_kind", manifest.source_kind);
   find_number_after(text, 0, "sampling_fps", manifest.sampling_fps);
   find_string_after(text, 0, "stream_mode", manifest.stream_mode);
+  find_string_after(text, 0, "prompt_format", manifest.prompt_format);
   find_number_after(text, 0, "window_sec", manifest.window_sec);
   find_string_after(text, 0, "prompt", manifest.prompt);
   double window_max_frames = 0.0;
@@ -434,14 +438,8 @@ long now_ms() {
 }
 
 std::string normalize_stream_mode(std::string mode, bool single_buffer) {
-  if (single_buffer) {
-    return "on_demand";
-  }
-  std::replace(mode.begin(), mode.end(), '-', '_');
+  mode = streamingvlm::hybrid_bridge::normalize_stream_mode_name(std::move(mode), single_buffer);
   if (mode.empty()) {
-    return "on_demand";
-  }
-  if (mode == "single_buffer") {
     return "on_demand";
   }
   if (mode == "on_demand" || mode == "sliding_window" || mode == "vision_prefill") {
@@ -618,155 +616,71 @@ std::vector<char*> mutable_argv(std::vector<std::string>& args) {
   return out;
 }
 
-std::vector<FrameRecord> evenly_limit_frames(const std::vector<FrameRecord>& frames, int limit) {
-  if (limit <= 0) {
-    std::fprintf(stderr, "--window-max-frames must be positive\n");
-    std::exit(2);
-  }
-  if (static_cast<int>(frames.size()) <= limit) {
-    return frames;
-  }
-  if (limit == 1) {
-    return {frames.back()};
-  }
-  std::vector<FrameRecord> out;
-  out.reserve(static_cast<size_t>(limit));
-  const int last = static_cast<int>(frames.size()) - 1;
-  for (int i = 0; i < limit; ++i) {
-    const int idx = static_cast<int>(std::llround(static_cast<double>(i) * last / (limit - 1)));
-    out.push_back(frames[static_cast<size_t>(idx)]);
-  }
-  return out;
-}
-
 std::vector<FrameRecord> select_prompt_frames(
     const Args& args,
     const std::vector<FrameRecord>& available_frames,
     const FrameRecord& current_frame,
     const PromptEvent& prompt) {
-  if (args.stream_mode == "on_demand") {
-    return {current_frame};
+  streamingvlm::hybrid_bridge::StreamingPolicyConfig policy;
+  policy.stream_mode = args.stream_mode;
+  policy.window_sec = args.window_sec;
+  policy.window_max_frames = args.window_max_frames;
+  try {
+    return streamingvlm::hybrid_bridge::select_prompt_frames(
+        policy,
+        available_frames,
+        current_frame,
+        prompt.timestamp_s);
+  } catch (const std::invalid_argument& exc) {
+    std::fprintf(stderr, "%s\n", exc.what());
+    std::exit(2);
   }
-
-  if (args.stream_mode == "vision_prefill") {
-    std::vector<FrameRecord> selected;
-    for (const FrameRecord& frame : available_frames) {
-      if (frame.timestamp_s <= prompt.timestamp_s) {
-        selected.push_back(frame);
-      }
-    }
-    if (selected.empty()) {
-      selected.push_back(current_frame);
-    }
-    return selected;
-  }
-
-  const double start_s = args.window_sec > 0.0 ? prompt.timestamp_s - args.window_sec : -1.0e30;
-  std::vector<FrameRecord> selected;
-  for (const FrameRecord& frame : available_frames) {
-    if (frame.timestamp_s >= start_s && frame.timestamp_s <= prompt.timestamp_s) {
-      selected.push_back(frame);
-    }
-  }
-  if (selected.empty()) {
-    for (auto it = available_frames.rbegin(); it != available_frames.rend(); ++it) {
-      if (it->timestamp_s <= prompt.timestamp_s) {
-        selected.push_back(*it);
-        break;
-      }
-    }
-  }
-  if (selected.empty()) {
-    selected.push_back(current_frame);
-  }
-  return evenly_limit_frames(selected, args.window_max_frames);
 }
 
 constexpr const char* SVLM_QUESTION_SENTINEL = "<SVLM_QUESTION_SENTINEL>";
 
+streamingvlm::hybrid_bridge::PromptFormatProfile g_prompt_format_profile =
+    streamingvlm::hybrid_bridge::prompt_format_profile("internvl3");
+
+const streamingvlm::hybrid_bridge::PromptFormatProfile& active_prompt_format_profile() {
+  return g_prompt_format_profile;
+}
+
 std::string build_video_prompt_prefix(const std::vector<FrameRecord>& frames) {
-  std::string out;
-  for (size_t frame_i = 0; frame_i < frames.size(); ++frame_i) {
-    out += "Frame" + std::to_string(frame_i + 1) + ": ";
-    const size_t n_tiles = std::max<size_t>(1, frames[frame_i].tiles.size());
-    for (size_t tile_i = 0; tile_i < n_tiles; ++tile_i) {
-      out += mtmd_default_marker();
-    }
-    out += "\n";
-  }
-  return out;
+  const auto& profile = active_prompt_format_profile();
+  return streamingvlm::hybrid_bridge::build_video_prompt_prefix(profile, frames);
 }
 
 std::string build_stream_frame_prompt_line(const FrameRecord& frame) {
-  std::string out = "Frame" + std::to_string(frame.index + 1) + ": ";
-  const size_t n_tiles = std::max<size_t>(1, frame.tiles.size());
-  for (size_t tile_i = 0; tile_i < n_tiles; ++tile_i) {
-    out += mtmd_default_marker();
-  }
-  out += "\n";
-  return out;
+  const auto& profile = active_prompt_format_profile();
+  return streamingvlm::hybrid_bridge::build_stream_frame_prompt_line(profile, frame);
 }
 
 std::string build_stream_video_prompt_prefix(const std::vector<FrameRecord>& frames) {
-  std::string out;
-  for (const FrameRecord& frame : frames) {
-    out += build_stream_frame_prompt_line(frame);
-  }
-  return out;
+  const auto& profile = active_prompt_format_profile();
+  return streamingvlm::hybrid_bridge::build_stream_video_prompt_prefix(profile, frames);
 }
 
 size_t next_non_frame_prefix_offset(const std::string& content) {
-  size_t pos = 0;
-  const std::string marker = mtmd_default_marker();
-  while (pos < content.size()) {
-    const size_t line_start = pos;
-    if (content.compare(pos, 5, "Frame") != 0) {
-      break;
-    }
-    pos += 5;
-    const size_t digits_begin = pos;
-    while (pos < content.size() && std::isdigit(static_cast<unsigned char>(content[pos]))) {
-      ++pos;
-    }
-    if (pos == digits_begin || pos + 2 > content.size() || content[pos] != ':' || content[pos + 1] != ' ') {
-      pos = line_start;
-      break;
-    }
-    pos += 2;
-    bool saw_image_marker = false;
-    while (content.compare(pos, marker.size(), marker) == 0) {
-      saw_image_marker = true;
-      pos += marker.size();
-    }
-    if (!saw_image_marker || pos >= content.size() || content[pos] != '\n') {
-      pos = line_start;
-      break;
-    }
-    ++pos;
-  }
-  return pos;
+  const auto& profile = active_prompt_format_profile();
+  return streamingvlm::hybrid_bridge::next_non_frame_prefix_offset(profile, content);
 }
 
 std::string strip_stream_video_prompt_prefix(const std::string& content) {
-  return content.substr(next_non_frame_prefix_offset(content));
+  const auto& profile = active_prompt_format_profile();
+  return streamingvlm::hybrid_bridge::strip_stream_video_prompt_prefix(profile, content);
 }
 
 bool update_first_video_user_message(
     std::vector<common_chat_msg>& chat_history,
     const std::vector<FrameRecord>& frames) {
-  for (common_chat_msg& msg : chat_history) {
-    if (msg.role == "user") {
-      msg.content = build_stream_video_prompt_prefix(frames) + strip_stream_video_prompt_prefix(msg.content);
-      return true;
-    }
-  }
-  return false;
+  const auto& profile = active_prompt_format_profile();
+  return streamingvlm::hybrid_bridge::update_first_video_user_message(profile, chat_history, frames);
 }
 
 std::string build_video_prompt(const std::vector<FrameRecord>& frames, const std::string& raw_prompt) {
-  std::string out = build_video_prompt_prefix(frames);
-  out += raw_prompt;
-  return out;
+  const auto& profile = active_prompt_format_profile();
+  return streamingvlm::hybrid_bridge::build_video_prompt(profile, frames, raw_prompt);
 }
 
 std::vector<int> frame_indices_for(const std::vector<FrameRecord>& frames) {
@@ -3235,6 +3149,12 @@ int main(int argc, char** argv) {
   mtmd_helper_log_set(common_log_default_callback, nullptr);
   Args args = parse_args(argc, argv);
   Manifest manifest = parse_manifest(args.manifest);
+  if (args.prompt_format.empty() && !manifest.prompt_format.empty()) {
+    args.prompt_format = manifest.prompt_format;
+  } else if (args.prompt_format.empty()) {
+    args.prompt_format = "internvl3";
+  }
+  g_prompt_format_profile = streamingvlm::hybrid_bridge::prompt_format_profile(args.prompt_format);
   if (args.stream_mode.empty() && !manifest.stream_mode.empty()) {
     args.stream_mode = manifest.stream_mode;
   }
