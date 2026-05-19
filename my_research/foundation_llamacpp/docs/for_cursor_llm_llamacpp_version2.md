@@ -28,6 +28,32 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   shifted tail tokens were originally computed under the old context. Treat this
   as a practical KV-level approximation unless the preserved tail states are
   acceptable for the compression policy.
+- Wired the helper into real hybrid streaming vision-prefill behind
+  `--kv-reposition-keep-latest-frames N`.
+  - `VisionPrefillCache` now tracks per-frame `VisionKvSpan` records for the
+    committed image KV ranges.
+  - `compact_vision_prefill_cache_frames()` removes old frame vision spans with
+    `llama_memory_seq_rm`, shifts the remaining tail with
+    `llama_memory_seq_add`, updates `ctx.n_past`, and saves the compacted cache
+    snapshot.
+  - `--latest-frame-only` cache updates were corrected to enqueue/process only
+    the live latest frame, not a cumulative selected frame list.
+  - `runner/cli.py` forwards the new arg, adds the result suffix
+    `_kvreposition_keep<N>`, and includes `KVRepositionCompact` in the common
+    phase labels.
+- Actual Android streaming validation with
+  `--online-buffer --latest-frame-only --partial-vision-kv
+  --kv-reposition-keep-latest-frames 4`:
+  - InternVL3-1B Q8_0:
+    `results/log/kv_rope_reposition_streaming_compact_1b_keep4_fixed/...`
+    completed with `foundation_exit_code.txt=0`,
+    `kv_reposition_compactions=11`, and
+    `kv_reposition_removed_tokens=2816`.
+  - InternVL3-2B Q8_0:
+    `results/log/kv_rope_reposition_streaming_compact_2b_keep4/...`
+    completed with `foundation_exit_code.txt=0`,
+    `kv_reposition_compactions=3`, and
+    `kv_reposition_removed_tokens=768`.
 
 ## 2026-05-18: Full Streaming Prefill Token Trace
 

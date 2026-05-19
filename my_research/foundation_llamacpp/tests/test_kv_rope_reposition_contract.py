@@ -97,3 +97,22 @@ def test_rope_reposition_design_is_documented_for_future_video_compression():
 
     assert "kv_rope_reposition_for_video_compression.md" in readme
     assert "kv_reposition.hpp" in structure
+
+
+def test_streaming_vision_prefill_can_compact_cached_frame_spans():
+    source = (ROOT / "my_research/foundation_llamacpp/hybrid_bridge/hybrid_streaming_decode.cpp").read_text()
+    runner = (ROOT / "my_research/foundation_llamacpp/runner/cli.py").read_text()
+
+    assert "kv_reposition_keep_latest_frames" in source
+    assert "--kv-reposition-keep-latest-frames" in source
+    assert "struct VisionKvSpan" in source
+    assert "frame_kv_spans" in source
+    assert "compact_vision_prefill_cache_frames" in source
+    assert "build_tail_compaction_plan" in source
+    assert "apply_tail_compaction_plan" in source
+    assert "KVRepositionCompact" in source
+    assert "kv_reposition_compactions" in source
+    assert "args.latest_frame_only\n                           ? std::vector<FrameRecord>{current_frame}" in source
+    assert "job.frames = {latest_frame};" in source
+
+    assert "--kv-reposition-keep-latest-frames" in runner

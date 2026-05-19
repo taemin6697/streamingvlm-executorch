@@ -120,6 +120,89 @@ unchanged tail was computed under the old context. This path should be treated
 as a practical KV-level approximation unless the compressed/repositioned region
 is before tokens whose hidden states are acceptable to preserve.
 
+## Streaming Vision-Prefill Integration
+
+The helper is now wired into the hybrid streaming vision-prefill path as an
+explicit experiment:
+
+```text
+--kv-reposition-keep-latest-frames N
+```
+
+When this option is positive, every committed image prefill records the actual
+decoder KV range occupied by that frame's vision tokens:
+
+```cpp
+struct VisionKvSpan {
+  int frame_index;
+  llama_pos begin;
+  llama_pos end;
+};
+```
+
+After a cache update commits, `compact_vision_prefill_cache_frames()` keeps the
+latest `N` frame indices and removes older vision-KV spans. For each removed
+span it builds a tail compaction plan, calls `llama_memory_seq_rm()` for the
+removed range, calls `llama_memory_seq_add()` to shift the later cached tokens,
+updates `ctx.n_past`, then saves the compacted cache snapshot. The removed
+range is vision KV only; closed user/assistant text KV is preserved and shifted.
+
+This is intentionally separate from the frame scheduling policy:
+
+```text
+--online-buffer
+  pick the live latest frame at processing start
+
+--latest-frame-only
+  drop stale cache-update jobs while the worker is busy
+
+--partial-vision-kv
+  let prompt preemption commit the current image micro-batch
+
+--kv-reposition-keep-latest-frames N
+  after commits, physically remove older frame vision-KV positions from seq 0
+```
+
+`streaming_phase_stats.csv` records `KVRepositionCompact` rows. The token trace
+also appends notes such as:
+
+```text
+## KV_REPOSITION_COMPACT removed_frames=1 removed_vision_tokens=256 keep_latest_frames=4
+```
+
+`stream_buffer_summary.txt` records:
+
+```text
+kv_reposition_keep_latest_frames
+kv_reposition_compactions
+kv_reposition_removed_frames
+kv_reposition_removed_tokens
+```
+
+Observed Android runs on the 20 s surveillance stream with
+`--online-buffer --latest-frame-only --partial-vision-kv
+--kv-reposition-keep-latest-frames 4`:
+
+```text
+InternVL3-1B-Instruct-Q8_0:
+  exit_code=0
+  committed_cache_updates=15
+  kv_reposition_compactions=11
+  kv_reposition_removed_tokens=2816
+  result:
+    my_research/foundation_llamacpp/results/log/
+    kv_rope_reposition_streaming_compact_1b_keep4_fixed/
+
+InternVL3-2B-Instruct-Q8_0:
+  exit_code=0
+  committed_cache_updates=7
+  kv_reposition_compactions=3
+  kv_reposition_removed_tokens=768
+  result:
+    my_research/foundation_llamacpp/results/log/
+    kv_rope_reposition_streaming_compact_2b_keep4/
+```
+
 ## Boundaries and Limitations
 
 This helper does not decide which frames or visual tokens to compress. It only

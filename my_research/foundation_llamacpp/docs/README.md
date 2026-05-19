@@ -59,6 +59,14 @@ User-facing CLI cleanup:
   the committed partial image KV is kept, and the answer starts without waiting
   for the rest of that frame image prefill. The commit granularity is
   controlled by `--ubatch-size`.
+
+--kv-reposition-keep-latest-frames N
+  Experimental hybrid vision-prefill compression hook. After each committed
+  cache update, keep only the latest N frame vision-KV spans, remove older
+  frame vision KV with `llama_memory_seq_rm`, and shift later cached tokens
+  forward with `llama_memory_seq_add`. This is a KV/RoPE reposition experiment
+  for future video compression; it preserves text/chat KV and compacts vision
+  spans only.
 ```
 
 ## Common Setup
@@ -248,8 +256,8 @@ png/dynamic_kv_grow_breakdown_stacked_bar.png
 png/phase_duration_stacked_bar.png
   Common runtime duration stack. It uses the same visible phase labels as
   `phase_timeline.png`: `V_Encode`, `Mmproj`, `ImagePrefill`, `T_Prefill`,
-  `DynamicKVGrow`, and `Decode`. Dynamic KV breakdown sub-rows are excluded
-  from this aggregate plot and remain in
+  `KVRepositionCompact`, `DynamicKVGrow`, and `Decode`. Dynamic KV breakdown
+  sub-rows are excluded from this aggregate plot and remain in
   `dynamic_kv_grow_breakdown_stacked_bar.png`.
 ```
 
@@ -640,6 +648,15 @@ current `--ubatch-size` image micro-batch, closes the image wrapper, and answers
 from the committed partial KV. For the current InternVL3 one-tile setup, each
 frame has 256 vision tokens, so `--ubatch-size 64` can answer from 64, 128, 192,
 or 256 committed vision KV tokens.
+
+Add `--kv-reposition-keep-latest-frames N` to compact old resident frame vision
+KV after cache updates. The bridge records each committed frame image KV span,
+removes spans older than the latest N frames, shifts later cached tokens forward
+with llama.cpp's sequence-position API, and saves the compacted snapshot.
+`streaming_phase_stats.csv` records `KVRepositionCompact`,
+`foundation_inference_tokens.txt` records `KV_REPOSITION_COMPACT`, and
+`stream_buffer_summary.txt` reports compaction counts and removed vision-token
+totals.
 
 ### CPU
 
