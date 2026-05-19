@@ -293,9 +293,14 @@ def test_vision_prefill_inserts_late_frames_into_initial_video_prefix():
     assert "bool video_prefix_insert_pos_valid" in cache_struct
     assert "video_prefix_state_valid" in cache_struct
     assert "insert_frame_into_closed_video_prefix" in build_fn
-    assert "restore_vision_prefill_video_prefix_state" in build_fn
-    assert "replay_cached_conversation_tail_after_video_prefix" in build_fn
-    assert "KVRepositionTailRestore" in build_fn
+    assert "build_tail_insertion_plan" in build_fn
+    assert "apply_tail_insertion_plan" in build_fn
+    assert "compact_unused_insert_gap" in build_fn
+    assert 'setenv("LLAMA_ALLOW_KV_GAP_FILL", "1", 1)' in source
+    assert "llama_memory_seq_add" in (ROOT / "my_research/foundation_llamacpp/hybrid_bridge/kv_reposition.hpp").read_text()
+    assert "replay_cached_conversation_tail_after_video_prefix" not in build_fn
+    assert "VisionPrefillTailReplayT_Prefill" not in build_fn
+    assert "KVRepositionTailShift" in build_fn
     assert "update_first_video_user_message" in source
     assert "save_vision_prefill_video_prefix_state(ctx, *vision_cache" in prompt_fn
     assert "vision_cache->video_prefix_insert_pos = video_prefix_insert_pos_before_suffix" in prompt_fn

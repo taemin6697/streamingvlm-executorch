@@ -35,13 +35,6 @@ struct KvTailInsertionPlan {
   llama_pos expanded_sequence_end = 0;
 };
 
-struct KvTailParkingPlan {
-  llama_seq_id main_seq_id = 0;
-  llama_seq_id scratch_seq_id = 1;
-  llama_pos tail_begin = 0;
-  llama_pos tail_end = 0;
-};
-
 inline void set_kv_reposition_error(std::string* error, const std::string& message) {
   if (error != nullptr) {
     *error = message;
@@ -230,103 +223,6 @@ inline bool apply_tail_insertion_plan(
   if (plan.tail_begin < plan.tail_end && plan.shift != 0) {
     llama_memory_seq_add(memory, seq_id, plan.tail_begin, plan.tail_end, plan.shift);
   }
-  set_kv_reposition_error(error, "");
-  return true;
-}
-
-inline bool build_tail_parking_plan(
-    llama_pos insert_pos,
-    llama_pos sequence_end,
-    llama_seq_id main_seq_id,
-    llama_seq_id scratch_seq_id,
-    KvTailParkingPlan* out,
-    std::string* error = nullptr) {
-  if (out == nullptr) {
-    set_kv_reposition_error(error, "output plan pointer is null");
-    return false;
-  }
-  if (insert_pos < 0) {
-    set_kv_reposition_error(error, "insert position must be non-negative");
-    return false;
-  }
-  if (sequence_end < insert_pos) {
-    set_kv_reposition_error(error, "insert position exceeds sequence end");
-    return false;
-  }
-  if (main_seq_id < 0 || scratch_seq_id < 0 || main_seq_id == scratch_seq_id) {
-    set_kv_reposition_error(error, "main and scratch sequence ids must be distinct non-negative values");
-    return false;
-  }
-
-  out->main_seq_id = main_seq_id;
-  out->scratch_seq_id = scratch_seq_id;
-  out->tail_begin = insert_pos;
-  out->tail_end = sequence_end;
-  set_kv_reposition_error(error, "");
-  return true;
-}
-
-inline bool apply_tail_parking_plan(
-    llama_memory_t memory,
-    const KvTailParkingPlan& plan,
-    std::string* error = nullptr) {
-  if (memory == nullptr) {
-    set_kv_reposition_error(error, "llama memory pointer is null");
-    return false;
-  }
-  if (plan.main_seq_id < 0 ||
-      plan.scratch_seq_id < 0 ||
-      plan.main_seq_id == plan.scratch_seq_id ||
-      plan.tail_begin < 0 ||
-      plan.tail_end < plan.tail_begin) {
-    set_kv_reposition_error(error, "invalid tail parking plan");
-    return false;
-  }
-
-  llama_memory_seq_rm(memory, plan.scratch_seq_id, -1, -1);
-  if (plan.tail_begin < plan.tail_end) {
-    llama_memory_seq_cp(memory, plan.main_seq_id, plan.scratch_seq_id, plan.tail_begin, plan.tail_end);
-    if (!llama_memory_seq_rm(memory, plan.main_seq_id, plan.tail_begin, plan.tail_end)) {
-      llama_memory_seq_rm(memory, plan.scratch_seq_id, -1, -1);
-      set_kv_reposition_error(error, "llama_memory_seq_rm failed while parking tail");
-      return false;
-    }
-  }
-  set_kv_reposition_error(error, "");
-  return true;
-}
-
-inline bool restore_parked_tail_after_insert(
-    llama_memory_t memory,
-    const KvTailParkingPlan& plan,
-    llama_pos inserted_len,
-    std::string* error = nullptr) {
-  if (memory == nullptr) {
-    set_kv_reposition_error(error, "llama memory pointer is null");
-    return false;
-  }
-  if (inserted_len < 0 ||
-      plan.main_seq_id < 0 ||
-      plan.scratch_seq_id < 0 ||
-      plan.main_seq_id == plan.scratch_seq_id ||
-      plan.tail_begin < 0 ||
-      plan.tail_end < plan.tail_begin) {
-    set_kv_reposition_error(error, "invalid parked tail restore plan");
-    return false;
-  }
-
-  if (plan.tail_begin < plan.tail_end) {
-    if (inserted_len != 0) {
-      llama_memory_seq_add(memory, plan.scratch_seq_id, plan.tail_begin, plan.tail_end, inserted_len);
-    }
-    llama_memory_seq_cp(
-        memory,
-        plan.scratch_seq_id,
-        plan.main_seq_id,
-        plan.tail_begin + inserted_len,
-        plan.tail_end + inserted_len);
-  }
-  llama_memory_seq_rm(memory, plan.scratch_seq_id, -1, -1);
   set_kv_reposition_error(error, "");
   return true;
 }

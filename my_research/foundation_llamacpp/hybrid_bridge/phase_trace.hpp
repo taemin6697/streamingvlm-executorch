@@ -44,7 +44,7 @@ inline const char* hybrid_decode_phase_description() {
          "Mmproj: OpenCL mmproj projection for QNN pre-projector features  "
          "Prefill: combined text/image prompt eval  ImagePrefill: external image embedding decode  "
          "T_Prefill: text prompt eval  KVRepositionInsert: append late frame to restored video-prefix KV  "
-         "KVRepositionTailRestore: replay cached text tail after video-prefix KV insert  "
+         "KVRepositionTailShift: shift cached text tail in-place and reapply RoPE via llama.cpp K-shift before video-prefix KV insert  "
          "KVRepositionCompact: remove/close a KV gap and shift cached tail  D: one generated-token decode";
 }
 

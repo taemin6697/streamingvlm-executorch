@@ -17,19 +17,17 @@ would be too expensive, so the cache needs a KV-level reposition operation.
 llama.cpp already exposes the needed primitive for one-dimensional RoPE models:
 
 ```cpp
-llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 llama_memory_seq_rm(mem, seq_id, p0, p1);
 llama_memory_seq_add(mem, seq_id, p0, p1, delta);
 ```
 
-`seq_cp` can add another sequence id to existing KV cells without copying data
-when both sequences share the same KV stream. This is used as a temporary
-parking lane for append-only-safe insertion. `seq_rm` removes a logical position
-range from the sequence. `seq_add` changes the logical position metadata of
-remaining tokens. Internally, changing
+`seq_rm` removes a logical position range from the sequence. `seq_add` changes
+the logical position metadata of remaining tokens. Internally, changing
 positions marks KV cells as shifted. On the next memory update/decode,
 `llama_kv_cache::build_rope_shift()` applies the corresponding RoPE delta to
-the cached K tensor.
+the cached K tensor. This is the actual KV-level inverse/reapply path: the
+cached K is rotated from the old position basis into the new position basis
+instead of replaying the text suffix.
 
 The important split is:
 
@@ -78,28 +76,27 @@ build_rewrite_compaction_plan(KvTokenRange{128, 384}, 32, 1024, &plan, &error);
 
 That removes `[160, 384)` and shifts the tail by `-224`.
 
-The same helper also contains `KvTailParkingPlan` for inserting a late frame
-into the already-closed video prefix. Directly shifting the tail right and then
-decoding into the gap does not work with llama.cpp because `llama_decode()`
-requires the next batch for a sequence to start at `seq_pos_max + 1`. The safe
-sequence is therefore:
+The same helper also contains `KvTailInsertionPlan` for inserting a late frame
+into the already-closed video prefix. The runtime sequence is:
 
 ```text
-seq_cp(seq0 -> seq1, tail)
-seq_rm(seq0, tail)
-decode inserted frame at the old video-prefix end in seq0
-seq_add(seq1, tail, inserted_len)
-seq_cp(seq1 -> seq0, shifted_tail)
-seq_rm(seq1, all)
+restore full cached sequence
+seq_add(seq0, tail, reserved_insert_len)
+run llama.cpp K-shift so cached K is re-RoPE'd at the new tail positions
+temporarily allow gap-fill batches for this kv-reposition run
+decode the inserted frame prefix into the opened gap
+if partial vision KV commits fewer than reserved_insert_len tokens:
+  seq_rm(seq0, unused_gap)
+  seq_add(seq0, tail_after_gap, -unused_gap_len)
+  run K-shift again
 ```
 
-This keeps the physical KV for the old user/assistant tail, but changes its
-logical RoPE positions after the new frame KV has been appended. This path is
-kept as a helper for future non-dynamic or multi-sequence experiments. The
-current dynamic-KV prototype only supports one non-unified sequence, so the
-streaming implementation uses a different runtime strategy: it stores a
-host-format snapshot of the open video-prefix KV, appends late frames to that
-prefix, and replays only the small text tail before saving the new cache.
+The dynamic-KV prototype only supports one non-unified sequence, so this path
+does not use a scratch sequence or `--parallel 2`. Instead, the hybrid binary
+sets `LLAMA_ALLOW_KV_GAP_FILL=1` only when
+`--kv-reposition-keep-latest-frames` is active. The llama.cpp batch allocator
+then permits the deliberately opened gap to be filled after the tail has already
+been shifted forward. Normal runs keep the default consecutive-position check.
 
 ## Host Probe
 
@@ -175,8 +172,8 @@ updates `ctx.n_past`, then saves the compacted cache snapshot. The removed
 range is vision KV only; closed user/assistant text KV is preserved and shifted.
 
 For a frame that arrives after the first user video turn has already been
-closed, the dynamic-KV streaming path uses a video-prefix snapshot rather than
-direct middle insertion:
+closed, the dynamic-KV streaming path inserts it into the original video prefix
+without replaying the user/assistant tail:
 
 ```text
 prompt time:
@@ -184,11 +181,13 @@ prompt time:
   prefill the question suffix and decode the answer
 
 late frame time:
-  restore the saved video-prefix KV
-  append the new frame's vision KV at the prefix end
+  restore the full cached sequence
+  shift the closed user/assistant tail forward by the new frame prefix length
+  llama.cpp K-shift re-applies RoPE to the cached K tail in-place
+  fill the opened video-prefix gap with the new frame text/image KV
+  compact any unused reserved gap if partial vision KV stopped early
   compact older frame KV if keep_latest_frames requires it
-  save the updated video-prefix snapshot
-  replay only the cached text tail, not the old vision KV
+  save the updated full cache snapshot
 ```
 
 This produces the intended logical prompt layout:
@@ -225,8 +224,9 @@ This is intentionally separate from the frame scheduling policy:
   after commits, physically remove older frame vision-KV positions from seq 0
 ```
 
-`streaming_phase_stats.csv` records `KVRepositionCompact` rows. The token trace
-also appends notes such as:
+`streaming_phase_stats.csv` records `KVRepositionTailShift` for the forward
+tail move and `KVRepositionCompact` for any unused-gap or old-frame removal.
+The token trace also appends notes such as:
 
 ```text
 ## KV_REPOSITION_COMPACT removed_frames=1 removed_vision_tokens=256 keep_latest_frames=4

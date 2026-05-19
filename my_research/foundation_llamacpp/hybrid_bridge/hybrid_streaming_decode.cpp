@@ -2282,14 +2282,24 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
   std::vector<std::string> images_to_load;
   std::vector<FrameRecord> frames_loaded_for_kv_span;
   bool insert_frame_into_closed_video_prefix = false;
-  bool replay_tail_after_closed_video_prefix = false;
+  bool shift_tail_for_closed_video_prefix = false;
+  bool closed_video_prefix_tail_shifted = false;
+  streamingvlm::hybrid_bridge::KvTailInsertionPlan closed_video_prefix_insert_plan;
+  llama_pos closed_video_prefix_original_sequence_end = 0;
 
-  const bool can_replay_closed_video_prefix =
-      can_append_incrementally && !cache.open_user_prefix && cache.video_prefix_state_valid;
-  const bool restored_for_incremental_append = can_replay_closed_video_prefix
-      ? restore_vision_prefill_video_prefix_state(ctx, cache, cache_phases, "VisionPrefillVideoPrefixRestore")
-      : (can_append_incrementally &&
-         restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore"));
+  const bool can_insert_into_closed_video_prefix =
+      can_append_incrementally && !cache.open_user_prefix && cache.video_prefix_insert_pos_valid;
+  bool restored_for_incremental_append = false;
+  if (can_insert_into_closed_video_prefix) {
+    restored_for_incremental_append =
+        restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore");
+    if (restored_for_incremental_append) {
+      closed_video_prefix_original_sequence_end = cache.n_past;
+    }
+  } else if (can_append_incrementally) {
+    restored_for_incremental_append =
+        restore_vision_prefill_cache_state(ctx, cache, cache_phases, "VisionPrefillCacheAppendRestore");
+  }
 
   if (can_append_incrementally && restored_for_incremental_append) {
     auto append_begin = target_frames.begin() + static_cast<std::ptrdiff_t>(cached_prefix_size);
@@ -2328,7 +2338,7 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     }
     if (!cache.open_user_prefix) {
       insert_frame_into_closed_video_prefix = true;
-      replay_tail_after_closed_video_prefix = true;
+      shift_tail_for_closed_video_prefix = true;
       next_cache.open_user_content = formatted_prefix;
       next_cache.open_user_content.clear();
       next_cache.open_user_prefix = false;
@@ -2394,6 +2404,40 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     return VisionPrefillCacheBuildStatus::Preempted;
   }
 
+  if (shift_tail_for_closed_video_prefix) {
+    llama_pos reserved_insert_len = 0;
+    const size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+    for (size_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+      const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.ptr.get(), chunk_idx);
+      reserved_insert_len += static_cast<llama_pos>(mtmd_input_chunk_get_n_tokens(chunk));
+    }
+    std::string error;
+    if (!streamingvlm::hybrid_bridge::build_tail_insertion_plan(
+            cache.video_prefix_insert_pos,
+            reserved_insert_len,
+            closed_video_prefix_original_sequence_end,
+            &closed_video_prefix_insert_plan,
+            &error)) {
+      LOG_ERR("failed to build KV tail insertion plan: %s\n", error.c_str());
+      cache = std::move(next_cache);
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    const long shift_start_ms = now_ms();
+    if (!streamingvlm::hybrid_bridge::apply_tail_insertion_plan(
+            llama_get_memory(ctx.lctx),
+            0,
+            closed_video_prefix_insert_plan,
+            &error)) {
+      LOG_ERR("failed to shift KV tail before video-prefix insert: %s\n", error.c_str());
+      cache = std::move(next_cache);
+      return VisionPrefillCacheBuildStatus::Failed;
+    }
+    llama_synchronize(ctx.lctx);
+    cache_phases.row("KVRepositionTailShift", shift_start_ms, now_ms());
+    ctx.n_past = closed_video_prefix_insert_plan.insert_pos;
+    closed_video_prefix_tail_shifted = true;
+  }
+
   bool preempted = false;
   bool partial_image_committed = false;
   std::vector<std::size_t> committed_image_tokens;
@@ -2411,23 +2455,40 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
         return false;
       }
     }
+    if (shift_tail_for_closed_video_prefix) {
+      if (!closed_video_prefix_tail_shifted) {
+        LOG_ERR("cannot finish closed video-prefix insert: KV tail was not shifted\n");
+        return false;
+      }
+      const llama_pos inserted_len = ctx.n_past - closed_video_prefix_insert_plan.insert_pos;
+      if (inserted_len < 0 || inserted_len > closed_video_prefix_insert_plan.insert_len) {
+        LOG_ERR("invalid closed video-prefix insert length: %lld\n", static_cast<long long>(inserted_len));
+        return false;
+      }
+      if (inserted_len < closed_video_prefix_insert_plan.insert_len) {
+        const llama_pos gap_begin = closed_video_prefix_insert_plan.insert_pos + inserted_len;
+        const llama_pos gap_end = closed_video_prefix_insert_plan.insert_pos + closed_video_prefix_insert_plan.insert_len;
+        if (!compact_unused_insert_gap(
+                ctx,
+                gap_begin,
+                gap_end,
+                closed_video_prefix_insert_plan.expanded_sequence_end,
+                cache_phases)) {
+          return false;
+        }
+      }
+      ctx.n_past = closed_video_prefix_original_sequence_end + inserted_len;
+      next_cache.n_past = ctx.n_past;
+      next_cache.video_prefix_insert_pos = closed_video_prefix_insert_plan.insert_pos + inserted_len;
+      next_cache.video_prefix_insert_pos_valid = true;
+      next_cache.video_prefix_state.clear();
+      next_cache.video_prefix_state_valid = false;
+    }
     if (!compact_vision_prefill_cache_frames(args, ctx, next_cache, cache_phases)) {
-      return false;
-    }
-    if (!save_vision_prefill_video_prefix_state(ctx, next_cache, cache_phases)) {
-      return false;
-    }
-    if (replay_tail_after_closed_video_prefix &&
-        !replay_cached_conversation_tail_after_video_prefix(
-            ctx,
-            next_cache.chat_history,
-            next_cache.frames,
-            cache_phases)) {
       return false;
     }
     next_cache.chat_history = ctx.chat_history;
     next_cache.n_past = ctx.n_past;
-    cache_phases.row("KVRepositionTailRestore", now_ms(), now_ms());
     return true;
   };
   if (!eval_streaming_chunks_with_on_demand_vision(
@@ -3185,6 +3246,9 @@ int main(int argc, char** argv) {
   }
   args.stream_mode = normalize_stream_mode(args.stream_mode, args.single_buffer);
   args.single_buffer = args.stream_mode == "on_demand";
+  if (args.kv_reposition_keep_latest_frames > 0) {
+    setenv("LLAMA_ALLOW_KV_GAP_FILL", "1", 1);
+  }
   if (manifest.frames.empty()) {
     std::fprintf(stderr, "stream manifest has no frames: %s\n", args.manifest.c_str());
     return 2;

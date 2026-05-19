@@ -16,18 +16,13 @@ def test_kv_reposition_header_defines_tail_compaction_contract():
     assert "struct KvTokenRange" in source
     assert "struct KvTailCompactionPlan" in source
     assert "struct KvTailInsertionPlan" in source
-    assert "struct KvTailParkingPlan" in source
     assert "build_tail_compaction_plan" in source
     assert "build_tail_insertion_plan" in source
-    assert "build_tail_parking_plan" in source
     assert "apply_tail_compaction_plan" in source
     assert "apply_tail_insertion_plan" in source
-    assert "apply_tail_parking_plan" in source
-    assert "restore_parked_tail_after_insert" in source
     assert "compacted_position_after" in source
     assert "inserted_position_after" in source
     assert "llama_memory_seq_rm" in source
-    assert "llama_memory_seq_cp" in source
     assert "llama_memory_seq_add" in source
     assert "llama_memory_seq_div" not in source
 
@@ -73,12 +68,6 @@ def test_kv_reposition_header_compiles_as_standalone_contract(tmp_path):
           if (inserted_position_after(384, 256, 1024, 128) != 128) {
             return 6;
           }
-          KvTailParkingPlan park_plan;
-          const bool park_ok = build_tail_parking_plan(384, 1024, 0, 1, &park_plan, &error);
-          if (!park_ok || park_plan.tail_begin != 384 || park_plan.tail_end != 1024 ||
-              park_plan.main_seq_id != 0 || park_plan.scratch_seq_id != 1) {
-            return 7;
-          }
           return 0;
         }
         """,
@@ -117,7 +106,6 @@ def test_rope_reposition_design_is_documented_for_future_video_compression():
 
     assert "kv_reposition.hpp" in archive
     assert "llama_memory_seq_rm" in archive
-    assert "llama_memory_seq_cp" in archive
     assert "llama_memory_seq_add" in archive
     assert "cached K" in archive
     assert "V cache" in archive
