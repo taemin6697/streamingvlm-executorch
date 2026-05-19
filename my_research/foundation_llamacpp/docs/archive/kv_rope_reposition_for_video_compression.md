@@ -74,6 +74,52 @@ build_rewrite_compaction_plan(KvTokenRange{128, 384}, 32, 1024, &plan, &error);
 
 That removes `[160, 384)` and shifts the tail by `-224`.
 
+## Host Probe
+
+`my_research/foundation_llamacpp/hybrid_bridge/kv_reposition_probe.cpp` is a
+small host-only validation binary. It compares two paths:
+
+```text
+reference:
+  prefill prefix + history + suffix
+  generate greedily
+
+KV reposition:
+  prefill prefix + removed + history
+  remove [prefix_end, removed_end)
+  shift history tail by -removed_len
+  prefill the same suffix at the compacted position
+  generate greedily
+```
+
+This intentionally avoids sampling from stale logits produced before the shift.
+The first generated token comes after a fresh suffix prefill, so it exercises
+the shifted cached K/V as context.
+
+Observed host runs:
+
+```text
+InternVL3-1B-Instruct-Q8_0:
+  top1_match=true
+  reference_answer: The user asked about alpha.
+  shifted_answer:   The user asked about alpha.
+  logits_rms_delta=0.438441459
+
+InternVL3-2B-Instruct-Q4_K_M:
+  top1_match=true
+  reference_answer: The user previously asked about alpha.
+  shifted_answer:   The user previously asked about alpha.
+  logits_rms_delta=0.473699338
+```
+
+The answers matched in these probes, but the logits were not identical. That is
+expected: RoPE shift fixes positions for cached K, but any already-prefilled
+tail token was originally computed while attending to the removed span. Exact
+equivalence to a compacted re-prefill is therefore not guaranteed when the
+unchanged tail was computed under the old context. This path should be treated
+as a practical KV-level approximation unless the compressed/repositioned region
+is before tokens whose hidden states are acceptable to preserve.
+
 ## Boundaries and Limitations
 
 This helper does not decide which frames or visual tokens to compress. It only

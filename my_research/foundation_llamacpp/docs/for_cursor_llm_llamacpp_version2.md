@@ -13,12 +13,21 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
   `llama_memory_seq_rm` plus `llama_memory_seq_add`, relying on llama.cpp's
   existing K-shift update to re-apply RoPE to cached K on the next memory
   update/decode.
+- Added `hybrid_bridge/kv_reposition_probe.cpp` for host validation against an
+  actual GGUF model. The probe compares compact re-prefill against
+  `prefix + removed + history -> remove+shift -> suffix`.
 - Documented the design in
   `docs/archive/kv_rope_reposition_for_video_compression.md`.
+- Actual host probe results:
+  - InternVL3-1B Q8_0: top-1 next token matched and both paths answered
+    "The user asked about alpha."; logits RMS delta was 0.438441459.
+  - InternVL3-2B Q4_K_M: top-1 next token matched and both paths answered
+    "The user previously asked about alpha."; logits RMS delta was 0.473699338.
 - Scope note: this does not yet physically shrink OpenCL KV allocation and does
-  not solve M-RoPE visual-axis remapping. Those are follow-up stages after the
-  InternVL-style one-dimensional RoPE path is validated against a compacted
-  re-prefill reference.
+  not solve M-RoPE visual-axis remapping. Also, logits are not identical because
+  shifted tail tokens were originally computed under the old context. Treat this
+  as a practical KV-level approximation unless the preserved tail states are
+  acceptable for the compression policy.
 
 ## 2026-05-18: Full Streaming Prefill Token Trace
 

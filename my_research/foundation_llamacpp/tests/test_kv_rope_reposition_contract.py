@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 HEADER = ROOT / "my_research/foundation_llamacpp/hybrid_bridge/kv_reposition.hpp"
+CMAKE = ROOT / "my_research/foundation_llamacpp/hybrid_bridge/CMakeLists.txt"
 ARCHIVE = ROOT / "my_research/foundation_llamacpp/docs/archive/kv_rope_reposition_for_video_compression.md"
 README = ROOT / "my_research/foundation_llamacpp/docs/README.md"
 STRUCTURE = ROOT / "my_research/foundation_llamacpp/docs/project_structure.md"
@@ -20,6 +21,14 @@ def test_kv_reposition_header_defines_tail_compaction_contract():
     assert "llama_memory_seq_rm" in source
     assert "llama_memory_seq_add" in source
     assert "llama_memory_seq_div" not in source
+
+
+def test_kv_reposition_probe_is_buildable_from_hybrid_bridge_cmake():
+    source = CMAKE.read_text()
+
+    assert "add_executable(\n    kv_reposition_probe" in source
+    assert "kv_reposition_probe.cpp" in source
+    assert "target_link_libraries(kv_reposition_probe PRIVATE llama Threads::Threads)" in source
 
 
 def test_kv_reposition_header_compiles_as_standalone_contract(tmp_path):

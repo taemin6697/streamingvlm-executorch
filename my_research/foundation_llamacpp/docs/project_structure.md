@@ -444,6 +444,7 @@ my_research/foundation_llamacpp/hybrid_bridge/
   hybrid_decode.cpp
   opencl_phase_mtmd.cpp
   hybrid_streaming_decode.cpp
+  kv_reposition_probe.cpp
   hybrid_vision_dump.cpp
   hybrid_embedding_file.h
   hybrid_embedding_file.cpp
@@ -622,6 +623,14 @@ compression. The helper builds and applies a `llama_memory_seq_rm` plus
 without re-prefilling the unchanged suffix. The current helper is intentionally
 policy-free: compression decides which visual token range is removed or
 rewritten, then this helper shifts the remaining logical positions.
+
+`kv_reposition_probe.cpp`
+
+Host-only validation binary for the KV/RoPE reposition helper. It compares a
+compact reference prefill with a `prefix + removed + history` cache that has the
+removed span deleted and the history tail shifted before a fresh suffix prefill.
+Use it to check whether a proposed compression policy preserves practical
+answers before wiring that policy into streaming video.
 
 `file_sync.hpp`
 
