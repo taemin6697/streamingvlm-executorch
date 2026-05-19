@@ -449,6 +449,7 @@ my_research/foundation_llamacpp/hybrid_bridge/
   hybrid_embedding_file.cpp
   inference_trace.hpp
   file_sync.hpp
+  kv_reposition.hpp
   phase_trace.hpp
   vision_encoder_et.hpp
   vision_encoder_et.cpp
@@ -612,6 +613,15 @@ decode token lines
 
 Use `foundation_inference_tokens.txt` to verify that image/video prompt layout
 matches the expected number of IMAGE chunks.
+
+`kv_reposition.hpp`
+
+Defines the experimental KV tail-compaction contract for future video
+compression. The helper builds and applies a `llama_memory_seq_rm` plus
+`llama_memory_seq_add` plan so llama.cpp can update cached K RoPE positions
+without re-prefilling the unchanged suffix. The current helper is intentionally
+policy-free: compression decides which visual token range is removed or
+rewritten, then this helper shifts the remaining logical positions.
 
 `file_sync.hpp`
 

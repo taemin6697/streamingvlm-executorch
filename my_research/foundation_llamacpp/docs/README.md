@@ -11,7 +11,9 @@ single-buffer details live in `archive/streaming_single_buffer_implementation.md
 the current on-demand/sliding-window/KV vision-prefill details live in
 `archive/streaming_sliding_window_and_vision_prefill.md`, and partial
 vision-prefill KV preemption details live in
-`archive/partial_vision_prefill_kv.md`.
+`archive/partial_vision_prefill_kv.md`. Future video-compression KV/RoPE
+repositioning notes live in
+`archive/kv_rope_reposition_for_video_compression.md`.
 
 ## Current Baseline
 

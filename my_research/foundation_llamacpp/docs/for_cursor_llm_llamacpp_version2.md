@@ -5,6 +5,21 @@ This is the active implementation log for the structured
 workflow notes, validation results, and follow-up tasks. The older cumulative log
 is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
 
+## 2026-05-19: KV/RoPE Repositioning Prototype Branch
+
+- Created branch `codex/rope-kv-reposition-experiment` from `origin/main`.
+- Added `hybrid_bridge/kv_reposition.hpp` as the first policy-free helper for
+  future video compression. It builds a tail-compaction plan and applies it via
+  `llama_memory_seq_rm` plus `llama_memory_seq_add`, relying on llama.cpp's
+  existing K-shift update to re-apply RoPE to cached K on the next memory
+  update/decode.
+- Documented the design in
+  `docs/archive/kv_rope_reposition_for_video_compression.md`.
+- Scope note: this does not yet physically shrink OpenCL KV allocation and does
+  not solve M-RoPE visual-axis remapping. Those are follow-up stages after the
+  InternVL-style one-dimensional RoPE path is validated against a compacted
+  re-prefill reference.
+
 ## 2026-05-18: Full Streaming Prefill Token Trace
 
 - Created branch `codex/full-streaming-prefill-token-trace`.

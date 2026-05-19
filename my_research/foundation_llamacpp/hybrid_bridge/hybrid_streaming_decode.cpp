@@ -25,6 +25,8 @@
 #include "opencl_phase_mtmd.cpp"
 #endif
 
+#include "kv_reposition.hpp"
+
 namespace {
 
 struct TileRecord {
