@@ -962,11 +962,13 @@ Partial vision-prefill scheduling
 Token trace contract
   `foundation_inference_tokens.txt` and `stream_inference_tokens_<idx>.txt`
   show mtmd prefill chunks followed by decode tokens. Vision-prefill cache
-  prompt turns replay the committed cached visual prefix into this trace before
-  the question suffix, so cached image KV is visible in the same sequential
-  order as on-demand/sliding-window prompts. Image slots are emitted as
-  `<VISION_KV_SLOT N>`; partial image commits emit only the committed slots and
-  add `nominal_placeholder_tokens=256` when fewer than the full image token
+  prompt turns replay the committed cached KV trace before the question suffix:
+  prior frame prefill, prior user text, prior assistant decode tokens, and the
+  currently open frame prefix are visible in sequence. This is a logical trace of
+  the restored cache state; it makes follow-up questions auditable even though
+  the decoder does not re-prefill those earlier tokens. Image slots are emitted
+  as `<VISION_KV_SLOT N>`; partial image commits emit only the committed slots
+  and add `nominal_placeholder_tokens=256` when fewer than the full image token
   count was committed.
 ```
 
@@ -1047,6 +1049,10 @@ streaming scheduling, KV cache behavior, or token tracing, run:
 ```bash
 my_research/foundation_llamacpp/scripts/run_merge_regression_internvl_qwen.sh
 ```
+
+`N_PREDICT` defaults to 64 for this script so multi-turn history checks have
+enough room to produce meaningful assistant turns. Override it only when the
+test goal is specifically short-output latency.
 
 The script runs InternVL3-1B and Qwen2.5-VL-3B through single image,
 multi-image, offline video, streaming on-demand, streaming sliding-window, and

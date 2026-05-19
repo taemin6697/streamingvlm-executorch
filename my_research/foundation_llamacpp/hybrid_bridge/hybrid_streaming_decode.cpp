@@ -1711,12 +1711,10 @@ VisionPrefillCacheBuildStatus build_vision_prefill_cache(
     }
     next_cache.open_user_content = cache.open_user_content + formatted_prefix;
     next_cache.open_user_prefix = true;
-    if (cache.open_user_prefix) {
-      next_cache.prefill_trace_body = cache.prefill_trace_body;
-      next_cache.prefill_trace_flat = cache.prefill_trace_flat;
-      next_cache.prefill_trace_next_chunk_idx = cache.prefill_trace_next_chunk_idx;
-      next_cache.prefill_trace_next_image_idx = cache.prefill_trace_next_image_idx;
-    }
+    next_cache.prefill_trace_body = cache.prefill_trace_body;
+    next_cache.prefill_trace_flat = cache.prefill_trace_flat;
+    next_cache.prefill_trace_next_chunk_idx = cache.prefill_trace_next_chunk_idx;
+    next_cache.prefill_trace_next_image_idx = cache.prefill_trace_next_image_idx;
     if (!cache.open_user_prefix) {
       next_cache.open_user_content = formatted_prefix;
       if (!build_formatted_vision_cache_prefix(ctx, next_cache.open_user_content, formatted_prefix)) {
@@ -1920,16 +1918,19 @@ int run_vision_prefill_prompt_from_committed_cache(
               prompt_phases,
               "VisionPrefillSuffixTokenize",
               suffix_chunks);
+      RenderedPrefillTrace suffix_trace;
+      if (tokenized_suffix) {
+        suffix_trace = render_prefill_trace_for_chunks(
+            ctx,
+            suffix_chunks,
+            vision_cache->prefill_trace_next_chunk_idx,
+            vision_cache->prefill_trace_next_image_idx);
+      }
       if (tokenized_suffix && trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
         trace_writer->write_prefill_header();
         trace_writer->append_prefill_trace_body(
             vision_cache->prefill_trace_body,
             vision_cache->prefill_trace_flat);
-        const RenderedPrefillTrace suffix_trace = render_prefill_trace_for_chunks(
-            ctx,
-            suffix_chunks,
-            vision_cache->prefill_trace_next_chunk_idx,
-            vision_cache->prefill_trace_next_image_idx);
         trace_writer->append_prefill_trace_body(suffix_trace.body, suffix_trace.flat);
       }
       if (tokenized_suffix &&
@@ -1948,15 +1949,27 @@ int run_vision_prefill_prompt_from_committed_cache(
         const int n_predict = args.n_predict < 0 ? INT32_MAX : args.n_predict;
         generated_text =
             generate_response(ctx, n_predict, args.force_generation, prompt_phases, trace_writer.get());
+        std::string restored_trace_body = vision_cache->prefill_trace_body + suffix_trace.body;
+        std::string restored_trace_flat = vision_cache->prefill_trace_flat + suffix_trace.flat;
+        std::size_t restored_next_chunk_idx = suffix_trace.next_chunk_idx;
+        const std::size_t restored_next_image_idx = suffix_trace.next_image_idx;
+        if (trace_writer != nullptr && static_cast<bool>(*trace_writer)) {
+          const std::string decode_history_body = trace_writer->decode_history_body(restored_next_chunk_idx);
+          if (!decode_history_body.empty()) {
+            restored_trace_body += decode_history_body;
+            restored_trace_flat += trace_writer->decode_flat();
+            ++restored_next_chunk_idx;
+          }
+        }
         vision_cache->frames = cached_frames;
         vision_cache->frame_indices = frame_indices_for(cached_frames);
         vision_cache->images = images;
         vision_cache->open_user_prefix = false;
         vision_cache->open_user_content.clear();
-        vision_cache->prefill_trace_body.clear();
-        vision_cache->prefill_trace_flat.clear();
-        vision_cache->prefill_trace_next_chunk_idx = 0;
-        vision_cache->prefill_trace_next_image_idx = 0;
+        vision_cache->prefill_trace_body = std::move(restored_trace_body);
+        vision_cache->prefill_trace_flat = std::move(restored_trace_flat);
+        vision_cache->prefill_trace_next_chunk_idx = restored_next_chunk_idx;
+        vision_cache->prefill_trace_next_image_idx = restored_next_image_idx;
         if (!save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, args.partial_vision_kv)) {
           rc = 1;
         } else {

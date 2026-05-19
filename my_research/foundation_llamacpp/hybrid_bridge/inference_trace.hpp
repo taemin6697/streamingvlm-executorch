@@ -23,8 +23,11 @@ inline std::string sibling_foundation_inference_tokens_path(const std::string& t
 struct inference_trace_collector {
   std::ofstream out;
   bool in_decode_ = false;
+  std::string prefill_body_;
   std::string prefill_flat_;
+  std::string decode_body_;
   std::string decode_flat_;
+  std::size_t decode_token_count_ = 0;
 
   explicit inference_trace_collector(const std::string& path) : out(path) {}
 
@@ -60,26 +63,31 @@ struct inference_trace_collector {
 
   void chunk_text_begin(std::size_t idx, std::size_t n_tok) {
     if (!out.is_open()) return;
-    out << "## CHUNK " << idx << " TEXT n_tokens=" << n_tok << "\n";
+    const std::string header =
+        "## CHUNK " + std::to_string(idx) + " TEXT n_tokens=" + std::to_string(n_tok) + "\n";
+    out << header;
+    prefill_body_ += header;
   }
 
   void token_line(llama_token t, const std::string& piece) {
     if (!out.is_open()) return;
-    out << static_cast<long long>(t) << '\t';
-    escape_piece(out, piece);
-    out << '\n';
     const std::string esc = escape_piece_str(piece);
     const std::string one = std::to_string(static_cast<long long>(t)) + '\t' + esc + '\n';
+    out << one;
     if (!in_decode_) {
+      prefill_body_ += one;
       prefill_flat_ += one;
     } else {
+      decode_body_ += one;
       decode_flat_ += one;
+      ++decode_token_count_;
     }
   }
 
   void append_prefill_trace_body(const std::string& body, const std::string& flat) {
     if (!out.is_open()) return;
     out << body;
+    prefill_body_ += body;
     prefill_flat_ += flat;
     in_decode_ = false;
   }
@@ -99,21 +107,28 @@ struct inference_trace_collector {
       const char* cid,
       std::size_t image_idx) {
     if (!out.is_open()) return;
-    out << "## CHUNK " << idx << " IMAGE image_index=" << (image_idx + 1)
-        << " n_placeholder_tokens=" << visible_tok;
+    std::string header = "## CHUNK " + std::to_string(idx) +
+                         " IMAGE image_index=" + std::to_string(image_idx + 1) +
+                         " n_placeholder_tokens=" + std::to_string(visible_tok);
     if (nominal_tok != visible_tok) {
-      out << " nominal_placeholder_tokens=" << nominal_tok;
+      header += " nominal_placeholder_tokens=" + std::to_string(nominal_tok);
     }
     if (cid != nullptr && cid[0]) {
-      out << " mtmd_chunk_id=" << cid;
+      header += std::string(" mtmd_chunk_id=") + cid;
     }
-    out << "\n";
+    header += "\n";
+    out << header;
+    prefill_body_ += header;
     for (size_t i = 0; i < visible_tok; ++i) {
       const std::string piece = vision_slot_piece(i + 1);
-      out << static_cast<long long>(-1) << '\t' << piece << '\n';
-      prefill_flat_ += std::string("-1\t") + piece + "\n";
+      const std::string line = std::string("-1\t") + piece + "\n";
+      out << line;
+      prefill_body_ += line;
+      prefill_flat_ += line;
     }
-    out << "# (each slot: projected vision embedding into decoder KV; not a BPE vocab id)\n";
+    const std::string note = "# (each slot: projected vision embedding into decoder KV; not a BPE vocab id)\n";
+    out << note;
+    prefill_body_ += note;
   }
 
   static std::string vision_slot_piece(std::size_t one_based_idx) {
@@ -124,6 +139,23 @@ struct inference_trace_collector {
     if (!out.is_open()) return;
     out << "\n--- DECODE ---\n";
     in_decode_ = true;
+  }
+
+  std::string decode_history_body(std::size_t chunk_idx) const {
+    if (decode_body_.empty()) {
+      return {};
+    }
+    return "## CHUNK " + std::to_string(chunk_idx) +
+           " ASSISTANT_DECODE n_tokens=" + std::to_string(decode_token_count_) + "\n" +
+           decode_body_;
+  }
+
+  const std::string& decode_flat() const {
+    return decode_flat_;
+  }
+
+  std::size_t decode_token_count() const {
+    return decode_token_count_;
   }
 
   /** Appended after `User:` / `Assistant:` block in `foundation_token_io.txt`. */

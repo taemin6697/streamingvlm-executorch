@@ -254,6 +254,9 @@ def test_inference_trace_uses_committed_vision_slots_without_nominal_suffix():
 def test_vision_prefill_preserves_chat_history_across_prompt_events():
     source = STREAMING_CPP.read_text()
     cache_struct = source.split("struct VisionPrefillCache {", 1)[1].split("\n};", 1)[0]
+    build_fn = source.split("VisionPrefillCacheBuildStatus build_vision_prefill_cache(", 1)[1].split(
+        "\n}\n\nint run_vision_prefill_prompt_from_committed_cache", 1
+    )[0]
     restore_fn = source.split("bool restore_vision_prefill_cache_state(", 1)[1].split("\n}\n\nbool build_vision_prefill_cache", 1)[0]
     prompt_fn = source.split("int run_vision_prefill_prompt_from_committed_cache(", 1)[1].split(
         "\n}\n\nint run_single_buffer_prompt", 1
@@ -268,6 +271,9 @@ def test_vision_prefill_preserves_chat_history_across_prompt_events():
     assert "ctx.chat_history = cache.chat_history" in restore_fn
     assert "cache.chat_history = ctx.chat_history" in source
     assert 'args.stream_mode == "vision_prefill"' not in singleton_fn
+    assert "next_cache.prefill_trace_body = cache.prefill_trace_body" in build_fn
+    assert "restored_trace_body = vision_cache->prefill_trace_body + suffix_trace.body" in prompt_fn
+    assert "decode_history_body(restored_next_chunk_idx)" in prompt_fn
     assert "vision_cache->open_user_prefix = false" in prompt_fn
     assert "save_vision_prefill_cache_state(ctx, *vision_cache, prompt_phases, args.partial_vision_kv)" in prompt_fn
 

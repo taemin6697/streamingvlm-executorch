@@ -32,6 +32,40 @@ is retained under `docs/archive/for_cursor_llm_llamacpp.md`.
     8B. All returned `foundation_exit_code.txt=0`; 2B and 8B produced partial
     image-slot traces with no `/256` slot suffix.
 
+## 2026-05-18: Restored Vision-Prefill History Trace
+
+- Created branch `codex/fix-streaming-history-trace` from the full token trace
+  branch.
+- Root cause: `foundation_inference_tokens.txt` showed only the newly evaluated
+  cache append/suffix chunks for later vision-prefill turns. The restored KV
+  state still carried `chat_history`, but the trace did not replay that restored
+  logical prefix, so follow-up turns looked as if previous user/assistant tokens
+  were missing.
+- Fix:
+  - `VisionPrefillCache` trace state is copied for every incremental append,
+    including the post-answer case where a new user turn starts.
+  - prompt suffix trace and assistant decode tokens are folded back into the
+    cache trace after each answer.
+  - later prompt traces now show prior frame prefill, prior question text,
+    `ASSISTANT_DECODE`, the new frame prefix, and the current question in order.
+- Updated `scripts/run_merge_regression_internvl_qwen.sh` default `N_PREDICT`
+  from 16 to 64 so the pre-merge multi-turn sanity run has enough generation
+  budget to avoid false history failures from overly short answers.
+- Validation:
+  - `python3 -m py_compile my_research/foundation_llamacpp/runner/cli.py`
+  - `python3 -m pytest my_research/foundation_llamacpp/tests/test_vision_prefill_kv_cache_contract.py my_research/foundation_llamacpp/tests/test_result_artifact_layout.py -q`
+    -> 31 passed.
+  - `cmake --build my_research/foundation_llamacpp/build-hybrid-android-opencl --target hybrid_streaming_decode -j2`
+  - 1B short run:
+    `results/log/history_trace_fix_1b_short/InternVL3-1B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic_online_latest_frame_only`
+    shows prompt 1 replaying prompt 0's `What is this situation?` and
+    `ASSISTANT_DECODE`.
+  - 2B short run:
+    `results/log/history_trace_fix_2b_short/InternVL3-2B-Instruct-Q8_0_hybrid_ctx_32768_streaming_vision_prefill_kv16_dynamic_online_latest_frame_only`
+    shows the same restored logical trace. The small 2B model still answered
+    "You didn't ask anything earlier" in this short run, but the token trace now
+    proves the prior user/assistant tokens are present in the restored sequence.
+
 ## 2026-05-17: Latest-Frame-Only Vision-Prefill Cache Updates
 
 - Created branch `codex/latest-frame-only-cache-updates`.
